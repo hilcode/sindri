@@ -1,0 +1,7 @@
+[package]
+name = "sindri"
+version = "0.1.0"
+edition = "2024"
+description = "Sindri"
+
+[dependencies]
