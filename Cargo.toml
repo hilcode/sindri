@@ -5,3 +5,4 @@ edition = "2024"
 description = "Sindri"
 
 [dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
