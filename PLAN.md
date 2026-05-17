@@ -7,59 +7,59 @@ All errors are reported through `miette` with helpful messages and a clear call 
 
 Tests in this phase use temporary directories (`tempfile` crate, added as a dev-dependency).
 
-- [ ] Add dependencies to `Cargo.toml`: `nickel-lang`, `miette` (with `fancy` feature), `thiserror`, `serde` (with `derive` feature)
-- [ ] Add `tracing`, `tracing-subscriber`, and `tracing-appender` dependencies; add a `--log` flag to the CLI; when present, initialise a non-blocking file subscriber writing to `<build_dir>/sindri.log` immediately after the workspace is loaded
-  - [ ] Test: running with `--log` creates `<build_dir>/sindri.log` containing trace output
-  - [ ] Test: running without `--log` creates no log file
-  - [ ] Test: terminal output contains no tracing output regardless of `--log`
-- [ ] Verify `nickel-lang` compiles and its API matches what was researched (evaluate a trivial `.ncl` expression, extract a value)
-  - [ ] Test: evaluating a Nickel record and extracting a string field succeeds
+- [x] Add dependencies to `Cargo.toml`: `nickel-lang`, `miette` (with `fancy` feature), `thiserror`, `serde` (with `derive` feature)
+- [x] Add `tracing`, `tracing-subscriber`, and `tracing-appender` dependencies; add a `--log` flag to the CLI; when present, initialise a non-blocking file subscriber writing to `<build_dir>/sindri.log` immediately after the workspace is loaded
+  - [x] Test: running with `--log` creates `<build_dir>/sindri.log` containing trace output
+  - [x] Test: running without `--log` creates no log file
+  - [x] Test: terminal output contains no tracing output regardless of `--log`
+- [x] Verify `nickel-lang` compiles and its API matches what was researched (evaluate a trivial `.ncl` expression, extract a value)
+  - [x] Test: evaluating a Nickel record and extracting a string field succeeds
 
-- [ ] Define Rust structs for `Workspace` and `Module` (with `serde::Deserialize`); use newtypes throughout (`Version`, `ModuleName`, `WorkspaceName`, `BuildDirectory`, `Repository`, `Language`, `WorkspaceRoot`, `BuildFile`)
-  - [ ] Test: `Workspace` deserializes correctly from a valid Nickel record
-  - [ ] Test: `Module` deserializes correctly from a valid Nickel record
-  - [ ] Test: missing required field in `Workspace` produces a `Schema` error
-  - [ ] Test: missing required field in `Module` produces a `Schema` error
-  - [ ] Test: `build_dir` defaults to `.target` when omitted from `sindri.workspace`
+- [x] Define Rust structs for `Workspace` and `Module` (with `serde::Deserialize`); use newtypes throughout (`Version`, `ModuleName`, `WorkspaceName`, `BuildDirectory`, `Repository`, `Language`, `WorkspaceRoot`, `BuildFile`)
+  - [x] Test: `Workspace` deserializes correctly from a valid Nickel record
+  - [x] Test: `Module` deserializes correctly from a valid Nickel record
+  - [x] Test: missing required field in `Workspace` produces a `Schema` error
+  - [x] Test: missing required field in `Module` produces a `Schema` error
+  - [x] Test: `build_dir` defaults to `.target` when omitted from `sindri.workspace`
 
-- [ ] Define all error types using `thiserror` + `#[diagnostic]`; every error must include a `help` message with a concrete call to action
-  - [ ] Test: every error variant has a non-empty `help` string
-  - [ ] Test: every error variant has a diagnostic `code`
+- [x] Define all error types using `thiserror` + `#[diagnostic]`; every error must include a `help` message with a concrete call to action
+  - [x] Test: every error variant has a non-empty `help` string
+  - [x] Test: every error variant has a diagnostic `code`
 
-- [ ] Wrap Nickel evaluation errors so they are presented through `miette` with source context
-  - [ ] Test: a Nickel syntax error in `sindri.workspace` produces a `NickelEval` error containing the file path
+- [x] Wrap Nickel evaluation errors so they are presented through `miette` with source context
+  - [x] Test: a Nickel syntax error in `sindri.workspace` produces a `NickelEval` error containing the file path
 
-- [ ] Implement workspace root detection: walk up from CWD until `sindri.workspace` is found; error if none found before the filesystem root; error if `sindri.workspace` is a symlink
-  - [ ] Test: finds the workspace root when invoked from the workspace root directory
-  - [ ] Test: finds the workspace root when invoked from a subdirectory
-  - [ ] Test: returns `WorkspaceNotFound` when no `sindri.workspace` exists anywhere in the tree
-  - [ ] Test: returns `SymlinkNotSupported` when `sindri.workspace` is a symlink
+- [x] Implement workspace root detection: walk up from CWD until `sindri.workspace` is found; error if none found before the filesystem root; error if `sindri.workspace` is a symlink
+  - [x] Test: finds the workspace root when invoked from the workspace root directory
+  - [x] Test: finds the workspace root when invoked from a subdirectory
+  - [x] Test: returns `WorkspaceNotFound` when no `sindri.workspace` exists anywhere in the tree
+  - [x] Test: returns `SymlinkNotSupported` when `sindri.workspace` is a symlink
 
-- [ ] Load `sindri.workspace`: evaluate via Nickel, deserialize into `Workspace` struct
-  - [ ] Test: loads a valid `sindri.workspace` and returns the expected field values
-  - [ ] Test: returns `NickelEval` on a file with a Nickel syntax error
-  - [ ] Test: returns `Schema` when a required field is missing
+- [x] Load `sindri.workspace`: evaluate via Nickel, deserialize into `Workspace` struct
+  - [x] Test: loads a valid `sindri.workspace` and returns the expected field values
+  - [x] Test: returns `NickelEval` on a file with a Nickel syntax error
+  - [x] Test: returns `Schema` when a required field is missing
 
-- [ ] Write the `Workspace` Nickel contract (`.ncl` file shipped with Sindri) and apply it during loading for richer error messages
-  - [ ] Test: contract violation (e.g. wrong type for a field) produces an error with source location context
-  - [ ] Test: valid `sindri.workspace` passes the contract without error
+- [x] Write the `Workspace` Nickel contract (`.ncl` file shipped with Sindri) and apply it during loading for richer error messages
+  - [x] Test: contract violation (e.g. wrong type for a field) produces an error with source location context
+  - [x] Test: valid `sindri.workspace` passes the contract without error
 
-- [ ] Write the `Module` Nickel contract (`.ncl` file shipped with Sindri) and apply it during loading
-  - [ ] Test: contract violation produces an error with source location context
-  - [ ] Test: valid `sindri.build` passes the contract without error
+- [x] Write the `Module` Nickel contract (`.ncl` file shipped with Sindri) and apply it during loading
+  - [x] Test: contract violation produces an error with source location context
+  - [x] Test: valid `sindri.build` passes the contract without error
 
-- [ ] Implement module entry-point detection: walk up from CWD until `sindri.build` (or `sindri-<qualifier>.build`) is found, stopping at the workspace root; error if none found; error if the build file is a symlink
-  - [ ] Test: finds `sindri.build` in the current directory
-  - [ ] Test: finds `sindri.build` in a parent directory (but not past the workspace root)
-  - [ ] Test: finds `sindri-kotlin.build` when no `sindri.build` exists
-  - [ ] Test: does not escape past the workspace root into parent directories
-  - [ ] Test: returns `ModuleNotFound` when no build file exists within the workspace
-  - [ ] Test: returns `SymlinkNotSupported` when the build file is a symlink
+- [x] Implement module entry-point detection: walk up from CWD until `sindri.build` (or `sindri-<qualifier>.build`) is found, stopping at the workspace root; error if none found; error if the build file is a symlink
+  - [x] Test: finds `sindri.build` in the current directory
+  - [x] Test: finds `sindri.build` in a parent directory (but not past the workspace root)
+  - [x] Test: finds `sindri-kotlin.build` when no `sindri.build` exists
+  - [x] Test: does not escape past the workspace root into parent directories
+  - [x] Test: returns `ModuleNotFound` when no build file exists within the workspace
+  - [x] Test: returns `SymlinkNotSupported` when the build file is a symlink
 
-- [ ] Load `sindri.build`: evaluate via Nickel, deserialize into `Module` struct
-  - [ ] Test: loads a valid `sindri.build` and returns the expected field values
-  - [ ] Test: returns `NickelEval` on a file with a Nickel syntax error
-  - [ ] Test: returns `Schema` when a required field is missing
+- [x] Load `sindri.build`: evaluate via Nickel, deserialize into `Module` struct
+  - [x] Test: loads a valid `sindri.build` and returns the expected field values
+  - [x] Test: returns `NickelEval` on a file with a Nickel syntax error
+  - [x] Test: returns `Schema` when a required field is missing
 
 ---
 

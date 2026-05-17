@@ -36,8 +36,16 @@ cov-open:
     cargo llvm-cov --open
 
 # Build in release mode
-build:
-    cargo build --release
+build type="debug": fmt
+    #!/usr/bin/env bash
+    if [ {{type}} == 'debug' ]; then
+        cargo build
+    elif [ {{type}} == 'release' ]; then
+        cargo build --release
+    else
+        echo 'Unknown build target: {{type}}'
+        exit 1
+    fi
 
 # Check code without building
 check:
