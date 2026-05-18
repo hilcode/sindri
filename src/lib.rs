@@ -1,6 +1,10 @@
 pub mod error;
+pub mod lifecycle;
+pub mod local_time_with_elapsed;
 pub mod module;
 pub mod nickel_eval;
+pub mod output;
+pub mod plugin;
 pub mod types;
 pub mod workspace;
 

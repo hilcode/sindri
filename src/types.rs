@@ -1,10 +1,32 @@
 use serde::Deserialize;
+use smol_str::SmolStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Step(SmolStr);
+
+impl Step {
+    pub fn new(name: impl Into<SmolStr>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl AsRef<str> for Step {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
-pub struct Version(String);
+pub struct Version(SmolStr);
 
 impl AsRef<str> for Version {
     fn as_ref(&self) -> &str {
@@ -14,7 +36,7 @@ impl AsRef<str> for Version {
 
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
-pub struct ModuleName(String);
+pub struct ModuleName(SmolStr);
 
 impl AsRef<str> for ModuleName {
     fn as_ref(&self) -> &str {
@@ -24,19 +46,9 @@ impl AsRef<str> for ModuleName {
 
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
-pub struct WorkspaceName(String);
+pub struct WorkspaceName(SmolStr);
 
 impl AsRef<str> for WorkspaceName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-pub struct Repository(String);
-
-impl AsRef<str> for Repository {
     fn as_ref(&self) -> &str {
         &self.0
     }
@@ -61,23 +73,15 @@ impl AsRef<Path> for BuildDirectory {
 #[derive(Debug)]
 pub enum Language {
     Go,
-    Rust,
-    Java,
-    Kotlin,
-    Zig,
 }
 
 impl<'de> Deserialize<'de> for Language {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: String = String::deserialize(deserializer)?;
+        let value: SmolStr = SmolStr::deserialize(deserializer)?;
         match value.as_str() {
             "go" => Ok(Language::Go),
-            "rust" => Ok(Language::Rust),
-            "java" => Ok(Language::Java),
-            "kotlin" => Ok(Language::Kotlin),
-            "zig" => Ok(Language::Zig),
             other => Err(serde::de::Error::custom(format!(
-                "unknown language `{other}`; expected one of: go, rust, java, kotlin, zig"
+                "unknown language `{other}`; expected one of: go"
             ))),
         }
     }

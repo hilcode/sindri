@@ -6,5 +6,4 @@
     name | String,
     version | String,
   } | optional,
-  repositories | Array String | optional,
 }

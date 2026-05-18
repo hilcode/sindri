@@ -68,19 +68,19 @@ Tests in this phase use temporary directories (`tempfile` crate, added as a dev-
 Goal: Sindri knows what tasks exist and in what order they run.
 `sindri lifecycle` prints the resolved lifecycle.
 
-- [ ] Add `tempfile` as a dev-dependency
-- [ ] Define Rust types: `Plugin`, `Task`, `LifecycleStep` (matching the shape a loaded plugin would produce)
-  - [ ] Test: the fixed lifecycle sequence contains the expected steps in the correct order
-- [ ] Implement the fixed lifecycle sequence as a static ordered list
-- [ ] Implement the built-in Go plugin as a static Rust value (same `Plugin` type as above, not loaded from disk)
-  - [ ] Test: the Go plugin contributes tasks to the correct lifecycle steps
-- [ ] Implement task graph construction for a single module: collect tasks bound to each step, add step-ordering edges
-  - [ ] Test: tasks within the same step have no ordering edges between them
-  - [ ] Test: all tasks in step N precede all tasks in step N+1
-- [ ] Add `lifecycle` subcommand to the CLI: print the resolved lifecycle steps and the tasks bound to each
-  - [ ] Integration test: `sindri lifecycle` output contains the expected steps and Go tasks
-- [ ] Add `compile` subcommand to the CLI (no execution yet — just resolves and prints the task graph that would run)
-  - [ ] Integration test: `sindri compile --dry-run` (or equivalent) prints the expected task graph
+- [x] Add `tempfile` as a dev-dependency
+- [x] Define Rust types: `Plugin`, `Task`, `Step` (matching the shape a loaded plugin would produce)
+  - [x] Test: the fixed lifecycle sequence contains the expected steps in the correct order
+- [x] Implement the fixed lifecycle sequence as a static ordered list
+- [x] Implement the built-in Go plugin as a static Rust value (same `Plugin` type as above, not loaded from disk)
+  - [x] Test: the Go plugin contributes tasks to the correct lifecycle steps
+- [x] Implement task graph construction for a single module: collect tasks bound to each step, add step-ordering edges
+  - [x] Test: tasks within the same step have no ordering edges between them
+  - [x] Test: all tasks in step N precede all tasks in step N+1
+- [x] Add `lifecycle` subcommand to the CLI: print the resolved lifecycle steps and the tasks bound to each
+  - [x] Integration test: `sindri lifecycle` output contains the expected steps and Go tasks
+- [x] Add `compile` subcommand to the CLI (no execution yet — just resolves and prints the task graph that would run)
+  - [x] Integration test: `sindri compile` prints the expected task graph
 
 ---
 
