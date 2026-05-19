@@ -1,6 +1,10 @@
+use crate::types::ShellCommand;
 use crate::types::Step;
+use serde::Deserialize;
 use smol_str::SmolStr;
-use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskName(SmolStr);
@@ -17,13 +21,14 @@ impl AsRef<str> for TaskName {
     }
 }
 
-impl fmt::Display for TaskName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for TaskName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.write_str(&self.0)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
 pub struct PluginName(SmolStr);
 
 impl PluginName {
@@ -32,23 +37,8 @@ impl PluginName {
     }
 }
 
-impl fmt::Display for PluginName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ShellCommand(SmolStr);
-
-impl ShellCommand {
-    pub fn new(command: impl Into<SmolStr>) -> Self {
-        Self(command.into())
-    }
-}
-
-impl fmt::Display for ShellCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for PluginName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.write_str(&self.0)
     }
 }
@@ -62,25 +52,64 @@ impl Glob {
     }
 }
 
-impl fmt::Display for Glob {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Glob {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.write_str(&self.0)
     }
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Task {
-    pub name: TaskName,
-    pub step: Step,
-    pub command: ShellCommand,
-    pub inputs: Vec<Glob>,
-    pub outputs: Vec<Glob>,
+    name: TaskName,
+    step: Step,
+    command: ShellCommand,
+    inputs: Vec<Glob>,
+    outputs: Vec<Glob>,
+}
+
+impl Task {
+    pub fn new(name: TaskName, step: Step, command: ShellCommand, inputs: Vec<Glob>, outputs: Vec<Glob>) -> Task {
+        Task {
+            name,
+            step,
+            command,
+            inputs,
+            outputs,
+        }
+    }
+
+    pub fn name(&self) -> &TaskName {
+        &self.name
+    }
+
+    pub fn step(&self) -> &Step {
+        &self.step
+    }
+
+    pub fn command(&self) -> &ShellCommand {
+        &self.command
+    }
 }
 
 #[derive(Debug)]
 pub struct Plugin {
-    pub name: PluginName,
-    pub tasks: Vec<Task>,
+    name: PluginName,
+    tasks: Vec<Task>,
+}
+
+impl Plugin {
+    pub fn new(name: PluginName, tasks: Vec<Task>) -> Plugin {
+        Plugin { name, tasks }
+    }
+
+    pub fn name(&self) -> &PluginName {
+        &self.name
+    }
+
+    pub fn tasks(&self) -> &[Task] {
+        &self.tasks
+    }
 }
 
 pub fn go_plugin() -> Plugin {
@@ -121,16 +150,16 @@ mod tests {
         let plugin: Plugin = go_plugin();
         let tasks_in = |step_name: &str| -> Vec<&Task> {
             let step: Step = Step::new(step_name);
-            plugin.tasks.iter().filter(|task| task.step == step).collect()
+            plugin.tasks.iter().filter(|task| task.step() == &step).collect()
         };
         let format_tasks: Vec<&Task> = tasks_in("format");
         let compile_tasks: Vec<&Task> = tasks_in("compile");
         let test_tasks: Vec<&Task> = tasks_in("test");
         assert_eq!(format_tasks.len(), 1);
-        assert_eq!(format_tasks[0].name, TaskName::new("go-format"));
+        assert_eq!(format_tasks[0].name(), &TaskName::new("go-format"));
         assert_eq!(compile_tasks.len(), 1);
-        assert_eq!(compile_tasks[0].name, TaskName::new("go-compile"));
+        assert_eq!(compile_tasks[0].name(), &TaskName::new("go-compile"));
         assert_eq!(test_tasks.len(), 1);
-        assert_eq!(test_tasks[0].name, TaskName::new("go-test"));
+        assert_eq!(test_tasks[0].name(), &TaskName::new("go-test"));
     }
 }

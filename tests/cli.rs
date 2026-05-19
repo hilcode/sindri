@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
@@ -29,6 +30,26 @@ fn module_dir() -> TempDir {
         r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
     )
     .unwrap();
+    directory
+}
+
+fn testdata_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("testdata")
+}
+
+fn go_module_dir() -> TempDir {
+    let directory: TempDir = module_dir();
+    let source: PathBuf = testdata_dir().join("go-module");
+    fs::copy(source.join("main.go"), directory.path().join("main.go")).unwrap();
+    fs::copy(source.join("go.mod"), directory.path().join("go.mod")).unwrap();
+    directory
+}
+
+fn failing_go_module_dir() -> TempDir {
+    let directory: TempDir = module_dir();
+    let source: PathBuf = testdata_dir().join("failing-go-module");
+    fs::copy(source.join("main.go"), directory.path().join("main.go")).unwrap();
+    fs::copy(source.join("go.mod"), directory.path().join("go.mod")).unwrap();
     directory
 }
 
@@ -146,13 +167,78 @@ fn lifecycle_short_all_flag() {
 }
 
 #[test]
-fn compile_shows_task_graph() {
-    let directory: TempDir = module_dir();
+fn compile_in_valid_go_module_exits_zero() {
+    let directory: TempDir = go_module_dir();
     let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "expected exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn compile_shows_progress_output() {
+    let directory: TempDir = go_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
     let stdout: String = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(stdout.contains("go-compile"), "missing go-compile task");
-    assert!(stdout.contains("go build ./..."), "missing go build command");
+    assert!(stdout.contains("go-compile"), "missing go-compile progress line");
+    assert!(stdout.contains('\u{2713}'), "missing success checkmark");
+}
+
+#[test]
+fn compile_quiet_flag_suppresses_progress() {
+    let directory: TempDir = go_module_dir();
+    let output: Output = sindri()
+        .args(["compile", "--quiet"])
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "expected no stdout with --quiet; got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn compile_creates_telemetry_json() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let telemetry_path: PathBuf = directory.path().join(".target").join("telemetry.json");
+    assert!(telemetry_path.exists(), "telemetry.json was not created");
+    let content: String = fs::read_to_string(&telemetry_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let events: &Vec<serde_json::Value> = parsed["traceEvents"].as_array().unwrap();
+    assert!(!events.is_empty(), "traceEvents should not be empty");
+    for event in events {
+        assert!(event["dur"].as_u64().unwrap() > 0, "all dur values should be positive");
+    }
+}
+
+#[test]
+fn compile_failing_go_code_exits_nonzero() {
+    let directory: TempDir = failing_go_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(!output.status.success(), "expected non-zero exit for broken Go code");
+    assert!(!output.stderr.is_empty(), "expected error output on stderr");
+}
+
+#[test]
+fn compile_quiet_with_failure_still_shows_error() {
+    let directory: TempDir = failing_go_module_dir();
+    let output: Output = sindri()
+        .args(["compile", "--quiet"])
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "expected non-zero exit");
+    assert!(
+        !output.stderr.is_empty(),
+        "expected error output on stderr even with --quiet"
+    );
+    assert!(output.stdout.is_empty(), "expected no stdout with --quiet");
 }
 
 #[test]

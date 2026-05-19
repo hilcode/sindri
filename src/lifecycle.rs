@@ -1,23 +1,67 @@
-use crate::module;
+use crate::error::SindriError;
+use crate::executor::ExecutionConfig;
+use crate::executor::TaskOutcome;
+use crate::executor::execute_graph;
 use crate::module::Module;
-use crate::output::Output;
 use crate::plugin::go_plugin;
 use crate::plugin::{Plugin, Task};
+use crate::runtime::Runtime;
+use crate::telemetry::Telemetry;
+use crate::types::AbsoluteDirectory;
 use crate::types::BuildFile;
+#[cfg(test)]
+use crate::types::Stdout;
 use crate::types::Step;
-use crate::types::WorkspaceRoot;
-use ::std::path::Path;
-use miette::IntoDiagnostic;
-use std::io::{self, Write};
+use crate::workspace::Workspace;
+use miette::Result as MietteResult;
+use std::io::Result as IoResult;
+use std::io::Write;
 
 pub struct TaskGraphNode {
-    pub task: Task,
-    pub step: Step,
+    task: Task,
+    step: Step,
+}
+
+impl TaskGraphNode {
+    pub fn new(task: Task, step: Step) -> TaskGraphNode {
+        TaskGraphNode { task, step }
+    }
+
+    pub fn task(&self) -> &Task {
+        &self.task
+    }
+
+    pub fn step(&self) -> &Step {
+        &self.step
+    }
 }
 
 pub struct TaskGraph {
-    pub nodes: Vec<TaskGraphNode>,
-    pub edges: Vec<(usize, usize)>,
+    nodes: Vec<TaskGraphNode>,
+}
+
+impl TaskGraph {
+    pub fn nodes(&self) -> &[TaskGraphNode] {
+        &self.nodes
+    }
+}
+
+pub struct TaskGraphBuilder {
+    nodes: Vec<TaskGraphNode>,
+}
+
+impl TaskGraphBuilder {
+    pub fn new() -> TaskGraphBuilder {
+        TaskGraphBuilder { nodes: Vec::new() }
+    }
+
+    pub fn add_node(&mut self, node: TaskGraphNode) {
+        self.nodes.push(node);
+    }
+
+    pub fn build(self) -> TaskGraph {
+        TaskGraph { nodes: self.nodes }
+    }
 }
 
 pub struct Lifecycle {
@@ -44,33 +88,31 @@ impl Lifecycle {
         }
     }
 
-    pub fn run_lifecycle(&self, show_all: bool, output: &mut impl Output) -> io::Result<()> {
+    pub fn run_lifecycle(&self, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
         let plugin: Plugin = go_plugin();
-        self.write(&[&plugin], show_all, output)
+        self.write(&[&plugin], show_all, &mut runtime.output())
     }
 
     pub fn run_compile(
         self,
-        current_directory: &Path,
-        workspace_root: &WorkspaceRoot,
-        output: &mut impl Output,
-    ) -> miette::Result<()> {
-        let build_file: BuildFile = module::find_entry_point(current_directory, workspace_root)?;
-        let loaded_module: Module = module::load(&build_file)?;
-        output.info(&format!("Module loaded: {}", loaded_module.name.as_ref()));
+        workspace: &Workspace,
+        config: &ExecutionConfig,
+        runtime: &impl Runtime,
+    ) -> MietteResult<()> {
+        let build_file: BuildFile = BuildFile::find(workspace, runtime)?;
+        let loaded_module: Module = Module::load(&build_file, workspace, runtime)?;
+        runtime
+            .log(&format!("Module loaded: {}", loaded_module.name().as_ref()))
+            .map_err(|source| SindriError::Log { source })?;
         let plugin: Plugin = go_plugin();
         let compile_step: Step = Step::new("compile");
         let graph: TaskGraph = self
             .build_task_graph(&[&plugin], &compile_step)
             .expect("compile is a built-in lifecycle step");
-        for node in &graph.nodes {
-            writeln!(
-                output,
-                "  {:<20} {:<14} {}",
-                node.task.name, node.step, node.task.command
-            )
-            .into_diagnostic()?;
-        }
+        let absolute_working_directory: AbsoluteDirectory = workspace.absolute_working_directory();
+        let outcomes: Vec<TaskOutcome> = execute_graph(&graph, &absolute_working_directory, config, runtime)?;
+        let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+        let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
         Ok(())
     }
 
@@ -78,12 +120,12 @@ impl Lifecycle {
         &self.steps
     }
 
-    pub fn write(&self, plugins: &[&Plugin], show_all: bool, writer: &mut impl Write) -> io::Result<()> {
+    pub fn write(&self, plugins: &[&Plugin], show_all: bool, writer: &mut impl Write) -> IoResult<()> {
         for step in &self.steps {
             let step_tasks: Vec<&Task> = plugins
                 .iter()
-                .flat_map(|plugin| plugin.tasks.iter())
-                .filter(|task| &task.step == step)
+                .flat_map(|plugin: &&Plugin| -> std::slice::Iter<'_, Task> { plugin.tasks().iter() })
+                .filter(|task: &&Task| -> bool { task.step() == step })
                 .collect();
             if step_tasks.is_empty() {
                 if show_all {
@@ -93,7 +135,7 @@ impl Lifecycle {
             } else {
                 writeln!(writer, "{step}")?;
                 for task in &step_tasks {
-                    writeln!(writer, "    {:<20} {}", task.name, task.command)?;
+                    writeln!(writer, "    {:<20} {}", task.name(), task.command())?;
                 }
             }
         }
@@ -101,15 +143,15 @@ impl Lifecycle {
     }
 
     pub fn build_task_graph(&self, plugins: &[&Plugin], target: &Step) -> Option<TaskGraph> {
-        let target_index: usize = self.steps.iter().position(|step| step == target)?;
+        let target_index: usize = self.steps.iter().position(|step: &Step| -> bool { step == target })?;
         let steps_in_scope: &[Step] = &self.steps[..=target_index];
 
-        let mut nodes: Vec<TaskGraphNode> = Vec::new();
+        let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
         for step in steps_in_scope {
             for plugin in plugins {
-                for task in &plugin.tasks {
-                    if &task.step == step {
-                        nodes.push(TaskGraphNode {
+                for task in plugin.tasks() {
+                    if task.step() == step {
+                        builder.add_node(TaskGraphNode {
                             task: task.clone(),
                             step: step.clone(),
                         });
@@ -118,57 +160,59 @@ impl Lifecycle {
             }
         }
 
-        let mut edges: Vec<(usize, usize)> = Vec::new();
-        let node_indices_by_occupied_step: Vec<Vec<usize>> = steps_in_scope
-            .iter()
-            .map(|step: &Step| {
-                nodes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, node)| &node.step == step)
-                    .map(|(node_index, _)| node_index)
-                    .collect::<Vec<usize>>()
-            })
-            .filter(|node_indices: &Vec<usize>| !node_indices.is_empty())
-            .collect();
-        for window in node_indices_by_occupied_step.windows(2) {
-            let from_indices: &Vec<usize> = &window[0];
-            let to_indices: &Vec<usize> = &window[1];
-            for &from_index in from_indices {
-                for &to_index in to_indices {
-                    edges.push((from_index, to_index));
-                }
-            }
-        }
-
-        Some(TaskGraph { nodes, edges })
+        Some(builder.build())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::CapturedOutput;
-    use crate::plugin::{Plugin, PluginName, ShellCommand, Task, TaskName, go_plugin};
-    use crate::types::WorkspaceRoot;
-    use std::fs;
-    use tempfile::TempDir;
+    use crate::executor::Verbosity;
+    use crate::plugin::{Plugin, PluginName, Task, TaskName, go_plugin};
+    use crate::runtime::DummyRuntime;
+    use crate::runtime::DummyRuntimeBuilder;
+    use crate::types::BuildStart;
+    use crate::types::CommandOutput;
+    use crate::types::ShellCommand;
+    use crate::types::Stderr;
+    use crate::types::TaskStatus;
+    use crate::workspace::Workspace;
+
+    fn succeeded() -> CommandOutput {
+        CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded)
+    }
+
+    fn failed() -> CommandOutput {
+        CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Failed)
+    }
+
+    /// A runtime seeded with a minimal Go workspace and module, ready for a `compile` run. Callers
+    /// register the command outcomes (`gofmt`, `go build`) the test wants to exercise.
+    fn go_workspace() -> DummyRuntimeBuilder {
+        DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+            )
+            .current_directory("/workspace")
+    }
 
     fn make_task(name: &str, step: &str) -> Task {
-        Task {
-            name: TaskName::new(name),
-            step: Step::new(step),
-            command: ShellCommand::new(""),
-            inputs: vec![],
-            outputs: vec![],
-        }
+        Task::new(
+            TaskName::new(name),
+            Step::new(step),
+            ShellCommand::new(""),
+            vec![],
+            vec![],
+        )
     }
 
     fn make_plugin(tasks: Vec<Task>) -> Plugin {
-        Plugin {
-            name: PluginName::new("test"),
-            tasks,
-        }
+        Plugin::new(PluginName::new("test"), tasks)
     }
 
     #[test]
@@ -195,44 +239,30 @@ mod tests {
     }
 
     #[test]
-    fn tasks_within_same_step_have_no_edges() {
-        let plugin: Plugin = make_plugin(vec![make_task("task-a", "compile"), make_task("task-b", "compile")]);
-        let lifecycle: Lifecycle = Lifecycle::new();
-        let graph: TaskGraph = lifecycle.build_task_graph(&[&plugin], &Step::new("compile")).unwrap();
-        assert_eq!(graph.nodes.len(), 2);
-        assert!(graph.edges.is_empty());
-    }
-
-    #[test]
-    fn all_tasks_in_earlier_step_precede_later_step_tasks() {
+    fn nodes_are_ordered_by_lifecycle_step() {
         let plugin: Plugin = make_plugin(vec![
             make_task("compile-task", "compile"),
             make_task("test-task", "test"),
         ]);
         let lifecycle: Lifecycle = Lifecycle::new();
         let graph: TaskGraph = lifecycle.build_task_graph(&[&plugin], &Step::new("test")).unwrap();
-        assert_eq!(graph.nodes.len(), 2);
-        let compile_index: usize = graph
-            .nodes
+        let names: Vec<&str> = graph
+            .nodes()
             .iter()
-            .position(|node| node.task.name.as_ref() == "compile-task")
-            .unwrap();
-        let test_index: usize = graph
-            .nodes
-            .iter()
-            .position(|node| node.task.name.as_ref() == "test-task")
-            .unwrap();
-        assert!(graph.edges.contains(&(compile_index, test_index)));
-        assert!(!graph.edges.contains(&(test_index, compile_index)));
+            .map(|node: &TaskGraphNode| -> &str { node.task().name().as_ref() })
+            .collect();
+        // The executor derives step ordering positionally from this node order, so build_task_graph
+        // must emit every compile-step task before every test-step task.
+        assert_eq!(names, vec!["compile-task", "test-task"]);
     }
 
     #[test]
     fn write_hides_empty_steps_by_default() {
         let lifecycle: Lifecycle = Lifecycle::new();
         let plugin: Plugin = go_plugin();
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&[&plugin], false, &mut buffer).unwrap();
-        let output: String = String::from_utf8(buffer).unwrap();
+        let output: &str = buffer.as_str();
         assert!(output.contains("go-compile"));
         assert!(output.contains("go-test"));
         assert!(!output.contains("(no tasks)"));
@@ -242,39 +272,90 @@ mod tests {
     fn write_shows_empty_steps_with_all_flag() {
         let lifecycle: Lifecycle = Lifecycle::new();
         let plugin: Plugin = go_plugin();
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&[&plugin], true, &mut buffer).unwrap();
-        let output: String = String::from_utf8(buffer).unwrap();
+        let output: &str = buffer.as_str();
         assert!(output.contains("(no tasks)"));
     }
 
     #[test]
-    fn run_compile_logs_module_name_and_writes_task_graph() {
-        let directory: TempDir = TempDir::new().unwrap();
-        fs::write(
-            directory.path().join("sindri.workspace"),
-            r#"{ name = "test", sindri_version = "0.1.0" }"#,
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("sindri.build"),
-            r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
-        )
-        .unwrap();
-        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(directory.path().to_path_buf());
-        let lifecycle: Lifecycle = Lifecycle::new();
-        let mut output: CapturedOutput = CapturedOutput::new();
-        lifecycle
-            .run_compile(directory.path(), &workspace_root, &mut output)
-            .unwrap();
+    fn run_compile_logs_the_loaded_module() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+            )
+            .command("gofmt -l .", succeeded())
+            .command("go build ./...", succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap();
+        assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
+    }
+
+    #[test]
+    fn run_compile_creates_the_build_directory_and_writes_telemetry() {
+        let runtime: DummyRuntime = go_workspace()
+            .command("gofmt -l .", succeeded())
+            .command("go build ./...", succeeded())
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap();
+        assert!(runtime.created_directory("/workspace/.target"));
         assert!(
-            output.log.iter().any(|message| message.contains("my-app")),
-            "module name should be logged; got: {:?}",
-            output.log
+            runtime.written_file("/workspace/.target/telemetry.json").is_some(),
+            "expected a telemetry trace to be written to the build directory",
+        );
+    }
+
+    #[test]
+    fn run_compile_fails_when_the_build_command_fails() {
+        let runtime: DummyRuntime = go_workspace()
+            .command("gofmt -l .", succeeded())
+            .command("go build ./...", failed())
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        let result: MietteResult<()> = Lifecycle::new().run_compile(&workspace, &config, &runtime);
+        assert!(result.is_err(), "a failing build command should fail the compile");
+    }
+
+    #[test]
+    fn run_compile_fails_when_no_build_file_is_present() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        let result: MietteResult<()> = Lifecycle::new().run_compile(&workspace, &config, &runtime);
+        assert!(result.is_err(), "compile should fail when no build file can be found");
+    }
+
+    #[test]
+    fn run_lifecycle_prints_the_compile_step_and_its_tasks() {
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        Lifecycle::new().run_lifecycle(false, &runtime).unwrap();
+        let output: Stdout = runtime.captured_output();
+        assert!(
+            output.as_str().contains("compile"),
+            "expected the compile step in the output, got:\n{}",
+            output.as_str(),
         );
         assert!(
-            output.stdout_str().contains("go-compile"),
-            "task graph should include go-compile"
+            output.as_str().contains("go build ./..."),
+            "expected the go build task in the output, got:\n{}",
+            output.as_str(),
         );
     }
 }

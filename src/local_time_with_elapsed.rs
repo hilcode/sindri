@@ -1,30 +1,29 @@
-use std::fmt;
-use std::time::Instant;
+use crate::types::BuildStart;
+use std::time::Duration;
 use time::OffsetDateTime;
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::time::FormatTime;
+use time::UtcOffset;
 
+/// Renders a log-line prefix combining the local wall-clock time with the elapsed time since a
+/// fixed start. The timezone offset is captured once (see [`crate::runtime::Bootstrap::into_runtime`])
+/// so the prefix is reproducible and never has to consult the system timezone again.
 pub struct LocalTimeWithElapsed {
-    start: Instant,
+    start: BuildStart,
+    offset: UtcOffset,
 }
 
 impl LocalTimeWithElapsed {
-    pub fn new(start: Instant) -> LocalTimeWithElapsed {
-        LocalTimeWithElapsed { start }
+    pub fn new(start: BuildStart, offset: UtcOffset) -> LocalTimeWithElapsed {
+        LocalTimeWithElapsed { start, offset }
     }
-}
 
-impl FormatTime for LocalTimeWithElapsed {
-    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
-        let now: OffsetDateTime =
-            OffsetDateTime::now_local().unwrap_or_else(|_| -> OffsetDateTime { OffsetDateTime::now_utc() });
-        let elapsed_ms: u64 = self.start.elapsed().as_millis() as u64;
-        let millis: u64 = elapsed_ms % 1000;
-        let total_seconds: u64 = elapsed_ms / 1000;
+    pub fn format(&self) -> String {
+        let now: OffsetDateTime = OffsetDateTime::now_utc().to_offset(self.offset);
+        let elapsed: Duration = self.start.elapsed();
+        let total_seconds: u64 = elapsed.as_secs();
+        let millis: u32 = elapsed.subsec_millis();
         let seconds: u64 = total_seconds % 60;
         let minutes: u64 = total_seconds / 60;
-        write!(
-            writer,
+        format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03} [{minutes:04}:{seconds:02}.{millis:03}]",
             now.year(),
             now.month() as u8,
@@ -40,15 +39,11 @@ impl FormatTime for LocalTimeWithElapsed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     #[test]
-    fn format_time_produces_expected_structure() {
-        let start: Instant = Instant::now();
-        let formatter: LocalTimeWithElapsed = LocalTimeWithElapsed::new(start);
-        let mut output: String = String::new();
-        let mut writer: Writer<'_> = Writer::new(&mut output);
-        formatter.format_time(&mut writer).unwrap();
+    fn format_produces_expected_structure() {
+        let formatter: LocalTimeWithElapsed = LocalTimeWithElapsed::new(BuildStart::now(), UtcOffset::UTC);
+        let output: String = formatter.format();
         // Expected shape: "2026-05-18T14:30:00.123 [0000:00.001]"
         assert!(output.contains('T'), "missing date/time separator");
         assert!(output.contains(" ["), "missing elapsed section open");
@@ -57,11 +52,8 @@ mod tests {
 
     #[test]
     fn elapsed_is_near_zero_when_measured_immediately() {
-        let start: Instant = Instant::now();
-        let formatter: LocalTimeWithElapsed = LocalTimeWithElapsed::new(start);
-        let mut output: String = String::new();
-        let mut writer: Writer<'_> = Writer::new(&mut output);
-        formatter.format_time(&mut writer).unwrap();
+        let formatter: LocalTimeWithElapsed = LocalTimeWithElapsed::new(BuildStart::now(), UtcOffset::UTC);
+        let output: String = formatter.format();
         assert!(
             output.contains("[0000:00."),
             "elapsed should show zero minutes and seconds"

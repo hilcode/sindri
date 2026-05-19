@@ -10,13 +10,12 @@ miette = { version = "7.6.0", features = ["fancy"] }
 nickel-lang = "2.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 smol_str = { version = "0.2", features = ["serde"] }
+serde_json = "1"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["local-offset"] }
-tracing = "0.1.44"
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3.27.0"
 
 [lints.clippy]

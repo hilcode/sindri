@@ -1,49 +1,70 @@
+use crate::plugin::TaskName;
+use crate::types::ShellCommand;
 use miette::Diagnostic;
+use std::io::Error as IoError;
+use std::path::PathBuf;
 use thiserror::Error;
+
+pub type SindriResult<T> = Result<T, SindriError>;
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SindriError {
-    #[error("no `sindri.workspace` file found starting from `{start}`")]
+    #[error("no `sindri.workspace` file found starting from `{}`", start.display())]
     #[diagnostic(
         help("create a `sindri.workspace` file in the root of your project"),
         code(sindri::workspace::not_found)
     )]
-    WorkspaceNotFound { start: String },
+    WorkspaceNotFound { start: PathBuf },
 
-    #[error("no `sindri.build` file found between `{start}` and the workspace root")]
+    #[error("no `sindri.build` file found between `{}` and the workspace root", start.display())]
     #[diagnostic(
         help("create a `sindri.build` file in your module directory"),
         code(sindri::module::not_found)
     )]
-    ModuleNotFound { start: String },
+    ModuleNotFound { start: PathBuf },
 
-    #[error("could not read `{path}`: {source}")]
+    #[error("could not read `{}`: {source}", path.display())]
     #[diagnostic(help("check that the file exists and is readable"), code(sindri::io))]
-    Io { path: String, source: std::io::Error },
+    Io { path: PathBuf, source: IoError },
 
-    #[error("failed to evaluate `{path}` as Nickel:\n\n{nickel_message}")]
+    #[error("could not write to the log: {source}")]
+    #[diagnostic(
+        help("check that the build directory is writable and the disk is not full"),
+        code(sindri::log)
+    )]
+    Log { source: IoError },
+
+    #[error("failed to evaluate `{}` as Nickel:\n\n{nickel_message}", path.display())]
     #[diagnostic(help("check the Nickel syntax in your build file"), code(sindri::nickel::eval))]
-    NickelEval { path: String, nickel_message: String },
+    NickelEval { path: PathBuf, nickel_message: String },
 
-    #[error("`{path}` has an invalid structure: {message}")]
+    #[error("`{}` has an invalid structure: {message}", path.display())]
     #[diagnostic(
         help("check that all required fields are present and have the correct types"),
         code(sindri::schema)
     )]
-    Schema { path: String, message: String },
+    Schema { path: PathBuf, message: String },
 
-    #[error("`{path}` is a symlink, which is not supported")]
+    #[error("`{}` is a symlink, which is not supported", path.display())]
     #[diagnostic(
         help("replace the symlink with the actual file"),
         code(sindri::symlink::not_supported)
     )]
-    SymlinkNotSupported { path: String },
+    SymlinkNotSupported { path: PathBuf },
+
+    #[error("task `{task_name}` failed\n\ncommand: {command}\n\noutput:\n{output}")]
+    #[diagnostic(help("check the command output above for details"), code(sindri::task::failed))]
+    TaskFailed {
+        task_name: TaskName,
+        command: ShellCommand,
+        output: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
+    use std::io::ErrorKind;
 
     fn assert_has_help_and_code(error: &SindriError) {
         assert!(error.help().is_some(), "error variant is missing help text: {error:?}");
@@ -55,23 +76,35 @@ mod tests {
 
     #[test]
     fn all_variants_have_help_and_code() {
-        let io_error: io::Error = io::Error::new(io::ErrorKind::NotFound, "not found");
-        assert_has_help_and_code(&SindriError::WorkspaceNotFound { start: "/tmp".into() });
-        assert_has_help_and_code(&SindriError::ModuleNotFound { start: "/tmp".into() });
+        let io_error: IoError = IoError::new(ErrorKind::NotFound, "not found");
+        assert_has_help_and_code(&SindriError::WorkspaceNotFound {
+            start: PathBuf::from("/tmp"),
+        });
+        assert_has_help_and_code(&SindriError::ModuleNotFound {
+            start: PathBuf::from("/tmp"),
+        });
         assert_has_help_and_code(&SindriError::Io {
-            path: "/tmp/foo".into(),
+            path: PathBuf::from("/tmp/foo"),
             source: io_error,
         });
+        assert_has_help_and_code(&SindriError::Log {
+            source: IoError::new(ErrorKind::WriteZero, "disk full"),
+        });
         assert_has_help_and_code(&SindriError::NickelEval {
-            path: "/tmp/foo".into(),
+            path: PathBuf::from("/tmp/foo"),
             nickel_message: "error".into(),
         });
         assert_has_help_and_code(&SindriError::Schema {
-            path: "/tmp/foo".into(),
+            path: PathBuf::from("/tmp/foo"),
             message: "missing field".into(),
         });
         assert_has_help_and_code(&SindriError::SymlinkNotSupported {
-            path: "/tmp/foo".into(),
+            path: PathBuf::from("/tmp/foo"),
+        });
+        assert_has_help_and_code(&SindriError::TaskFailed {
+            task_name: TaskName::new("go-compile"),
+            command: ShellCommand::new("go build ./..."),
+            output: "error: undefined".into(),
         });
     }
 }
