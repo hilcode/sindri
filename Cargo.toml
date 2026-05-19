@@ -9,6 +9,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 nickel-lang = "2.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
+smol_str = { version = "0.2", features = ["serde"] }
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["local-offset"] }
 tracing = "0.1.44"

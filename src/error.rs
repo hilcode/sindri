@@ -43,7 +43,6 @@ pub enum SindriError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use miette::Diagnostic as _;
     use std::io;
 
     fn assert_has_help_and_code(error: &SindriError) {

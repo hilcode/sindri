@@ -1,6 +1,6 @@
 use crate::error::SindriError;
 use crate::nickel_eval;
-use crate::types::{BuildDirectory, Repository, Version, WorkspaceFile, WorkspaceName, WorkspaceRoot};
+use crate::types::{BuildDirectory, Version, WorkspaceFile, WorkspaceName, WorkspaceRoot};
 use nickel_lang::Expr;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -25,8 +25,6 @@ pub struct Workspace {
     pub build_dir: BuildDirectory,
     #[serde(default)]
     pub plugins: Vec<PluginRef>,
-    #[serde(default)]
-    pub repositories: Vec<Repository>,
 }
 
 fn default_build_dir() -> BuildDirectory {
@@ -129,7 +127,6 @@ mod tests {
         assert_eq!(workspace.sindri_version.as_ref(), "0.1.0");
         assert_eq!(workspace.build_dir.as_ref(), Path::new(".target"));
         assert!(workspace.plugins.is_empty());
-        assert!(workspace.repositories.is_empty());
     }
 
     #[test]
