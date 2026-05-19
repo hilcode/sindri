@@ -2,6 +2,7 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::nickel_eval::Nickel;
+use crate::nickel_import::ScriptResolutionState;
 use crate::nickel_import::evaluate_hermetically;
 use crate::parameter::ParameterBinding;
 use crate::runtime::FileSystem;
@@ -213,6 +214,7 @@ impl Script {
         &self,
         inputs: &ScriptInputs,
         script_path: &AbsoluteFile,
+        resolution_state: &mut ScriptResolutionState,
         file_system: &impl FileSystem,
     ) -> SindriResult<Vec<Command>> {
         let source: String = format!(
@@ -226,7 +228,13 @@ impl Script {
             script = self.source,
             inputs = inputs.to_nickel_record(),
         );
-        let value: NickelValue = evaluate_hermetically(&source, script_path, inputs.workspace_root, file_system)?;
+        let value: NickelValue = evaluate_hermetically(
+            &source,
+            script_path,
+            inputs.workspace_root,
+            resolution_state,
+            file_system,
+        )?;
         Vec::<Command>::deserialize(value).map_err(|error| -> SindriError {
             SindriError::ScriptEvaluation {
                 nickel_message: error.to_string(),
@@ -289,7 +297,8 @@ mod tests {
             &module_directory,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
-        Script::new(script_source).evaluate(&inputs, &script_path(), &runtime)
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        Script::new(script_source).evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
     }
 
     #[test]
@@ -409,8 +418,9 @@ mod tests {
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(format!("{WORKSPACE}/{MODULE}/helper.ncl"), "\"go\"")
             .build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = Script::new("fun inputs => [ { program = import \"helper.ncl\" } ]")
-            .evaluate(&inputs, &script_path(), &runtime)
+            .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
             .unwrap();
         assert_eq!(commands[0].program(), "go");
     }
@@ -443,9 +453,10 @@ mod tests {
             &module_directory,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> =
             Script::new("fun inputs => [ { program = \"echo\", arguments = [ inputs.params.\"plugin\".mode ] } ]")
-                .evaluate(&inputs, &script_path(), &runtime)
+                .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
                 .unwrap();
         assert_eq!(commands[0].arguments(), &[SmolStr::new("debug")]);
     }
@@ -478,10 +489,11 @@ mod tests {
             &module_directory,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<Vec<Command>> = Script::new(
             "fun inputs => [ { program = \"echo\", arguments = [ inputs.params.verbose ] } ]",
         )
-        .evaluate(&inputs, &script_path(), &runtime);
+        .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime);
         assert!(matches!(result, Err(SindriError::ScriptEvaluation { .. })));
     }
 
@@ -525,7 +537,10 @@ mod tests {
                 &module_directory,
             );
             let runtime: DummyRuntime = DummyRuntime::builder().build();
-            let commands: Vec<Command> = script.evaluate(&inputs, &script_path(), &runtime).unwrap();
+            let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+            let commands: Vec<Command> = script
+                .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
+                .unwrap();
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].program(), program);
             assert_eq!(commands[0].arguments()[0], SmolStr::new(first_argument));
@@ -550,8 +565,9 @@ mod tests {
             &module_directory,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = Script::go_compile_executable()
-            .evaluate(&inputs, &script_path(), &runtime)
+            .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
             .unwrap();
         assert_eq!(
             commands[0].arguments(),

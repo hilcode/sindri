@@ -133,6 +133,7 @@ impl GoPlugin {
 mod tests {
     use super::*;
     use crate::module_graph::ModuleGraph;
+    use crate::nickel_import::ScriptResolutionState;
     use crate::parameter::ParameterName;
     use crate::parameter::ParameterState;
     use crate::parameter::ParameterValue;
@@ -189,12 +190,14 @@ mod tests {
     fn resolve_with(task: &Task, parameter_state: &ParameterState) -> Vec<Command> {
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         task.resolve(
             parameter_state,
             &RelativeDirectory::new_unchecked(""),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out")),
             &workspace_root,
+            &mut resolution_state,
             &runtime,
         )
         .unwrap()
@@ -341,6 +344,7 @@ mod tests {
     fn generate_go_work_task_inits_a_workspace_covering_every_go_module() {
         let task: Task = GoPlugin::generate_go_work_task(&module_graph_with_dependency(), &workspace_root());
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = task
             .resolve(
                 &ParameterState::default(),
@@ -348,6 +352,7 @@ mod tests {
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &workspace_root(),
+                &mut resolution_state,
                 &runtime,
             )
             .unwrap();

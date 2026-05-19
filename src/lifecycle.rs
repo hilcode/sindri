@@ -3,6 +3,7 @@ use crate::executor::BuildContext;
 use crate::executor::ExecutionConfig;
 use crate::executor::ModuleLocation;
 use crate::executor::ModuleRebuilt;
+use crate::executor::ScriptResolutionState;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
 use crate::executor::run_standalone_task;
@@ -138,11 +139,17 @@ impl Lifecycle {
             &absolute_build_directory,
             &cache,
         );
+        // One resolution state for the whole compile: every task's script — the standalone
+        // `generate-go-work` and every module's own tasks below — resolves its definition hash and,
+        // once run, its commands against these same two long-lived hubs, so a file shared by more
+        // than one task's script is read from disk at most once per pass for the entire build.
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let (go_work_outcome, go_work_output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
             &generate_go_work,
             &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
             &bootstrap_context,
             config,
+            &mut resolution_state,
             runtime,
         )?;
         outcomes.push(go_work_outcome);
@@ -182,6 +189,7 @@ impl Lifecycle {
                 &context,
                 dependency_rebuilt,
                 config,
+                &mut resolution_state,
                 runtime,
             )?;
             module_rebuilt.push(rebuilt);

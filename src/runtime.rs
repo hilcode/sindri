@@ -380,8 +380,9 @@ impl DummyRuntime {
             .collect()
     }
 
-    /// How many times [`FileSystem::read`] was called for `path`. Lets a test prove a caching layer
-    /// actually avoids redundant reads, rather than merely returning the right answer.
+    /// How many times [`FileSystem::read`] or [`FileSystem::read_to_string`] was called for `path`.
+    /// Lets a test prove a caching layer actually avoids redundant reads, rather than merely
+    /// returning the right answer.
     pub fn read_count(&self, path: impl AsRef<Path>) -> usize {
         self.reads
             .lock()
@@ -429,6 +430,7 @@ impl FileSystem for DummyRuntime {
     }
 
     fn read_to_string(&self, path: &Path) -> IoResult<String> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
         match self.files.get(path) {
             Some(file) => {
                 String::from_utf8(file.contents.clone()).map_err(|error| IoError::new(ErrorKind::InvalidData, error))
@@ -762,6 +764,16 @@ mod tests {
             runtime.read_to_string(Path::new("/absent")).unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn read_to_string_is_reflected_in_read_count() {
+        let runtime: DummyRuntime = DummyRuntime::builder().file("/file.ncl", "contents").build();
+        assert_eq!(runtime.read_count("/file.ncl"), 0);
+        runtime.read_to_string(Path::new("/file.ncl")).unwrap();
+        assert_eq!(runtime.read_count("/file.ncl"), 1);
+        runtime.read_to_string(Path::new("/file.ncl")).unwrap();
+        assert_eq!(runtime.read_count("/file.ncl"), 2);
     }
 
     #[test]

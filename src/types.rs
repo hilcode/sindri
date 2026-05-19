@@ -661,7 +661,7 @@ impl Display for AbsoluteDirectory {
 
 /// An absolute path to a file. Produced by resolving a relative file against an
 /// [`AbsoluteDirectory`]. Used wherever a file is read or written.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AbsoluteFile(PathBuf);
 
 impl AbsoluteFile {

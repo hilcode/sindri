@@ -3,6 +3,7 @@ use crate::error::SindriResult;
 use crate::file_set::ContentHash;
 use crate::file_set::FileSet;
 use crate::metadata_cache::MetadataCache;
+use crate::nickel_import::ScriptResolutionState;
 use crate::parameter::BindingHash;
 use crate::runtime::FileSystem;
 use crate::task::DefinitionHash;
@@ -72,7 +73,53 @@ pub struct TaskRunRecord {
 }
 
 impl TaskRunRecord {
+    pub fn definition_hash(&self) -> DefinitionHash {
+        self.definition_hash
+    }
+
+    /// Compute a task's fingerprint from scratch, deriving a fresh [`DefinitionHash`] along the
+    /// way — the one place a definition hash is (re)derived. Used once per task per compile, in the
+    /// serial planning phase; a later, already-known hash is threaded through
+    /// [`TaskRunRecord::with_definition_hash`] instead of coming back through here.
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
+        task: &Task,
+        module_directory: &RelativeDirectory,
+        managed_input_base: &AbsoluteDirectory,
+        output_directory: &AbsoluteDirectory,
+        workspace_root: &WorkspaceRoot,
+        cache: &MetadataCache,
+        resolution_state: &mut ScriptResolutionState,
+        file_system: &impl FileSystem,
+    ) -> SindriResult<TaskRunRecord> {
+        let definition_hash: DefinitionHash =
+            task.definition_hash(module_directory, workspace_root, resolution_state, file_system)?;
+        Self::with_definition_hash(
+            definition_hash,
+            task,
+            module_directory,
+            managed_input_base,
+            output_directory,
+            workspace_root,
+            cache,
+            file_system,
+        )
+    }
+
+    /// The same fingerprint [`TaskRunRecord::compute`] produces, given an already-known
+    /// [`DefinitionHash`] rather than deriving one — touches no Nickel type at all, since only the
+    /// input/output content hashes (metadata-cache driven) are computed here. Used after a task's
+    /// own commands just ran, when its definition hash cannot have changed since the pre-run
+    /// dirtiness check that already derived it (only the task's own inputs/outputs can have).
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_definition_hash(
+        definition_hash: DefinitionHash,
         task: &Task,
         module_directory: &RelativeDirectory,
         managed_input_base: &AbsoluteDirectory,
@@ -81,7 +128,6 @@ impl TaskRunRecord {
         cache: &MetadataCache,
         file_system: &impl FileSystem,
     ) -> SindriResult<TaskRunRecord> {
-        let definition_hash: DefinitionHash = task.definition_hash(module_directory, workspace_root, file_system)?;
         let module_directory_absolute: AbsoluteDirectory =
             workspace_root.to_absolute_directory().join_directory(module_directory);
         let declared_files: FileSet = resolve_file_set(
@@ -245,6 +291,7 @@ mod tests {
     }
 
     fn record(task: &Task, runtime: &DummyRuntime, output_directory: &AbsoluteDirectory) -> TaskRunRecord {
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         TaskRunRecord::compute(
             task,
             &module_directory(),
@@ -252,6 +299,7 @@ mod tests {
             output_directory,
             &workspace_root(),
             &metadata_cache(),
+            &mut resolution_state,
             runtime,
         )
         .unwrap()
@@ -288,6 +336,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let output_directory: AbsoluteDirectory = layout(binding_hash("debug")).output_directory().clone();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
@@ -295,6 +344,7 @@ mod tests {
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
+            &mut resolution_state,
             &workspace_with("package common"),
         );
         assert!(matches!(result, Err(SindriError::Io { .. })));
@@ -311,6 +361,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let output_directory: AbsoluteDirectory = layout(binding_hash("debug")).output_directory().clone();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
@@ -318,6 +369,7 @@ mod tests {
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
+            &mut resolution_state,
             &workspace_with("package common"),
         );
         assert!(matches!(result, Err(SindriError::Io { .. })));
@@ -334,6 +386,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let output_directory: AbsoluteDirectory = layout(binding_hash("debug")).output_directory().clone();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
@@ -341,6 +394,7 @@ mod tests {
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
+            &mut resolution_state,
             &workspace_with("package common"),
         );
         assert!(matches!(result, Err(SindriError::Io { .. })));
@@ -415,6 +469,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let compile_output: AbsoluteDirectory = layout(binding_hash("debug")).output_directory().clone();
+        let mut compile_resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         TaskRunRecord::compute(
             &go_compile,
             &module_directory(),
@@ -422,9 +477,11 @@ mod tests {
             &compile_output,
             &workspace_root(),
             &cache,
+            &mut compile_resolution_state,
             &runtime,
         )
         .unwrap();
+        let mut test_resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         TaskRunRecord::compute(
             &go_test,
             &module_directory(),
@@ -432,6 +489,7 @@ mod tests {
             &compile_output,
             &workspace_root(),
             &cache,
+            &mut test_resolution_state,
             &runtime,
         )
         .unwrap();
