@@ -57,7 +57,9 @@ impl Telemetry {
                     dur: outcome.task_duration(),
                     pid: 0,
                     tid: outcome.fiber(),
-                    args: TraceArgs { cache: "miss" },
+                    args: TraceArgs {
+                        cache: outcome.cache().label(),
+                    },
                 }
             })
             .collect();
@@ -72,12 +74,14 @@ impl Telemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glob::GlobPatterns;
     use crate::plugin::Task;
     use crate::plugin::TaskName;
     use crate::runtime::DummyRuntime;
     use crate::runtime::Runtime;
+    use crate::state::CacheStatus;
+    use crate::types::Command;
     use crate::types::CommandOutput;
-    use crate::types::ShellCommand;
     use crate::types::Stderr;
     use crate::types::Stdout;
     use crate::types::Step;
@@ -94,18 +98,29 @@ mod tests {
     }
 
     fn make_outcome(task_name: &str, fiber: Fiber, task_duration: Duration, task_start: TaskStart) -> TaskOutcome {
+        cached_outcome(task_name, fiber, task_duration, task_start, CacheStatus::Miss)
+    }
+
+    fn cached_outcome(
+        task_name: &str,
+        fiber: Fiber,
+        task_duration: Duration,
+        task_start: TaskStart,
+        cache: CacheStatus,
+    ) -> TaskOutcome {
         TaskOutcome::new(
             Task::new(
                 TaskName::new(task_name),
                 Step::new("compile"),
-                ShellCommand::new("true"),
-                vec![],
-                vec![],
+                Command::new("true", [] as [&str; 0]),
+                GlobPatterns::new(vec![], vec![]),
+                GlobPatterns::new(vec![], vec![]),
             ),
             CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded),
             task_duration,
             task_start,
             fiber,
+            cache,
         )
     }
 
@@ -180,5 +195,32 @@ mod tests {
         )];
         Telemetry::write(&outcomes, &build_directory(), build_start, &runtime).unwrap();
         assert!(runtime.created_directory(BUILD_DIRECTORY));
+    }
+
+    #[test]
+    fn cache_hit_and_miss_are_annotated_in_the_trace() {
+        let build_start: BuildStart = BuildStart::now();
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let task_start: TaskStart = TaskStart::new(runtime.now());
+        let outcomes: Vec<TaskOutcome> = vec![
+            cached_outcome(
+                "ran",
+                Fiber::new(0),
+                Duration::from_millis(100),
+                task_start,
+                CacheStatus::Miss,
+            ),
+            cached_outcome(
+                "skipped",
+                Fiber::new(1),
+                Duration::from_millis(1),
+                task_start,
+                CacheStatus::Hit,
+            ),
+        ];
+        let parsed: serde_json::Value = write_and_parse(&outcomes, build_start, &runtime);
+        let events: &Vec<serde_json::Value> = parsed["traceEvents"].as_array().unwrap();
+        assert_eq!(events[0]["args"]["cache"], "miss");
+        assert_eq!(events[1]["args"]["cache"], "hit");
     }
 }

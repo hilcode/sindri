@@ -1,4 +1,6 @@
-use crate::types::ShellCommand;
+use crate::glob::Glob;
+use crate::glob::GlobPatterns;
+use crate::types::Command;
 use crate::types::Step;
 use serde::Deserialize;
 use smol_str::SmolStr;
@@ -44,32 +46,16 @@ impl Display for PluginName {
 }
 
 #[derive(Clone, Debug)]
-pub struct Glob(SmolStr);
-
-impl Glob {
-    pub fn new(pattern: impl Into<SmolStr>) -> Self {
-        Self(pattern.into())
-    }
-}
-
-impl Display for Glob {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct Task {
     name: TaskName,
     step: Step,
-    command: ShellCommand,
-    inputs: Vec<Glob>,
-    outputs: Vec<Glob>,
+    command: Command,
+    inputs: GlobPatterns,
+    outputs: GlobPatterns,
 }
 
 impl Task {
-    pub fn new(name: TaskName, step: Step, command: ShellCommand, inputs: Vec<Glob>, outputs: Vec<Glob>) -> Task {
+    pub fn new(name: TaskName, step: Step, command: Command, inputs: GlobPatterns, outputs: GlobPatterns) -> Task {
         Task {
             name,
             step,
@@ -87,8 +73,16 @@ impl Task {
         &self.step
     }
 
-    pub fn command(&self) -> &ShellCommand {
+    pub fn command(&self) -> &Command {
         &self.command
+    }
+
+    pub fn inputs(&self) -> &GlobPatterns {
+        &self.inputs
+    }
+
+    pub fn outputs(&self) -> &GlobPatterns {
+        &self.outputs
     }
 }
 
@@ -112,6 +106,18 @@ impl Plugin {
     }
 }
 
+/// A platform-independent superset of every file type the Go toolchain might compile — all Go and
+/// C-family sources cgo can pull in, plus assembly and the module manifests. Over-inclusion only
+/// ever costs a spurious rebuild; it never misses an input. Per-target precision via `go list` is
+/// future work.
+fn go_source_superset() -> Vec<Glob> {
+    vec![
+        Glob::new("**/*.{go,c,h,cc,cpp,cxx,hh,hpp,hxx,m,s,S}"),
+        Glob::new("go.mod"),
+        Glob::new("go.sum"),
+    ]
+}
+
 pub fn go_plugin() -> Plugin {
     Plugin {
         name: PluginName::new("sindri-go"),
@@ -119,23 +125,23 @@ pub fn go_plugin() -> Plugin {
             Task {
                 name: TaskName::new("go-format"),
                 step: Step::new("format"),
-                command: ShellCommand::new("gofmt -l ."),
-                inputs: vec![Glob::new("**/*.go")],
-                outputs: vec![],
+                command: Command::new("gofmt", ["-l", "."]),
+                inputs: GlobPatterns::new(vec![Glob::new("**/*.go")], vec![]),
+                outputs: GlobPatterns::new(vec![], vec![]),
             },
             Task {
                 name: TaskName::new("go-compile"),
                 step: Step::new("compile"),
-                command: ShellCommand::new("go build ./..."),
-                inputs: vec![Glob::new("**/*.go"), Glob::new("go.mod"), Glob::new("go.sum")],
-                outputs: vec![],
+                command: Command::new("go", ["build", "-o", "{output}/", "./..."]),
+                inputs: GlobPatterns::new(go_source_superset(), vec![]),
+                outputs: GlobPatterns::new(vec![Glob::new("**/*")], vec![]),
             },
             Task {
                 name: TaskName::new("go-test"),
                 step: Step::new("test"),
-                command: ShellCommand::new("go test ./..."),
-                inputs: vec![Glob::new("**/*.go"), Glob::new("go.mod"), Glob::new("go.sum")],
-                outputs: vec![],
+                command: Command::new("go", ["test", "./..."]),
+                inputs: GlobPatterns::new(go_source_superset(), vec![]),
+                outputs: GlobPatterns::new(vec![], vec![]),
             },
         ],
     }

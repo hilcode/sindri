@@ -1,28 +1,34 @@
+use crate::glob::GlobPatterns;
 use crate::local_time_with_elapsed::LocalTimeWithElapsed;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
+use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::DirEntry;
 use crate::types::FileKind;
-use crate::types::ShellCommand;
+use ignore::DirEntry as WalkEntry;
+use ignore::WalkBuilder;
+use ignore::overrides::Override;
+use ignore::overrides::OverrideBuilder;
 use std::env::current_dir;
 use std::fs::DirEntry as DirectoryEntry;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::create_dir_all;
+use std::fs::read;
 use std::fs::read_dir;
 use std::fs::read_to_string;
 use std::fs::symlink_metadata;
 use std::fs::write;
+use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::io::Write;
 use std::io::stdout;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::Command as ProcessCommand;
 use std::process::Output;
-use std::str::SplitAsciiWhitespace;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Instant;
@@ -34,7 +40,14 @@ use time::UtcOffset;
 pub trait FileSystem {
     fn current_directory(&self) -> IoResult<PathBuf>;
     fn read_to_string(&self, path: &Path) -> IoResult<String>;
+    /// The raw bytes of a file, with no line-ending or encoding normalization — that belongs to the
+    /// hashing layer, which needs the bytes exactly as stored.
+    fn read(&self, path: &Path) -> IoResult<Vec<u8>>;
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>>;
+    /// Every regular file beneath `base` that the glob patterns select, as absolute paths. Drives a
+    /// recursive walk that prunes excluded subtrees as it descends, so unrelated trees are never
+    /// entered. Used to expand a task's input and output globs for incremental hashing.
+    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>>;
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>>;
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()>;
     fn create_directories(&self, path: &Path) -> IoResult<()>;
@@ -46,7 +59,7 @@ pub trait FileSystem {
 /// [`Bootstrap::into_runtime`].
 pub trait Runtime: FileSystem + Sync {
     fn now(&self) -> Instant;
-    fn run_command(&self, command: &ShellCommand, working_directory: &Path) -> IoResult<CommandOutput>;
+    fn run_command(&self, command: &Command, working_directory: &Path) -> IoResult<CommandOutput>;
     fn log(&self, message: &str) -> IoResult<()>;
     fn output(&self) -> impl Write + '_;
 }
@@ -69,6 +82,10 @@ impl FileSystem for SystemFileSystem {
         read_to_string(path)
     }
 
+    fn read(&self, path: &Path) -> IoResult<Vec<u8>> {
+        read(path)
+    }
+
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>> {
         let mut entries: Vec<DirEntry> = Vec::new();
         for entry in read_dir(path)? {
@@ -77,6 +94,31 @@ impl FileSystem for SystemFileSystem {
             entries.push(DirEntry::new(entry.path(), kind));
         }
         Ok(entries)
+    }
+
+    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
+        // Includes become whitelist globs and excludes become negated globs; the `ignore` walker
+        // then yields only whitelisted files and prunes excluded directory subtrees as it descends.
+        let mut override_builder: OverrideBuilder = OverrideBuilder::new(base);
+        for include in patterns.includes() {
+            override_builder.add(include.as_str()).map_err(IoError::other)?;
+        }
+        for exclude in patterns.excludes() {
+            override_builder
+                .add(&format!("!{}", exclude.as_str()))
+                .map_err(IoError::other)?;
+        }
+        let overrides: Override = override_builder.build().map_err(IoError::other)?;
+        let mut walker: WalkBuilder = WalkBuilder::new(base);
+        walker.standard_filters(false).follow_links(false).overrides(overrides);
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in walker.build() {
+            let entry: WalkEntry = entry.map_err(IoError::other)?;
+            if entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+                files.push(entry.into_path());
+            }
+        }
+        Ok(files)
     }
 
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
@@ -137,8 +179,16 @@ impl FileSystem for SystemRuntime {
         self.file_system.read_to_string(path)
     }
 
+    fn read(&self, path: &Path) -> IoResult<Vec<u8>> {
+        self.file_system.read(path)
+    }
+
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>> {
         self.file_system.read_directory(path)
+    }
+
+    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
+        self.file_system.matching_files(base, patterns)
     }
 
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
@@ -159,12 +209,9 @@ impl Runtime for SystemRuntime {
         Instant::now()
     }
 
-    fn run_command(&self, command: &ShellCommand, working_directory: &Path) -> IoResult<CommandOutput> {
-        let mut parts: SplitAsciiWhitespace<'_> = command.as_ref().split_ascii_whitespace();
-        let program: &str = parts.next().unwrap_or("");
-        let arguments: Vec<&str> = parts.collect();
-        let output: Output = Command::new(program)
-            .args(&arguments)
+    fn run_command(&self, command: &Command, working_directory: &Path) -> IoResult<CommandOutput> {
+        let output: Output = ProcessCommand::new(command.program())
+            .args(command.arguments().iter().map(|argument| argument.as_str()))
             .current_dir(working_directory)
             .output()?;
         Ok(CommandOutput::new(
@@ -191,6 +238,8 @@ impl Runtime for SystemRuntime {
 }
 
 #[cfg(test)]
+use crate::glob::CompiledGlobs;
+#[cfg(test)]
 use crate::types::Stdout;
 #[cfg(test)]
 use std::cmp::Ordering;
@@ -198,8 +247,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
-#[cfg(test)]
-use std::io::Error as IoError;
 
 /// A [`Write`] handle over a [`DummyRuntime`]'s captured standard output. Holds the lock for the
 /// duration of the write, so each `writeln!` lands atomically.
@@ -292,6 +339,16 @@ impl FileSystem for DummyRuntime {
         }
     }
 
+    fn read(&self, path: &Path) -> IoResult<Vec<u8>> {
+        match self.files.get(path) {
+            Some(contents) => Ok(contents.clone()),
+            None => Err(IoError::new(
+                ErrorKind::NotFound,
+                format!("no such file: {}", path.display()),
+            )),
+        }
+    }
+
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>> {
         if self.kind_of(path) != Some(FileKind::Directory) {
             return Err(IoError::new(
@@ -321,6 +378,20 @@ impl FileSystem for DummyRuntime {
         Ok(entries)
     }
 
+    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
+        // No real tree to walk: match the registered files directly against the compiled patterns.
+        let compiled: CompiledGlobs = patterns.compiled().map_err(IoError::other)?;
+        let mut files: Vec<PathBuf> = Vec::new();
+        for path in self.files.keys() {
+            if let Ok(relative) = path.strip_prefix(base) {
+                if compiled.is_match(relative) {
+                    files.push(path.clone());
+                }
+            }
+        }
+        Ok(files)
+    }
+
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
         Ok(self.kind_of(path))
     }
@@ -345,9 +416,16 @@ impl Runtime for DummyRuntime {
         self.now
     }
 
-    fn run_command(&self, command: &ShellCommand, _working_directory: &Path) -> IoResult<CommandOutput> {
-        match self.commands.get(command.as_ref()) {
-            Some(output) => Ok(output.clone()),
+    fn run_command(&self, command: &Command, _working_directory: &Path) -> IoResult<CommandOutput> {
+        // Stubs are matched by command-line prefix so a test can register `"go build"` without having
+        // to spell out a resolved `{output}` path (an absolute directory that varies per run).
+        let command_line: String = command.to_string();
+        match self
+            .commands
+            .iter()
+            .find(|(stub, _)| -> bool { command_line.starts_with(stub.as_str()) })
+        {
+            Some((_, output)) => Ok(output.clone()),
             None => Err(IoError::new(
                 ErrorKind::NotFound,
                 format!("command not stubbed: {command}"),
@@ -545,13 +623,13 @@ mod tests {
             CommandOutput::new(Stdout::new(b"ok".to_vec()), Stderr::default(), TaskStatus::Succeeded);
         let runtime: DummyRuntime = DummyRuntime::builder().command("go build", stubbed).build();
         let output: CommandOutput = runtime
-            .run_command(&ShellCommand::new("go build"), Path::new("/workspace"))
+            .run_command(&Command::new("go", ["build"]), Path::new("/workspace"))
             .unwrap();
         assert_eq!(output.stdout().as_bytes(), b"ok");
         assert_eq!(output.status(), TaskStatus::Succeeded);
         assert_eq!(
             runtime
-                .run_command(&ShellCommand::new("go test"), Path::new("/workspace"))
+                .run_command(&Command::new("go", ["test"]), Path::new("/workspace"))
                 .unwrap_err()
                 .kind(),
             ErrorKind::NotFound

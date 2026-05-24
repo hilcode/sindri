@@ -1,0 +1,21 @@
+# List available recipes
+default:
+    @just --list
+
+# Compile one example (needs `sindri` on PATH — run `just install` from the repo root first)
+compile example:
+    cd {{example}} && sindri compile
+
+# Print one example's resolved lifecycle steps and their tasks
+lifecycle example:
+    cd {{example}} && sindri lifecycle
+
+# Remove the build output (.target) from one example
+clean example:
+    rm -rf {{example}}/.target
+
+# Compile every example
+compile-all: (compile "hello") (compile "greeter")
+
+# Remove the build output from every example
+clean-all: (clean "hello") (clean "greeter")

@@ -1,5 +1,5 @@
 use crate::plugin::TaskName;
-use crate::types::ShellCommand;
+use crate::types::Command;
 use miette::Diagnostic;
 use std::io::Error as IoError;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ pub enum SindriError {
     #[diagnostic(help("check the command output above for details"), code(sindri::task::failed))]
     TaskFailed {
         task_name: TaskName,
-        command: ShellCommand,
+        command: Command,
         output: String,
     },
 }
@@ -103,7 +103,7 @@ mod tests {
         });
         assert_has_help_and_code(&SindriError::TaskFailed {
             task_name: TaskName::new("go-compile"),
-            command: ShellCommand::new("go build ./..."),
+            command: Command::new("go", ["build", "./..."]),
             output: "error: undefined".into(),
         });
     }

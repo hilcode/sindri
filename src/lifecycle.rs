@@ -9,6 +9,7 @@ use crate::runtime::Runtime;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
 use crate::types::BuildFile;
+use crate::types::Qualifier;
 #[cfg(test)]
 use crate::types::Stdout;
 use crate::types::Step;
@@ -109,9 +110,22 @@ impl Lifecycle {
         let graph: TaskGraph = self
             .build_task_graph(&[&plugin], &compile_step)
             .expect("compile is a built-in lifecycle step");
+        let qualifier: Qualifier = build_file.qualifier();
         let absolute_working_directory: AbsoluteDirectory = workspace.absolute_working_directory();
-        let outcomes: Vec<TaskOutcome> = execute_graph(&graph, &absolute_working_directory, config, runtime)?;
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+        // A failing task makes `execute_graph` return early via `?`, so the telemetry write below is
+        // skipped on a broken build. That is deliberate, not an oversight: a failed build is
+        // diagnosed from its error, and dropping the partial trace keeps every telemetry.json a
+        // record of a whole build rather than an aborted fragment.
+        let outcomes: Vec<TaskOutcome> = execute_graph(
+            &graph,
+            &absolute_working_directory,
+            workspace.workspace_root(),
+            &absolute_build_directory,
+            &qualifier,
+            config,
+            runtime,
+        )?;
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
         Ok(())
     }
@@ -168,12 +182,13 @@ impl Lifecycle {
 mod tests {
     use super::*;
     use crate::executor::Verbosity;
+    use crate::glob::GlobPatterns;
     use crate::plugin::{Plugin, PluginName, Task, TaskName, go_plugin};
     use crate::runtime::DummyRuntime;
     use crate::runtime::DummyRuntimeBuilder;
     use crate::types::BuildStart;
+    use crate::types::Command;
     use crate::types::CommandOutput;
-    use crate::types::ShellCommand;
     use crate::types::Stderr;
     use crate::types::TaskStatus;
     use crate::workspace::Workspace;
@@ -205,9 +220,9 @@ mod tests {
         Task::new(
             TaskName::new(name),
             Step::new(step),
-            ShellCommand::new(""),
-            vec![],
-            vec![],
+            Command::new("", [] as [&str; 0]),
+            GlobPatterns::new(vec![], vec![]),
+            GlobPatterns::new(vec![], vec![]),
         )
     }
 
@@ -290,7 +305,7 @@ mod tests {
                 r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
             )
             .command("gofmt -l .", succeeded())
-            .command("go build ./...", succeeded())
+            .command("go build", succeeded())
             .current_directory("/workspace")
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
@@ -303,7 +318,7 @@ mod tests {
     fn run_compile_creates_the_build_directory_and_writes_telemetry() {
         let runtime: DummyRuntime = go_workspace()
             .command("gofmt -l .", succeeded())
-            .command("go build ./...", succeeded())
+            .command("go build", succeeded())
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
@@ -319,7 +334,7 @@ mod tests {
     fn run_compile_fails_when_the_build_command_fails() {
         let runtime: DummyRuntime = go_workspace()
             .command("gofmt -l .", succeeded())
-            .command("go build ./...", failed())
+            .command("go build", failed())
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
@@ -353,7 +368,7 @@ mod tests {
             output.as_str(),
         );
         assert!(
-            output.as_str().contains("go build ./..."),
+            output.as_str().contains("go build"),
             "expected the go build task in the output, got:\n{}",
             output.as_str(),
         );

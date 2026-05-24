@@ -1,0 +1,5 @@
+{   name = "greeter"
+,   language = "go"
+,   type = "executable"
+,   version = "0.1.0"
+}

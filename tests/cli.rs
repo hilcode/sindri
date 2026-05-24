@@ -241,6 +241,76 @@ fn compile_quiet_with_failure_still_shows_error() {
     assert!(output.stdout.is_empty(), "expected no stdout with --quiet");
 }
 
+fn go_compile_output_directory(workspace: &Path) -> PathBuf {
+    workspace
+        .join(".target")
+        .join("default")
+        .join("compile")
+        .join("go-compile")
+        .join("output")
+}
+
+#[test]
+fn second_compile_on_unchanged_tree_is_silent() {
+    let directory: TempDir = go_module_dir();
+    let first: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first compile failed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("go-compile"),
+        "first compile should run go-compile"
+    );
+    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    assert!(
+        fs::read_dir(&output_directory).unwrap().next().is_some(),
+        "first compile should leave a built binary in {output_directory:?}"
+    );
+
+    let second: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(second.status.success(), "second compile failed");
+    assert!(
+        second.stdout.is_empty(),
+        "second compile on an unchanged tree should be silent; got: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+}
+
+#[test]
+fn editing_a_source_file_triggers_a_rebuild() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    fs::write(
+        directory.path().join("main.go"),
+        "package main\n\nfunc main() {\n\tprintln(\"changed\")\n}\n",
+    )
+    .unwrap();
+    let rebuild: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(rebuild.status.success(), "rebuild after edit failed");
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "editing a source file should re-run go-compile"
+    );
+}
+
+#[test]
+fn deleting_the_output_binary_triggers_a_rebuild() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    for entry in fs::read_dir(&output_directory).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let rebuild: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(rebuild.status.success(), "rebuild after deleting output failed");
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "deleting the output binary should re-run go-compile (self-healing)"
+    );
+}
+
 #[test]
 fn no_workspace_exits_nonzero() {
     let directory: TempDir = TempDir::new().unwrap();

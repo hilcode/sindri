@@ -1,12 +1,15 @@
 pub mod cli;
 pub mod error;
 pub mod executor;
+pub mod glob;
+pub mod hash;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;
 pub mod module;
 pub mod nickel_eval;
 pub mod plugin;
 pub mod runtime;
+pub mod state;
 pub mod telemetry;
 pub mod types;
 pub mod workspace;

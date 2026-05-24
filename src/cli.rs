@@ -35,11 +35,11 @@ pub struct Arguments {
     #[arg(long, help = "Write trace output to <build_directory>/sindri.log")]
     log: bool,
     #[command(subcommand)]
-    command: Command,
+    action: Action,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Action {
     /// Print the resolved lifecycle steps and the tasks bound to each.
     /// By default only steps with tasks are shown; use --all to see every step.
     Lifecycle {
@@ -74,9 +74,9 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
         })?;
     workspace.log_loaded(&runtime)?;
     let lifecycle: Lifecycle = Lifecycle::new();
-    match arguments.command {
-        Command::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
-        Command::Compile { quiet, verbose } => {
+    match arguments.action {
+        Action::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
+        Action::Compile { quiet, verbose } => {
             let verbosity: Verbosity = if quiet {
                 Verbosity::Quiet
             } else if verbose {
@@ -129,7 +129,7 @@ mod tests {
         let runtime: DummyRuntime = workspace().build();
         let arguments: Arguments = Arguments {
             log: false,
-            command: Command::Lifecycle { all: true },
+            action: Action::Lifecycle { all: true },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
     }
@@ -139,7 +139,7 @@ mod tests {
         let runtime: DummyRuntime = workspace().build();
         let arguments: Arguments = Arguments {
             log: true,
-            command: Command::Lifecycle { all: false },
+            action: Action::Lifecycle { all: false },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
     }
@@ -148,11 +148,11 @@ mod tests {
     fn run_compile_action_runs_the_build_commands() {
         let runtime: DummyRuntime = go_workspace()
             .command("gofmt -l .", succeeded())
-            .command("go build ./...", succeeded())
+            .command("go build", succeeded())
             .build();
         let arguments: Arguments = Arguments {
             log: false,
-            command: Command::Compile {
+            action: Action::Compile {
                 quiet: true,
                 verbose: false,
             },
@@ -165,7 +165,7 @@ mod tests {
         let runtime: DummyRuntime = DummyRuntime::builder().current_directory("/nowhere").build();
         let arguments: Arguments = Arguments {
             log: false,
-            command: Command::Lifecycle { all: false },
+            action: Action::Lifecycle { all: false },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_err());
     }
