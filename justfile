@@ -1,42 +1,57 @@
+# Directory the `install` recipe copies the `sindri` binary into
+install_directory := env_var_or_default("SINDRI_INSTALL_DIR", env_var("HOME") / ".local/bin")
+
 # List available recipes
 default:
     @just --list
 
 # Run all tests (unit + integration)
+[group('test')]
 test:
     cargo test
 
 # Run only unit tests
+[group('test')]
 test-unit:
     cargo test --lib --bins
 
 # Run only integration tests
+[group('test')]
 test-integration:
     cargo test --tests
 
-# Run tests with coverage summary
-cov:
-    cargo llvm-cov
+# Run tests with coverage summary and enforce the coverage floor
+[group('coverage')]
+coverage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo llvm-cov --no-report
+    cargo llvm-cov report | scripts/coverage-ratchet.sh
 
 # Coverage for unit tests only
-cov-unit:
+[group('coverage')]
+coverage-unit:
     cargo llvm-cov --lib --bins
 
 # Coverage for integration tests only
-cov-integration:
+[group('coverage')]
+coverage-integration:
     cargo llvm-cov --tests
 
 # Generate HTML coverage report
-cov-html:
+[group('coverage')]
+coverage-html:
     cargo llvm-cov --html
     @echo "Report: target/llvm-cov/html/index.html"
 
 # Open HTML coverage report in browser
-cov-open:
+[group('coverage')]
+coverage-open:
     cargo llvm-cov --open
 
-# Build in release mode
-build type="debug": fmt
+# Build the `sindri` binary (debug or release)
+[group('build')]
+build type="debug": format
     #!/usr/bin/env bash
     if [ {{type}} == 'debug' ]; then
         cargo build
@@ -47,18 +62,31 @@ build type="debug": fmt
         exit 1
     fi
 
+# Build and install the `sindri` binary into {{install_directory}} (debug or release)
+[group('build')]
+install type="debug": (build type)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p '{{install_directory}}'
+    cp 'target/{{type}}/sindri' '{{install_directory}}/sindri'
+    echo 'Installed sindri ({{type}}) to {{install_directory}}/sindri'
+
 # Check code without building
+[group('build')]
 check:
     cargo check
 
-# Run clippy lints
-lint:
-    cargo clippy -- -D warnings
-
-# Format code
-fmt:
-    cargo fmt
-
 # Clean build artifacts
+[group('build')]
 clean:
     cargo clean
+
+# Format code
+[group('quality')]
+format:
+    cargo fmt
+
+# Run clippy lints
+[group('quality')]
+lint:
+    cargo clippy --lib --tests -- -D warnings

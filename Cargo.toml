@@ -18,3 +18,11 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[lints.clippy]
+# Sindri is a binary, not a library: a no-argument `new()` needs no companion `Default`, since
+# there is no external consumer or generic `Default`-bounded code to satisfy.
+new_without_default = "allow"
+# The explicit nested `if` / `if let` form reads more clearly than collapsing the conditions into a
+# single `&&` (or let-chain), so keep the nesting rather than flattening it.
+collapsible_if = "allow"
