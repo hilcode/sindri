@@ -9,10 +9,11 @@ use crate::runtime::Runtime;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
 use crate::types::BuildFile;
-use crate::types::Qualifier;
+use crate::types::ModulePath;
 #[cfg(test)]
 use crate::types::Stdout;
 use crate::types::Step;
+use crate::types::WorkspaceRoot;
 use crate::workspace::Workspace;
 use miette::Result as MietteResult;
 use std::io::Result as IoResult;
@@ -102,9 +103,9 @@ impl Lifecycle {
     ) -> MietteResult<()> {
         let build_file: BuildFile = BuildFile::find(workspace, runtime)?;
         let module_graph: ModuleGraph = ModuleGraph::load(&build_file, workspace, runtime)?;
-        for loaded_module in module_graph.modules() {
+        for node in module_graph.nodes() {
             runtime
-                .log(&format!("Module loaded: {}", loaded_module.name().as_ref()))
+                .log(&format!("Module loaded: {}", node.module().name().as_ref()))
                 .map_err(|source| SindriError::Log { source })?;
         }
         let plugin: Plugin = go_plugin();
@@ -112,22 +113,29 @@ impl Lifecycle {
         let graph: TaskGraph = self
             .build_task_graph(&[&plugin], &compile_step)
             .expect("compile is a built-in lifecycle step");
-        let qualifier: Option<Qualifier> = build_file.qualifier();
-        let absolute_working_directory: AbsoluteDirectory = workspace.absolute_working_directory();
+        let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
-        // A failing task makes `execute_graph` return early via `?`, so the telemetry write below is
-        // skipped on a broken build. That is deliberate, not an oversight: a failed build is
-        // diagnosed from its error, and dropping the partial trace keeps every telemetry.json a
-        // record of a whole build rather than an aborted fragment.
-        let outcomes: Vec<TaskOutcome> = execute_graph(
-            &graph,
-            &absolute_working_directory,
-            workspace.workspace_root(),
-            &absolute_build_directory,
-            qualifier.as_ref(),
-            config,
-            runtime,
-        )?;
+        // Modules build in dependency-first order (the graph's node order), each in its own directory
+        // and its own state subtree, so a dependency is fully built before anything that depends on
+        // it. A failing task makes `execute_graph` return early via `?`, so a broken build writes no
+        // telemetry: the partial trace is dropped, keeping every telemetry.json a whole-build record.
+        let mut outcomes: Vec<TaskOutcome> = Vec::new();
+        for node in module_graph.nodes() {
+            let module_directory: AbsoluteDirectory = workspace_root
+                .to_absolute_directory()
+                .join_directory(node.identity().directory());
+            let module_path: ModulePath = node.identity().module_path();
+            let module_outcomes: Vec<TaskOutcome> = execute_graph(
+                &graph,
+                &module_directory,
+                workspace_root,
+                &absolute_build_directory,
+                &module_path,
+                config,
+                runtime,
+            )?;
+            outcomes.extend(module_outcomes);
+        }
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
         Ok(())
     }
@@ -314,6 +322,52 @@ mod tests {
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap();
         assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
+    }
+
+    #[test]
+    fn run_compile_builds_every_module_in_the_graph() {
+        // The entry `app` depends on a local library `lib`. Both must be built, each into its own
+        // state subtree — proving the scheduler runs the whole graph, not just the entry module.
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+            )
+            .file(
+                "/workspace/lib/sindri.build",
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap();
+        // The dependency is loaded and built before the entry.
+        assert_eq!(
+            runtime.logged(),
+            vec!["Module loaded: lib".to_string(), "Module loaded: app".to_string()]
+        );
+        // Each module persisted its compile state under its own subtree: the root module directly
+        // under `.target`, the `lib` module under `.target/lib`.
+        assert!(
+            runtime
+                .written_file("/workspace/.target/compile/go-compile/state.bin")
+                .is_some(),
+            "the entry module should have built and persisted its state"
+        );
+        assert!(
+            runtime
+                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
+                .is_some(),
+            "the dependency module should have built and persisted its state"
+        );
     }
 
     #[test]

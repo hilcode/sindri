@@ -745,6 +745,23 @@ impl ModuleIdentity {
         BuildFile::new(RelativeFile::new(self.directory.as_ref().join(file_name)))
     }
 
+    /// The module's directory, relative to the workspace root — where its sources live and where its
+    /// build commands run. The workspace-root module has the empty directory.
+    pub fn directory(&self) -> &RelativeDirectory {
+        &self.directory
+    }
+
+    /// This module's state subtree under the build directory: its directory, then the qualifier as a
+    /// subdirectory when it has one. Distinct identities map to distinct paths, so no two modules share
+    /// a `.target` subtree — the reason state is keyed here rather than on the qualifier alone.
+    pub fn module_path(&self) -> ModulePath {
+        let mut path: PathBuf = self.directory.as_ref().to_path_buf();
+        if let Some(qualifier) = &self.qualifier {
+            path.push(qualifier.as_ref());
+        }
+        ModulePath(RelativeDirectory::new(path))
+    }
+
     fn is_valid_segment(segment: &str) -> bool {
         !segment.is_empty()
             && segment != "."
@@ -796,6 +813,23 @@ impl Display for ModuleIdentityParseError {
 }
 
 impl std::error::Error for ModuleIdentityParseError {}
+
+/// A module's state subtree under the build directory, keyed by identity so two modules never collide
+/// there — a second plain `sindri.build` in another directory would share a qualifier-only key. Built
+/// from a [`ModuleIdentity`] via [`ModuleIdentity::module_path`]; the workspace-root module maps to the
+/// empty path, so its state sits directly under the build directory as before multi-module support.
+#[derive(Clone, Debug)]
+pub struct ModulePath(RelativeDirectory);
+
+impl ModulePath {
+    pub fn new(directory: RelativeDirectory) -> ModulePath {
+        ModulePath(directory)
+    }
+
+    pub fn as_relative_directory(&self) -> &RelativeDirectory {
+        &self.0
+    }
+}
 
 /// A dependency cycle among modules, held as the ordered path that closes back on itself — the first
 /// module repeated as the last, so `//a → //b → //a` records both which modules form the loop and the
@@ -909,6 +943,26 @@ mod tests {
             identity.to_build_file().as_ref(),
             Path::new("tools/codegen/sindri-bin.build")
         );
+    }
+
+    #[test]
+    fn module_identity_module_path_is_the_directory_then_the_qualifier() {
+        // A plain module's state subtree is just its directory; a qualified one appends the qualifier,
+        // so two modules in the same directory never share a subtree.
+        let plain: ModuleIdentity = ModuleIdentity::parse("//libs/common").unwrap();
+        assert_eq!(
+            plain.module_path().as_relative_directory().as_ref(),
+            Path::new("libs/common")
+        );
+        let qualified: ModuleIdentity = ModuleIdentity::parse("//libs/common [kotlin]").unwrap();
+        assert_eq!(
+            qualified.module_path().as_relative_directory().as_ref(),
+            Path::new("libs/common/kotlin")
+        );
+        // The workspace-root module maps to the empty path, so its state sits directly under the
+        // build directory.
+        let root: ModuleIdentity = ModuleIdentity::new(RelativeDirectory::new(""), None);
+        assert_eq!(root.module_path().as_relative_directory().as_ref(), Path::new(""));
     }
 
     #[test]

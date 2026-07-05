@@ -16,7 +16,7 @@ use crate::types::BuildStart;
 use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::Fiber;
-use crate::types::Qualifier;
+use crate::types::ModulePath;
 use crate::types::Stderr;
 use crate::types::Stdout;
 use crate::types::Step;
@@ -181,14 +181,14 @@ fn plan_group(
     working_directory: &AbsoluteDirectory,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
-    qualifier: Option<&Qualifier>,
+    module_path: &ModulePath,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
     let mut plans: Vec<TaskPlan> = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
         let node: &TaskGraphNode = &nodes[node_id.value()];
         let task: Task = node.task().clone();
-        let paths: TaskPaths = TaskPaths::new(build_directory, qualifier, node.step(), task.name());
+        let paths: TaskPaths = TaskPaths::new(build_directory, module_path, node.step(), task.name());
         let current_state: TaskState = TaskState::compute(
             &task,
             working_directory,
@@ -304,7 +304,7 @@ pub fn execute_graph(
     working_directory: &AbsoluteDirectory,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
-    qualifier: Option<&Qualifier>,
+    module_path: &ModulePath,
     config: &ExecutionConfig,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskOutcome>> {
@@ -317,7 +317,7 @@ pub fn execute_graph(
             working_directory,
             workspace_root,
             build_directory,
-            qualifier,
+            module_path,
             runtime,
         )?;
         if config.verbosity != Verbosity::Quiet {
@@ -465,7 +465,7 @@ mod tests {
             working_directory,
             &workspace_root,
             &build_directory,
-            None,
+            &ModulePath::new(RelativeDirectory::new("")),
             config,
             runtime,
         )
@@ -483,7 +483,7 @@ mod tests {
             &working_directory,
             &workspace_root,
             &build_directory,
-            None,
+            &ModulePath::new(RelativeDirectory::new("")),
             config,
             &system_runtime(),
         )

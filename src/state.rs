@@ -7,7 +7,7 @@ use crate::plugin::TaskName;
 use crate::runtime::FileSystem;
 use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
-use crate::types::Qualifier;
+use crate::types::ModulePath;
 use crate::types::RelativeDirectory;
 use crate::types::RelativeFile;
 use crate::types::Step;
@@ -38,9 +38,10 @@ impl CacheStatus {
 }
 
 /// The on-disk locations a single task owns under the build directory:
-/// `.target/<qualifier>/<step>/<task>/`, or `.target/<step>/<task>/` when the module has no qualifier
-/// (a plain `sindri.build`). Holds its `state.bin` and an `output/` subdirectory for its artifacts.
-/// Each task owns a disjoint directory, so parallel tasks never contend.
+/// `.target/<module-path>/<step>/<task>/`, where `<module-path>` is the module's own subtree (empty for
+/// the workspace-root module, so its tasks sit directly under `.target/<step>/<task>/`). Holds its
+/// `state.bin` and an `output/` subdirectory for its artifacts. Each task owns a disjoint directory, so
+/// tasks — even across concurrent modules — never contend.
 pub struct TaskPaths {
     state_file: AbsoluteFile,
     output_directory: AbsoluteDirectory,
@@ -49,14 +50,11 @@ pub struct TaskPaths {
 impl TaskPaths {
     pub fn new(
         build_directory: &AbsoluteDirectory,
-        qualifier: Option<&Qualifier>,
+        module_path: &ModulePath,
         step: &Step,
         task: &TaskName,
     ) -> TaskPaths {
-        let mut relative_path: PathBuf = PathBuf::new();
-        if let Some(qualifier) = qualifier {
-            relative_path.push(qualifier.as_ref());
-        }
+        let mut relative_path: PathBuf = module_path.as_relative_directory().as_ref().to_path_buf();
         relative_path.push(step.as_ref());
         relative_path.push(task.as_ref());
         let relative: RelativeDirectory = RelativeDirectory::new(relative_path);
@@ -236,7 +234,7 @@ mod tests {
         let persisted: Option<TaskState> = TaskState::load(
             TaskPaths::new(
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target")),
-                None,
+                &ModulePath::new(RelativeDirectory::new("")),
                 task.step(),
                 task.name(),
             )

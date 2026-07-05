@@ -6,16 +6,16 @@ use crate::types::BuildFile;
 use crate::types::ModuleCycle;
 use crate::types::ModuleIdentity;
 use crate::workspace::Workspace;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-/// The reachable module graph, loaded demand-driven from an entry module. Loading follows
-/// each module's `{ module = … }` dependencies transitively — never walking the filesystem — so only
-/// modules reachable from the entry point are ever loaded. Modules are recorded in dependency-first
-/// order (a module appears after all the modules it depends on), which is the order later phases will
-/// build them in.
+/// The reachable module graph, loaded demand-driven from an entry module. Loading follows each
+/// module's `{ module = … }` dependencies transitively — never walking the filesystem — so only
+/// modules reachable from the entry point are ever loaded. Nodes are stored in dependency-first order
+/// (a module appears after every module it depends on), so a scheduler that walks them in order builds
+/// each dependency before the modules that consume it.
 #[derive(Debug)]
 pub struct ModuleGraph {
-    modules: Vec<Module>,
+    nodes: Vec<ModuleNode>,
 }
 
 impl ModuleGraph {
@@ -26,31 +26,57 @@ impl ModuleGraph {
         let mut loader: GraphLoader<'_, _> = GraphLoader {
             workspace,
             file_system,
-            loaded: HashSet::new(),
-            modules: Vec::new(),
+            index_by_identity: HashMap::new(),
+            nodes: Vec::new(),
         };
         let mut path: Vec<ModuleIdentity> = Vec::new();
         loader.visit(entry.identity(), None, &mut path)?;
-        Ok(ModuleGraph {
-            modules: loader.modules,
-        })
+        Ok(ModuleGraph { nodes: loader.nodes })
     }
 
     /// Every loaded module, in dependency-first order (the entry module is therefore last).
-    pub fn modules(&self) -> &[Module] {
-        &self.modules
+    pub fn nodes(&self) -> &[ModuleNode] {
+        &self.nodes
     }
 }
 
-/// The mutable state threaded through the depth-first load. `loaded` is the set of modules whose whole
-/// subtree is done (so a diamond dependency is loaded once), while the `path` argument of
-/// [`visit`](GraphLoader::visit) holds the ancestors currently being loaded — revisiting one of those is
-/// a cycle.
+/// A module in the graph: its identity, its loaded definition, and the indices of the modules it
+/// directly depends on. Because nodes are stored dependency-first, every dependency index is smaller
+/// than the node's own — the sequential scheduler builds them in stored order, and the edges let a
+/// later phase tell whether any dependency of a module was rebuilt.
+#[derive(Debug)]
+pub struct ModuleNode {
+    identity: ModuleIdentity,
+    module: Module,
+    dependencies: Vec<usize>,
+}
+
+impl ModuleNode {
+    pub fn identity(&self) -> &ModuleIdentity {
+        &self.identity
+    }
+
+    pub fn module(&self) -> &Module {
+        &self.module
+    }
+
+    /// The indices, within [`ModuleGraph::nodes`], of the modules this one directly depends on. Two
+    /// modules with no path between them never appear in each other's edges, marking them independent
+    /// (parallel-eligible).
+    pub fn dependencies(&self) -> &[usize] {
+        &self.dependencies
+    }
+}
+
+/// The mutable state threaded through the depth-first load. `index_by_identity` maps each fully loaded
+/// module to its node index (its presence also marks the module as done, so a diamond dependency is
+/// loaded once), while the `path` argument of [`visit`](GraphLoader::visit) holds the ancestors
+/// currently being loaded — revisiting one of those is a cycle.
 struct GraphLoader<'load, FileSystemType: FileSystem> {
     workspace: &'load Workspace,
     file_system: &'load FileSystemType,
-    loaded: HashSet<ModuleIdentity>,
-    modules: Vec<Module>,
+    index_by_identity: HashMap<ModuleIdentity, usize>,
+    nodes: Vec<ModuleNode>,
 }
 
 impl<FileSystemType: FileSystem> GraphLoader<'_, FileSystemType> {
@@ -60,7 +86,7 @@ impl<FileSystemType: FileSystem> GraphLoader<'_, FileSystemType> {
         required_by: Option<&ModuleIdentity>,
         path: &mut Vec<ModuleIdentity>,
     ) -> SindriResult<()> {
-        if self.loaded.contains(&identity) {
+        if self.index_by_identity.contains_key(&identity) {
             return Ok(());
         }
         if let Some(position) = path.iter().position(|ancestor: &ModuleIdentity| ancestor == &identity) {
@@ -84,13 +110,30 @@ impl<FileSystemType: FileSystem> GraphLoader<'_, FileSystemType> {
             }
         }
         path.push(identity.clone());
-        let dependencies: Vec<ModuleIdentity> = module.dependencies().module_dependencies().cloned().collect();
-        for dependency in dependencies {
-            self.visit(dependency, Some(&identity), path)?;
+        let dependency_identities: Vec<ModuleIdentity> = module.dependencies().module_dependencies().cloned().collect();
+        for dependency in &dependency_identities {
+            self.visit(dependency.clone(), Some(&identity), path)?;
         }
         path.pop();
-        self.loaded.insert(identity);
-        self.modules.push(module);
+        // Every dependency is loaded now, so each resolves to a node index. Deduplicate: the same
+        // module may be named in more than one scope, but it is a single edge.
+        let mut dependencies: Vec<usize> = Vec::new();
+        for dependency in &dependency_identities {
+            let index: usize = *self
+                .index_by_identity
+                .get(dependency)
+                .expect("a dependency is loaded before the module that depends on it");
+            if !dependencies.contains(&index) {
+                dependencies.push(index);
+            }
+        }
+        let node_index: usize = self.nodes.len();
+        self.nodes.push(ModuleNode {
+            identity: identity.clone(),
+            module,
+            dependencies,
+        });
+        self.index_by_identity.insert(identity, node_index);
         Ok(())
     }
 }
@@ -122,10 +165,18 @@ mod tests {
 
     fn loaded_names(graph: &ModuleGraph) -> Vec<&str> {
         graph
-            .modules()
+            .nodes()
             .iter()
-            .map(|loaded: &Module| -> &str { loaded.name().as_ref() })
+            .map(|node: &ModuleNode| -> &str { node.module().name().as_ref() })
             .collect()
+    }
+
+    fn node_index(graph: &ModuleGraph, name: &str) -> usize {
+        graph
+            .nodes()
+            .iter()
+            .position(|node: &ModuleNode| -> bool { node.module().name().as_ref() == name })
+            .expect("the named module is present in the graph")
     }
 
     #[test]
@@ -214,6 +265,79 @@ mod tests {
             1,
             "the shared dependency must be loaded exactly once, got {names:?}"
         );
+    }
+
+    #[test]
+    fn orders_dependencies_before_dependents_with_an_edge() {
+        // `app` depends on `lib`: `lib` is stored first (dependency-first), so all of `lib`'s tasks
+        // precede `app`'s, and `app` carries a dependency edge back to `lib`.
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+            )
+            .file(
+                "/workspace/lib/sindri.build",
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let graph: ModuleGraph = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap();
+        assert_eq!(loaded_names(&graph), vec!["lib", "app"]);
+        let lib_index: usize = node_index(&graph, "lib");
+        let app_index: usize = node_index(&graph, "app");
+        assert!(
+            lib_index < app_index,
+            "the dependency must be ordered before its dependent"
+        );
+        assert_eq!(
+            graph.nodes()[app_index].dependencies(),
+            &[lib_index],
+            "the dependent must carry an edge to its dependency"
+        );
+        assert!(
+            graph.nodes()[lib_index].dependencies().is_empty(),
+            "a leaf dependency has no outgoing edges"
+        );
+    }
+
+    #[test]
+    fn independent_modules_have_no_edge_between_them() {
+        // `app` depends on both `a` and `b`, which do not depend on each other. Neither `a` nor `b`
+        // has an edge to the other, so they are parallel-eligible.
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//a" }, { module = "//b" } ] } }"#,
+            )
+            .file(
+                "/workspace/a/sindri.build",
+                r#"{ name = "a", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/b/sindri.build",
+                r#"{ name = "b", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let graph: ModuleGraph = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap();
+        let a_index: usize = node_index(&graph, "a");
+        let b_index: usize = node_index(&graph, "b");
+        assert!(
+            !graph.nodes()[a_index].dependencies().contains(&b_index),
+            "independent modules must not have an edge between them"
+        );
+        assert!(
+            !graph.nodes()[b_index].dependencies().contains(&a_index),
+            "independent modules must not have an edge between them"
+        );
+        // The dependent still carries an edge to each independent dependency.
+        let app_dependencies: &[usize] = graph.nodes()[node_index(&graph, "app")].dependencies();
+        assert!(app_dependencies.contains(&a_index) && app_dependencies.contains(&b_index));
     }
 
     #[test]
