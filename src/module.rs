@@ -4,12 +4,14 @@ use crate::nickel_eval::Contract;
 use crate::nickel_eval::Nickel;
 use crate::runtime::FileSystem;
 use crate::types::{
-    AbsoluteDirectory, AbsoluteFile, BuildFile, ConfigFile, DirEntry, FileKind, Language, ModuleName, RelativeFile,
-    Version, WorkspaceRoot,
+    AbsoluteDirectory, AbsoluteFile, BuildFile, ConfigFile, DirEntry, FileKind, Language, ModuleIdentity, ModuleName,
+    RelativeFile, Version, WorkspaceRoot,
 };
 use crate::workspace::Workspace;
 use nickel_lang::Expr;
 use serde::Deserialize;
+use serde::de::Error as DeserializeError;
+use smol_str::SmolStr;
 use std::borrow::Cow;
 
 const MODULE_CONTRACT: Contract = Contract::new(
@@ -30,17 +32,124 @@ pub enum ArtifactType {
     ContainerImage,
 }
 
-impl<'de> Deserialize<'de> for ArtifactType {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+impl<'deserialize> Deserialize<'deserialize> for ArtifactType {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
         let value: String = String::deserialize(deserializer)?;
         match value.as_str() {
             "library" => Ok(ArtifactType::Library),
             "executable" => Ok(ArtifactType::Executable),
             "web-archive" => Ok(ArtifactType::WebArchive),
             "container-image" => Ok(ArtifactType::ContainerImage),
-            other => Err(serde::de::Error::custom(format!(
+            other => Err(DeserializeError::custom(format!(
                 "unknown artifact type `{other}`; expected one of: library, executable, web-archive, container-image"
             ))),
+        }
+    }
+}
+
+/// The identity of an external-artifact dependency (e.g. `example-org:some-lib`) — the artifact
+/// parallel of a [`ModuleIdentity`]. A thin newtype over the coordinate text; it names which artifact,
+/// not which version.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactIdentity(SmolStr);
+
+impl AsRef<str> for ArtifactIdentity {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A single dependency: on a module in this workspace, or on an external artifact. Naming exactly one
+/// of the two is an invariant of the type — a dependency can never name both or neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dependency {
+    Module(ModuleIdentity),
+    Artifact(ArtifactIdentity),
+}
+
+impl Dependency {
+    /// The module this dependency names, or `None` when it names an external artifact. Lets the graph
+    /// loader follow module edges without matching on the variant at every call site.
+    pub fn module_identity(&self) -> Option<&ModuleIdentity> {
+        match self {
+            Dependency::Module(identity) => Some(identity),
+            Dependency::Artifact(_) => None,
+        }
+    }
+}
+
+/// A module's declared dependencies, grouped by scope. Re-exporting a compile dependency to this
+/// module's own consumers is modelled as its own [`exported`](DependencyGroup::exported) scope rather
+/// than a per-dependency flag, so an exported non-compile dependency simply cannot be represented.
+/// Only `module` dependencies participate in the build graph; `artifact` dependencies are recorded but
+/// not resolved. Empty scopes throughout are the ordinary "no dependencies" case — the [`Default`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct DependencyGroup {
+    #[serde(default)]
+    compile: Vec<Dependency>,
+    #[serde(default, rename = "export")]
+    exported: Vec<Dependency>,
+    #[serde(default)]
+    test: Vec<Dependency>,
+    #[serde(default)]
+    runtime: Vec<Dependency>,
+    #[serde(default, rename = "test-runtime")]
+    test_runtime: Vec<Dependency>,
+}
+
+impl DependencyGroup {
+    /// Compile-scope dependencies that are not re-exported to consumers. Everything visible during
+    /// compilation is these together with [`exported`](DependencyGroup::exported).
+    pub fn compile(&self) -> &[Dependency] {
+        &self.compile
+    }
+
+    /// Compile-scope dependencies re-exported to this module's consumers.
+    pub fn exported(&self) -> &[Dependency] {
+        &self.exported
+    }
+
+    pub fn test(&self) -> &[Dependency] {
+        &self.test
+    }
+
+    pub fn runtime(&self) -> &[Dependency] {
+        &self.runtime
+    }
+
+    pub fn test_runtime(&self) -> &[Dependency] {
+        &self.test_runtime
+    }
+}
+
+impl<'deserialize> Deserialize<'deserialize> for Dependency {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        // The wire shape of a single dependency: a record naming a module or an artifact. The Nickel
+        // contract already enforces that exactly one of the two is present; the match below maps the
+        // record onto the variants and still treats "both" and "neither" as errors, so the invariant
+        // holds even were a caller ever to evaluate without the contract.
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(default)]
+            module: Option<ModuleIdentity>,
+            #[serde(default)]
+            artifact: Option<ArtifactIdentity>,
+        }
+        let fields: Fields = Fields::deserialize(deserializer)?;
+        match (fields.module, fields.artifact) {
+            (Some(module), None) => Ok(Dependency::Module(module)),
+            (None, Some(artifact)) => Ok(Dependency::Artifact(artifact)),
+            (Some(_), Some(_)) => Err(DeserializeError::custom(
+                "a dependency must set exactly one of `module` or `artifact`, not both",
+            )),
+            (None, None) => Err(DeserializeError::custom(
+                "a dependency must set either `module` or `artifact`",
+            )),
         }
     }
 }
@@ -52,6 +161,8 @@ pub struct Module {
     #[serde(rename = "type")]
     artifact_type: ArtifactType,
     version: Version,
+    #[serde(default)]
+    dependencies: DependencyGroup,
 }
 
 impl Module {
@@ -69,6 +180,10 @@ impl Module {
 
     pub fn version(&self) -> &Version {
         &self.version
+    }
+
+    pub fn dependencies(&self) -> &DependencyGroup {
+        &self.dependencies
     }
 }
 
@@ -278,5 +393,115 @@ mod tests {
         let workspace: Workspace = make_workspace(&runtime, "");
         let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
         Module::load(&build_file, &workspace, &runtime).unwrap();
+    }
+
+    #[test]
+    fn load_module_groups_dependencies_by_scope() {
+        let source: &str = r#"{
+  name = "app",
+  language = "go",
+  type = "executable",
+  version = "0.1.0",
+  dependencies = {
+    compile = [
+      { module = "//libs/common" },
+      { artifact = "example-org:some-lib" },
+    ],
+    export = [
+      { module = "//libs/api" },
+    ],
+    test = [
+      { module = "//libs/test-helpers" },
+    ],
+  },
+}"#;
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        let dependencies: &DependencyGroup = module.dependencies();
+        // The non-exported compile entries: the module and the artifact.
+        assert_eq!(dependencies.compile().len(), 2);
+        assert_eq!(
+            dependencies.compile()[0].module_identity().map(ToString::to_string),
+            Some("//libs/common".to_string())
+        );
+        match &dependencies.compile()[1] {
+            Dependency::Artifact(identity) => assert_eq!(identity.as_ref(), "example-org:some-lib"),
+            other => panic!("expected an artifact dependency, got {other:?}"),
+        }
+        // The exported compile entry lands in its own scope.
+        assert_eq!(dependencies.exported().len(), 1);
+        assert_eq!(
+            dependencies.exported()[0].module_identity().map(ToString::to_string),
+            Some("//libs/api".to_string())
+        );
+        assert_eq!(dependencies.test().len(), 1);
+        assert!(dependencies.runtime().is_empty());
+        assert!(dependencies.test_runtime().is_empty());
+    }
+
+    #[test]
+    fn load_module_without_dependencies_has_empty_scopes() {
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        let dependencies: &DependencyGroup = module.dependencies();
+        assert!(dependencies.compile().is_empty());
+        assert!(dependencies.exported().is_empty());
+        assert!(dependencies.test().is_empty());
+        assert!(dependencies.runtime().is_empty());
+        assert!(dependencies.test_runtime().is_empty());
+    }
+
+    #[test]
+    fn per_entry_export_field_is_a_contract_error() {
+        // `export` is a scope, not a per-dependency flag: re-exported compile dependencies go in the
+        // `export` scope. A stray `export` on an entry is an unknown field on the closed dependency
+        // contract, so it fails during Nickel evaluation.
+        let source: &str = r#"{
+  name = "app", language = "go", type = "executable", version = "0.1.0",
+  dependencies = { compile = [ { module = "//libs/common", export = true } ] },
+}"#;
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
+        assert!(
+            matches!(error, SindriError::NickelEval { .. }),
+            "expected NickelEval, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_type_deserializes_every_kind() {
+        assert!(matches!(
+            serde_json::from_str::<ArtifactType>(r#""library""#).unwrap(),
+            ArtifactType::Library
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ArtifactType>(r#""executable""#).unwrap(),
+            ArtifactType::Executable
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ArtifactType>(r#""web-archive""#).unwrap(),
+            ArtifactType::WebArchive
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ArtifactType>(r#""container-image""#).unwrap(),
+            ArtifactType::ContainerImage
+        ));
+    }
+
+    #[test]
+    fn artifact_type_rejects_an_unknown_kind() {
+        assert!(serde_json::from_str::<ArtifactType>(r#""firmware""#).is_err());
+    }
+
+    #[test]
+    fn dependency_rejects_setting_both_module_and_artifact() {
+        let both: &str = r#"{ "module": "//libs/common", "artifact": "example-org:some-lib" }"#;
+        assert!(serde_json::from_str::<Dependency>(both).is_err());
     }
 }

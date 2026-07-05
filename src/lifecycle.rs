@@ -110,7 +110,7 @@ impl Lifecycle {
         let graph: TaskGraph = self
             .build_task_graph(&[&plugin], &compile_step)
             .expect("compile is a built-in lifecycle step");
-        let qualifier: Qualifier = build_file.qualifier();
+        let qualifier: Option<Qualifier> = build_file.qualifier();
         let absolute_working_directory: AbsoluteDirectory = workspace.absolute_working_directory();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
         // A failing task makes `execute_graph` return early via `?`, so the telemetry write below is
@@ -122,7 +122,7 @@ impl Lifecycle {
             &absolute_working_directory,
             workspace.workspace_root(),
             &absolute_build_directory,
-            &qualifier,
+            qualifier.as_ref(),
             config,
             runtime,
         )?;

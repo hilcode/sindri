@@ -38,20 +38,28 @@ impl CacheStatus {
 }
 
 /// The on-disk locations a single task owns under the build directory:
-/// `.target/<qualifier>/<step>/<task>/`, holding its `state.bin` and an `output/` subdirectory for
-/// its artifacts. Each task owns a disjoint directory, so parallel tasks never contend.
+/// `.target/<qualifier>/<step>/<task>/`, or `.target/<step>/<task>/` when the module has no qualifier
+/// (a plain `sindri.build`). Holds its `state.bin` and an `output/` subdirectory for its artifacts.
+/// Each task owns a disjoint directory, so parallel tasks never contend.
 pub struct TaskPaths {
     state_file: AbsoluteFile,
     output_directory: AbsoluteDirectory,
 }
 
 impl TaskPaths {
-    pub fn new(build_directory: &AbsoluteDirectory, qualifier: &Qualifier, step: &Step, task: &TaskName) -> TaskPaths {
-        let relative: RelativeDirectory = RelativeDirectory::new(
-            PathBuf::from(qualifier.as_ref())
-                .join(step.as_ref())
-                .join(task.as_ref()),
-        );
+    pub fn new(
+        build_directory: &AbsoluteDirectory,
+        qualifier: Option<&Qualifier>,
+        step: &Step,
+        task: &TaskName,
+    ) -> TaskPaths {
+        let mut relative_path: PathBuf = PathBuf::new();
+        if let Some(qualifier) = qualifier {
+            relative_path.push(qualifier.as_ref());
+        }
+        relative_path.push(step.as_ref());
+        relative_path.push(task.as_ref());
+        let relative: RelativeDirectory = RelativeDirectory::new(relative_path);
         let task_directory: AbsoluteDirectory = build_directory.join_directory(&relative);
         TaskPaths {
             state_file: task_directory.join_file(&RelativeFile::new("state.bin")),
@@ -228,7 +236,7 @@ mod tests {
         let persisted: Option<TaskState> = TaskState::load(
             TaskPaths::new(
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target")),
-                &Qualifier::default(),
+                None,
                 task.step(),
                 task.name(),
             )

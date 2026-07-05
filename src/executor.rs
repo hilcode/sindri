@@ -181,7 +181,7 @@ fn plan_group(
     working_directory: &AbsoluteDirectory,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
-    qualifier: &Qualifier,
+    qualifier: Option<&Qualifier>,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
     let mut plans: Vec<TaskPlan> = Vec::with_capacity(node_ids.len());
@@ -304,7 +304,7 @@ pub fn execute_graph(
     working_directory: &AbsoluteDirectory,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
-    qualifier: &Qualifier,
+    qualifier: Option<&Qualifier>,
     config: &ExecutionConfig,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskOutcome>> {
@@ -465,7 +465,7 @@ mod tests {
             working_directory,
             &workspace_root,
             &build_directory,
-            &Qualifier::default(),
+            None,
             config,
             runtime,
         )
@@ -483,7 +483,7 @@ mod tests {
             &working_directory,
             &workspace_root,
             &build_directory,
-            &Qualifier::default(),
+            None,
             config,
             &system_runtime(),
         )

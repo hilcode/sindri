@@ -242,9 +242,10 @@ fn compile_quiet_with_failure_still_shows_error() {
 }
 
 fn go_compile_output_directory(workspace: &Path) -> PathBuf {
+    // A plain `sindri.build` module has no qualifier, so its state lives directly under `.target`
+    // (no qualifier segment): `.target/<step>/<task>/output/`.
     workspace
         .join(".target")
-        .join("default")
         .join("compile")
         .join("go-compile")
         .join("output")

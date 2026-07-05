@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::Error as DeserializeError;
 use smol_str::SmolStr;
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -410,12 +411,14 @@ pub enum Language {
     Go,
 }
 
-impl<'de> Deserialize<'de> for Language {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+impl<'deserialize> Deserialize<'deserialize> for Language {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
         let value: SmolStr = SmolStr::deserialize(deserializer)?;
         match value.as_str() {
             "go" => Ok(Language::Go),
-            other => Err(serde::de::Error::custom(format!(
+            other => Err(DeserializeError::custom(format!(
                 "unknown language `{other}`; expected one of: go"
             ))),
         }
@@ -456,7 +459,7 @@ impl Display for RelativeFile {
 /// A path to a directory, relative to some directory (ultimately a [`WorkspaceRoot`]). Resolve it
 /// against an absolute base with [`AbsoluteDirectory::join_directory`] to obtain an
 /// [`AbsoluteDirectory`].
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct RelativeDirectory(PathBuf);
 
@@ -612,46 +615,184 @@ impl BuildFile {
         ConfigFile::resolve(self.0.clone(), root)
     }
 
-    /// The build file's qualifier, which names this module's state subtree under the build directory.
-    /// A plain `sindri.build` is the [`Qualifier::default`]; a `sindri-<name>.build` yields `<name>`.
-    pub fn qualifier(&self) -> Qualifier {
+    /// The build file's qualifier, or `None` for a plain `sindri.build`; a `sindri-<name>.build`
+    /// yields `Some(<name>)`. This names the module's state subtree under the build directory.
+    pub fn qualifier(&self) -> Option<Qualifier> {
         let file_name: &str = self
             .0
             .as_ref()
             .file_name()
             .and_then(|name: &OsStr| -> Option<&str> { name.to_str() })
             .unwrap_or_default();
-        match file_name
+        file_name
             .strip_prefix("sindri-")
             .and_then(|rest: &str| -> Option<&str> { rest.strip_suffix(".build") })
-        {
-            Some(name) => Qualifier::new(name),
-            None => Qualifier::default(),
-        }
+            .map(Qualifier::new)
     }
 }
 
-/// Names a module's state subtree under the build directory: `default` for `sindri.build`, or the
-/// qualifier name (e.g. `kotlin`) for `sindri-<name>.build`. Keeps parallel modules' state in
-/// separate directories so they never contend.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A module qualifier: the `<name>` in a `sindri-<name>.build` file (e.g. `kotlin`), naming that
+/// module's state subtree under the build directory. A plain `sindri.build` has no qualifier — that
+/// "no qualifier" case is modelled as `None` at the use sites, never as a sentinel value here, so a
+/// `Qualifier` always holds a genuine, user-written name. Qualifiers are case-insensitive and stored
+/// in lower case (see [`Qualifier::new`]).
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Qualifier(SmolStr);
 
 impl Qualifier {
+    /// Qualifiers are case-insensitive, so the name is canonicalized to lower case: `Kotlin`,
+    /// `kotlin`, and `KOTLIN` all yield the same qualifier and resolve to `sindri-kotlin.build`.
     pub fn new(name: impl Into<SmolStr>) -> Qualifier {
-        Qualifier(name.into())
-    }
-}
-
-impl Default for Qualifier {
-    fn default() -> Qualifier {
-        Qualifier(SmolStr::new_static("default"))
+        let name: SmolStr = name.into();
+        Qualifier(SmolStr::new(name.to_ascii_lowercase()))
     }
 }
 
 impl AsRef<str> for Qualifier {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+/// A workspace-relative module identity, written `//libs/common` or `//libs/common [kotlin]`. It is a
+/// logical identifier, not a filesystem path: the leading segment names the module's directory
+/// relative to the workspace root, and the optional bracketed qualifier selects a
+/// `sindri-<qualifier>.build` file in that directory (its absence selects the plain `sindri.build`).
+/// This is the single form in which one module names another in a `dependencies` declaration, and the
+/// key under which a loaded module is identified in the module graph.
+///
+/// The directory is case-sensitive — `//common` resolves to `common` and `//Common` to `Common`,
+/// matching the case-sensitive filesystem — but the qualifier is case-insensitive and canonicalized to
+/// lower case, so `[Kotlin]`, `[kotlin]`, and `[KOTLIN]` all name the `kotlin` qualifier and its
+/// `sindri-kotlin.build` file. A workspace may still not contain two modules whose directories differ
+/// only in case; that collision is rejected when the module graph is loaded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct ModuleIdentity {
+    directory: RelativeDirectory,
+    qualifier: Option<Qualifier>,
+}
+
+impl ModuleIdentity {
+    /// Parse the `//<directory> [<qualifier>]` surface syntax. Directory segments are drawn from
+    /// `[A-Za-z0-9._-]` (and are never the traversal names `.` or `..`); the qualifier begins with a
+    /// letter and otherwise draws from `[A-Za-z0-9]` plus `-_.+#=@!~$%^&`, never ending in `.` (a
+    /// trailing dot is not a legal directory name on Windows). `[`, `]`, and spaces are in neither set,
+    /// so they are always structural delimiters and never part of a name — every legal identity string
+    /// therefore has exactly one parse, and a directory whose real name contains those characters is
+    /// simply not a valid module directory. The qualifier suffix is one or more spaces then `[name]`,
+    /// so qualifiers can be aligned across lines. The directory is matched case-sensitively; the
+    /// qualifier is case-insensitive and canonicalized to lower case. Any string outside this grammar
+    /// yields a [`ModuleIdentityParseError`].
+    pub fn parse(text: &str) -> Result<ModuleIdentity, ModuleIdentityParseError> {
+        let malformed = || -> ModuleIdentityParseError {
+            ModuleIdentityParseError {
+                text: SmolStr::new(text),
+            }
+        };
+        let body: &str = text.strip_prefix("//").ok_or_else(malformed)?;
+        let (directory_text, qualifier): (&str, Option<Qualifier>) = match body.strip_suffix(']') {
+            Some(head) => {
+                // Brackets are illegal in names, so the sole `[` opens the qualifier; it is set off
+                // from the directory by one or more spaces, which lets qualifiers be aligned.
+                let (before_bracket, qualifier_name): (&str, &str) = head.split_once('[').ok_or_else(malformed)?;
+                if !before_bracket.ends_with(' ') || !Self::is_valid_qualifier(qualifier_name) {
+                    return Err(malformed());
+                }
+                (
+                    before_bracket.trim_end_matches(' '),
+                    Some(Qualifier::new(qualifier_name)),
+                )
+            }
+            None => (body, None),
+        };
+        if !Self::is_valid_directory(directory_text) {
+            return Err(malformed());
+        }
+        Ok(ModuleIdentity {
+            directory: RelativeDirectory::new(PathBuf::from(directory_text)),
+            qualifier,
+        })
+    }
+
+    /// Resolve this identity to the build file that defines it, relative to the workspace root:
+    /// `//libs/common` → `libs/common/sindri.build`, and `//tools/codegen [bin]` →
+    /// `tools/codegen/sindri-bin.build`.
+    pub fn to_build_file(&self) -> BuildFile {
+        let file_name: String = match &self.qualifier {
+            Some(qualifier) => format!("sindri-{}.build", qualifier.as_ref()),
+            None => "sindri.build".to_string(),
+        };
+        BuildFile::new(RelativeFile::new(self.directory.as_ref().join(file_name)))
+    }
+
+    fn is_valid_segment(segment: &str) -> bool {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+
+    fn is_valid_directory(directory: &str) -> bool {
+        !directory.is_empty() && directory.split('/').all(Self::is_valid_segment)
+    }
+
+    fn is_valid_qualifier(qualifier: &str) -> bool {
+        // Starts with a letter (so it can never be `.`/`..` or begin with a digit) and otherwise draws
+        // from alphanumerics plus a set of punctuation — but never ends in `.`, since a trailing dot is
+        // an illegal directory name on Windows and the qualifier becomes a directory under the build
+        // tree.
+        let first_is_letter: bool = qualifier
+            .bytes()
+            .next()
+            .is_some_and(|byte: u8| byte.is_ascii_alphabetic());
+        let every_byte_allowed: bool = qualifier.bytes().all(|byte: u8| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'+' | b'#' | b'=' | b'@' | b'!' | b'~' | b'$' | b'%' | b'^' | b'&'
+                )
+        });
+        first_is_letter && every_byte_allowed && !qualifier.ends_with('.')
+    }
+}
+
+/// The reason a string could not be read as a [`ModuleIdentity`]. Carries the offending text so the
+/// message can point at exactly what was written.
+#[derive(Clone, Debug)]
+pub struct ModuleIdentityParseError {
+    text: SmolStr,
+}
+
+impl Display for ModuleIdentityParseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            formatter,
+            "invalid module identity `{}`; expected `//path` or `//path [qualifier]`",
+            self.text
+        )
+    }
+}
+
+impl std::error::Error for ModuleIdentityParseError {}
+
+impl<'deserialize> Deserialize<'deserialize> for ModuleIdentity {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let text: SmolStr = SmolStr::deserialize(deserializer)?;
+        ModuleIdentity::parse(&text).map_err(|error: ModuleIdentityParseError| DeserializeError::custom(error))
+    }
+}
+
+impl Display for ModuleIdentity {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        write!(formatter, "//{}", self.directory.as_ref().display())?;
+        if let Some(qualifier) = &self.qualifier {
+            write!(formatter, " [{}]", qualifier.as_ref())?;
+        }
+        Ok(())
     }
 }
 
@@ -699,5 +840,188 @@ impl ConfigFile {
 
     pub fn workspace_path(&self) -> &RelativeFile {
         &self.workspace_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn module_identity_resolves_default_build_file() {
+        let identity: ModuleIdentity = ModuleIdentity::parse("//libs/common").unwrap();
+        assert_eq!(identity.to_build_file().as_ref(), Path::new("libs/common/sindri.build"));
+    }
+
+    #[test]
+    fn module_identity_resolves_qualified_build_file() {
+        let identity: ModuleIdentity = ModuleIdentity::parse("//tools/codegen [bin]").unwrap();
+        assert_eq!(
+            identity.to_build_file().as_ref(),
+            Path::new("tools/codegen/sindri-bin.build")
+        );
+    }
+
+    #[test]
+    fn module_identity_directory_is_case_sensitive() {
+        assert_ne!(
+            ModuleIdentity::parse("//libs/common").unwrap(),
+            ModuleIdentity::parse("//libs/Common").unwrap()
+        );
+        assert_eq!(
+            ModuleIdentity::parse("//libs/Common").unwrap().to_build_file().as_ref(),
+            Path::new("libs/Common/sindri.build")
+        );
+        let mut identities: HashSet<ModuleIdentity> = HashSet::new();
+        assert!(identities.insert(ModuleIdentity::parse("//libs/common").unwrap()));
+        assert!(identities.insert(ModuleIdentity::parse("//libs/Common").unwrap()));
+    }
+
+    #[test]
+    fn module_identity_qualifier_is_case_insensitive() {
+        let canonical: ModuleIdentity = ModuleIdentity::parse("//libs/common [kotlin]").unwrap();
+        assert_eq!(canonical.to_string(), "//libs/common [kotlin]");
+        for text in [
+            "//libs/common [kotlin]",
+            "//libs/common [Kotlin]",
+            "//libs/common [KOTLIN]",
+        ] {
+            let identity: ModuleIdentity = ModuleIdentity::parse(text).unwrap();
+            assert_eq!(identity, canonical);
+            assert_eq!(
+                identity.to_build_file().as_ref(),
+                Path::new("libs/common/sindri-kotlin.build")
+            );
+        }
+    }
+
+    #[test]
+    fn module_identity_allows_aligned_qualifiers_with_multiple_spaces() {
+        assert_eq!(
+            ModuleIdentity::parse("//libs/common     [kotlin]").unwrap(),
+            ModuleIdentity::parse("//libs/common [kotlin]").unwrap()
+        );
+    }
+
+    #[test]
+    fn module_identity_requires_at_least_one_space_before_the_qualifier() {
+        assert!(ModuleIdentity::parse("//libs/common[kotlin]").is_err());
+    }
+
+    #[test]
+    fn module_identity_requires_the_double_slash_prefix() {
+        assert!(ModuleIdentity::parse("libs/common").is_err());
+    }
+
+    #[test]
+    fn module_identity_rejects_spaces_within_a_directory_name() {
+        assert!(ModuleIdentity::parse("//libs/my common").is_err());
+        assert!(ModuleIdentity::parse("//libs/my common [kotlin]").is_err());
+    }
+
+    #[test]
+    fn module_identity_rejects_brackets_within_a_directory_name() {
+        // The former pathological case: a directory literally named `my-dir[kotlin]` is a clean
+        // rejection now, not a silent mis-resolution to `my-dir/sindri-kotlin.build`.
+        assert!(ModuleIdentity::parse("//my-dir[kotlin]").is_err());
+    }
+
+    #[test]
+    fn module_identity_rejects_traversal_segments() {
+        assert!(ModuleIdentity::parse("//libs/../secret").is_err());
+        assert!(ModuleIdentity::parse("//.").is_err());
+    }
+
+    #[test]
+    fn module_identity_round_trips_through_display() {
+        for text in ["//libs/common", "//tools/codegen [bin]"] {
+            assert_eq!(ModuleIdentity::parse(text).unwrap().to_string(), text);
+        }
+    }
+
+    #[test]
+    fn module_identity_qualifier_allows_punctuation_and_single_letters() {
+        for text in [
+            "//libs/common [c]",
+            "//libs/common [c++]",
+            "//libs/common [f#]",
+            "//libs/tools [web.archive]",
+        ] {
+            assert!(ModuleIdentity::parse(text).is_ok(), "expected `{text}` to parse");
+        }
+    }
+
+    #[test]
+    fn module_identity_qualifier_rejects_bad_starts_and_trailing_dots() {
+        // Must start with a letter (so never `.`/`..` or a leading digit) and must not end in `.` — an
+        // illegal directory name on Windows, where the qualifier becomes a build-state directory.
+        for text in [
+            "//libs/common [1x]",
+            "//libs/common [_x]",
+            "//libs/common [+x]",
+            "//libs/common [web.]",
+        ] {
+            assert!(ModuleIdentity::parse(text).is_err(), "expected `{text}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn working_directory_relativizes_against_the_root_and_resolves_back() {
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        let absolute: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/services/api"));
+        let derived: WorkingDirectory = WorkingDirectory::derive(&absolute, &root);
+        assert_eq!(derived.as_ref(), Path::new("services/api"));
+        assert_eq!(derived.absolute(&root), absolute);
+        let constructed: WorkingDirectory = WorkingDirectory::new(RelativeDirectory::new("services/api"));
+        assert_eq!(constructed.absolute(&root), absolute);
+    }
+
+    #[test]
+    fn language_deserialize_rejects_an_unknown_language() {
+        assert!(serde_json::from_str::<Language>(r#""rust""#).is_err());
+    }
+
+    #[test]
+    fn module_identity_parse_error_reports_the_offending_text() {
+        let error: ModuleIdentityParseError = ModuleIdentity::parse("not-an-identity").unwrap_err();
+        let message: String = error.to_string();
+        assert!(message.contains("not-an-identity"), "message was: {message}");
+        assert!(message.contains("invalid module identity"), "message was: {message}");
+    }
+
+    #[test]
+    fn command_output_exposes_its_streams_and_status() {
+        let output: CommandOutput = CommandOutput::new(
+            Stdout::new(b"out".to_vec()),
+            Stderr::new(b"err".to_vec()),
+            TaskStatus::Succeeded,
+        );
+        assert_eq!(output.stdout().as_bytes(), b"out");
+        assert_eq!(output.stderr().as_bytes(), b"err");
+        assert_eq!(output.status(), TaskStatus::Succeeded);
+    }
+
+    #[test]
+    fn stdout_captures_writes_and_flush_is_a_noop() {
+        let mut stdout: Stdout = Stdout::new(Vec::new());
+        stdout.write_all(b"hello").unwrap();
+        stdout.flush().unwrap();
+        assert_eq!(stdout.as_bytes(), b"hello");
+    }
+
+    #[test]
+    fn workspace_root_and_build_file_display_and_resolve() {
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        assert_eq!(root.to_string(), "/workspace");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        assert_eq!(build_file.to_string(), "sindri.build");
+        assert_eq!(
+            build_file.absolute(&root).as_ref(),
+            Path::new("/workspace/sindri.build")
+        );
     }
 }
