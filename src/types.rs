@@ -615,6 +615,17 @@ impl BuildFile {
         ConfigFile::resolve(self.0.clone(), root)
     }
 
+    /// The workspace-relative identity of the module this file defines: its parent directory paired
+    /// with its qualifier. A `sindri.build` at the workspace root yields the empty-directory identity
+    /// (`//`); a `libs/common/sindri-kotlin.build` yields `//libs/common [kotlin]`. This is the inverse
+    /// of [`ModuleIdentity::to_build_file`] and is how the entry module joins the module graph keyed by
+    /// the same identity form its dependents would name it with.
+    pub fn identity(&self) -> ModuleIdentity {
+        let directory: RelativeDirectory =
+            RelativeDirectory::new(self.0.as_ref().parent().map(Path::to_path_buf).unwrap_or_default());
+        ModuleIdentity::new(directory, self.qualifier())
+    }
+
     /// The build file's qualifier, or `None` for a plain `sindri.build`; a `sindri-<name>.build`
     /// yields `Some(<name>)`. This names the module's state subtree under the build directory.
     pub fn qualifier(&self) -> Option<Qualifier> {
@@ -673,6 +684,15 @@ pub struct ModuleIdentity {
 }
 
 impl ModuleIdentity {
+    /// Build an identity directly from an already-typed directory and optional qualifier. Unlike
+    /// [`parse`](ModuleIdentity::parse), which validates surface syntax, this trusts its typed inputs
+    /// — it is how an entry module derives its own identity from the [`BuildFile`] it was found at,
+    /// including the workspace-root module whose directory is empty (a form [`parse`](ModuleIdentity::parse)
+    /// deliberately rejects, since no other module can name it).
+    pub fn new(directory: RelativeDirectory, qualifier: Option<Qualifier>) -> ModuleIdentity {
+        ModuleIdentity { directory, qualifier }
+    }
+
     /// Parse the `//<directory> [<qualifier>]` surface syntax. Directory segments are drawn from
     /// `[A-Za-z0-9._-]` (and are never the traversal names `.` or `..`); the qualifier begins with a
     /// letter and otherwise draws from `[A-Za-z0-9]` plus `-_.+#=@!~$%^&`, never ending in `.` (a
@@ -776,6 +796,31 @@ impl Display for ModuleIdentityParseError {
 }
 
 impl std::error::Error for ModuleIdentityParseError {}
+
+/// A dependency cycle among modules, held as the ordered path that closes back on itself — the first
+/// module repeated as the last, so `//a → //b → //a` records both which modules form the loop and the
+/// order the edges were followed. It gives the diagnostic's arrow-chain rendering a typed home; the
+/// path is kept structured (rather than pre-joined) so the closing edge is explicit.
+#[derive(Clone, Debug)]
+pub struct ModuleCycle(Vec<ModuleIdentity>);
+
+impl ModuleCycle {
+    pub fn new(path: Vec<ModuleIdentity>) -> ModuleCycle {
+        ModuleCycle(path)
+    }
+}
+
+impl Display for ModuleCycle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        for (index, identity) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(" → ")?;
+            }
+            write!(formatter, "{identity}")?;
+        }
+        Ok(())
+    }
+}
 
 impl<'deserialize> Deserialize<'deserialize> for ModuleIdentity {
     fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(

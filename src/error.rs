@@ -1,5 +1,7 @@
 use crate::plugin::TaskName;
 use crate::types::Command;
+use crate::types::ModuleCycle;
+use crate::types::ModuleIdentity;
 use miette::Diagnostic;
 use std::io::Error as IoError;
 use std::path::PathBuf;
@@ -52,6 +54,26 @@ pub enum SindriError {
     )]
     SymlinkNotSupported { path: PathBuf },
 
+    #[error("dependency cycle detected: {cycle}")]
+    #[diagnostic(
+        help("break the cycle by removing one of the `module` dependencies along it"),
+        code(sindri::module::cycle)
+    )]
+    DependencyCycle { cycle: ModuleCycle },
+
+    #[error(
+        "module `{dependency}` is a {kind}, but only library modules may be a dependency (required by `{dependent}`)"
+    )]
+    #[diagnostic(
+        help("make the dependency a library module, or remove the dependency"),
+        code(sindri::module::non_library_dependency)
+    )]
+    NonLibraryDependency {
+        dependent: ModuleIdentity,
+        dependency: ModuleIdentity,
+        kind: &'static str,
+    },
+
     #[error("task `{task_name}` failed\n\ncommand: {command}\n\noutput:\n{output}")]
     #[diagnostic(help("check the command output above for details"), code(sindri::task::failed))]
     TaskFailed {
@@ -100,6 +122,18 @@ mod tests {
         });
         assert_has_help_and_code(&SindriError::SymlinkNotSupported {
             path: PathBuf::from("/tmp/foo"),
+        });
+        assert_has_help_and_code(&SindriError::DependencyCycle {
+            cycle: ModuleCycle::new(vec![
+                ModuleIdentity::parse("//a").unwrap(),
+                ModuleIdentity::parse("//b").unwrap(),
+                ModuleIdentity::parse("//a").unwrap(),
+            ]),
+        });
+        assert_has_help_and_code(&SindriError::NonLibraryDependency {
+            dependent: ModuleIdentity::parse("//app").unwrap(),
+            dependency: ModuleIdentity::parse("//tools/gen").unwrap(),
+            kind: "executable",
         });
         assert_has_help_and_code(&SindriError::TaskFailed {
             task_name: TaskName::new("go-compile"),

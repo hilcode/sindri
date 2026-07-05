@@ -2,7 +2,7 @@ use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
-use crate::module::Module;
+use crate::module_graph::ModuleGraph;
 use crate::plugin::go_plugin;
 use crate::plugin::{Plugin, Task};
 use crate::runtime::Runtime;
@@ -101,10 +101,12 @@ impl Lifecycle {
         runtime: &impl Runtime,
     ) -> MietteResult<()> {
         let build_file: BuildFile = BuildFile::find(workspace, runtime)?;
-        let loaded_module: Module = Module::load(&build_file, workspace, runtime)?;
-        runtime
-            .log(&format!("Module loaded: {}", loaded_module.name().as_ref()))
-            .map_err(|source| SindriError::Log { source })?;
+        let module_graph: ModuleGraph = ModuleGraph::load(&build_file, workspace, runtime)?;
+        for loaded_module in module_graph.modules() {
+            runtime
+                .log(&format!("Module loaded: {}", loaded_module.name().as_ref()))
+                .map_err(|source| SindriError::Log { source })?;
+        }
         let plugin: Plugin = go_plugin();
         let compile_step: Step = Step::new("compile");
         let graph: TaskGraph = self

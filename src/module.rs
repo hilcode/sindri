@@ -32,6 +32,24 @@ pub enum ArtifactType {
     ContainerImage,
 }
 
+impl ArtifactType {
+    /// Whether this is a `library` — the only type that may appear as another module's dependency.
+    /// Executables, web archives, and container images may consume dependencies but never be one.
+    pub fn is_library(&self) -> bool {
+        matches!(self, ArtifactType::Library)
+    }
+
+    /// The type's on-the-wire name, for diagnostics that report a module's type back to the user.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ArtifactType::Library => "library",
+            ArtifactType::Executable => "executable",
+            ArtifactType::WebArchive => "web-archive",
+            ArtifactType::ContainerImage => "container-image",
+        }
+    }
+}
+
 impl<'deserialize> Deserialize<'deserialize> for ArtifactType {
     fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
         deserializer: Deserializer,
@@ -122,6 +140,19 @@ impl DependencyGroup {
 
     pub fn test_runtime(&self) -> &[Dependency] {
         &self.test_runtime
+    }
+
+    /// Every module named as a dependency, across all scopes, in declaration order. External
+    /// `artifact` dependencies are skipped — only `module` edges participate in the build graph, so
+    /// this is what the graph loader follows transitively.
+    pub fn module_dependencies(&self) -> impl Iterator<Item = &ModuleIdentity> {
+        self.compile
+            .iter()
+            .chain(&self.exported)
+            .chain(&self.test)
+            .chain(&self.runtime)
+            .chain(&self.test_runtime)
+            .filter_map(Dependency::module_identity)
     }
 }
 

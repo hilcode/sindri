@@ -6,6 +6,7 @@ pub mod hash;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;
 pub mod module;
+pub mod module_graph;
 pub mod nickel_eval;
 pub mod plugin;
 pub mod runtime;
