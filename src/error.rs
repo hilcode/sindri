@@ -81,6 +81,13 @@ pub enum SindriError {
         command: Command,
         output: String,
     },
+
+    #[error("could not determine the Go toolchain version")]
+    #[diagnostic(
+        help("ensure the `go` command is available (it is provided by the Devenv shell)"),
+        code(sindri::go::toolchain_version_unknown)
+    )]
+    GoToolchainVersionUnknown,
 }
 
 #[cfg(test)]
@@ -140,5 +147,6 @@ mod tests {
             command: Command::new("go", ["build", "./..."]),
             output: "error: undefined".into(),
         });
+        assert_has_help_and_code(&SindriError::GoToolchainVersionUnknown);
     }
 }

@@ -53,6 +53,39 @@ fn failing_go_module_dir() -> TempDir {
     directory
 }
 
+/// A workspace whose entry `app` executable declares a `{ module = … }` dependency on a local
+/// `//lib/greeting` library. `app` imports `example.com/greeting`, which only resolves once Sindri
+/// generates the `go.work` covering both module directories.
+fn multi_module_dir() -> TempDir {
+    let directory: TempDir = workspace_dir();
+    fs::write(
+        directory.path().join("sindri.build"),
+        r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+             dependencies = { compile = [ { module = "//lib/greeting" } ] } }"#,
+    )
+    .unwrap();
+    fs::write(directory.path().join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
+    fs::write(
+        directory.path().join("main.go"),
+        "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/greeting\"\n)\n\nfunc main() {\n\tfmt.Println(greeting.Message(\"Sindri\"))\n}\n",
+    )
+    .unwrap();
+    let greeting: PathBuf = directory.path().join("lib").join("greeting");
+    fs::create_dir_all(&greeting).unwrap();
+    fs::write(
+        greeting.join("sindri.build"),
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0" }"#,
+    )
+    .unwrap();
+    fs::write(greeting.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
+    fs::write(
+        greeting.join("greeting.go"),
+        "package greeting\n\nimport \"fmt\"\n\nfunc Message(name string) string {\n\treturn fmt.Sprintf(\"Hello, %s!\", name)\n}\n",
+    )
+    .unwrap();
+    directory
+}
+
 #[test]
 fn version_long_flag() {
     let output: Output = sindri().arg("--version").output().unwrap();
@@ -174,6 +207,23 @@ fn compile_in_valid_go_module_exits_zero() {
         output.status.success(),
         "expected exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn compile_module_with_local_go_library_dependency_builds() {
+    let directory: TempDir = multi_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "expected exit 0 building a module with a local library dependency; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let go_work: String = fs::read_to_string(directory.path().join(".target").join("go.work"))
+        .expect("a go.work should be generated in the build directory");
+    assert!(
+        go_work.contains("lib/greeting"),
+        "the generated go.work should list the local library, got:\n{go_work}"
     );
 }
 

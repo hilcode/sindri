@@ -287,6 +287,7 @@ impl Display for Step {
 pub struct Command {
     program: SmolStr,
     arguments: Vec<SmolStr>,
+    environment: Vec<(SmolStr, SmolStr)>,
 }
 
 impl Command {
@@ -294,7 +295,16 @@ impl Command {
         Command {
             program: program.into(),
             arguments: arguments.into_iter().map(|argument| argument.into()).collect(),
+            environment: Vec::new(),
         }
+    }
+
+    /// Set an environment variable in the process this command spawns, returning the command so
+    /// setters chain onto [`new`](Command::new). Environment variables are execution detail only —
+    /// they do not appear in the [`Display`] rendering used for diagnostics.
+    pub fn with_environment_variable(mut self, name: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Command {
+        self.environment.push((name.into(), value.into()));
+        self
     }
 
     pub fn program(&self) -> &str {
@@ -305,8 +315,13 @@ impl Command {
         &self.arguments
     }
 
+    pub fn environment(&self) -> &[(SmolStr, SmolStr)] {
+        &self.environment
+    }
+
     /// Resolve the `{output}` placeholder in each argument to a task's output directory, yielding a
-    /// ready-to-spawn command. Tasks that do not reference `{output}` are returned unchanged.
+    /// ready-to-spawn command. Arguments that do not reference `{output}` — and the environment, which
+    /// carries no placeholder — are carried through unchanged.
     pub fn with_output_directory(&self, output_directory: &Path) -> Command {
         let replacement: Cow<'_, str> = output_directory.to_string_lossy();
         Command {
@@ -316,6 +331,7 @@ impl Command {
                 .iter()
                 .map(|argument: &SmolStr| -> SmolStr { SmolStr::new(argument.replace("{output}", &replacement)) })
                 .collect(),
+            environment: self.environment.clone(),
         }
     }
 }

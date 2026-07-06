@@ -2,12 +2,16 @@ use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
+use crate::go_work::GoToolchainVersion;
+use crate::go_work::GoWork;
+use crate::module::ArtifactType;
 use crate::module_graph::ModuleGraph;
 use crate::plugin::go_plugin;
 use crate::plugin::{Plugin, Task};
 use crate::runtime::Runtime;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
+use crate::types::AbsoluteFile;
 use crate::types::BuildFile;
 use crate::types::ModulePath;
 #[cfg(test)]
@@ -91,7 +95,9 @@ impl Lifecycle {
     }
 
     pub fn run_lifecycle(&self, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
-        let plugin: Plugin = go_plugin();
+        // The listing is workspace-generic, with no module and no generated workspace file in hand;
+        // show the executable form of the go-compile task as a representative.
+        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
         self.write(&[&plugin], show_all, &mut runtime.output())
     }
 
@@ -108,19 +114,37 @@ impl Lifecycle {
                 .log(&format!("Module loaded: {}", node.module().name().as_ref()))
                 .map_err(|source| SindriError::Log { source })?;
         }
-        let plugin: Plugin = go_plugin();
         let compile_step: Step = Step::new("compile");
-        let graph: TaskGraph = self
-            .build_task_graph(&[&plugin], &compile_step)
-            .expect("compile is a built-in lifecycle step");
         let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+        // Project the declared module dependencies into Go's local-dependency view, written inside the
+        // build directory and reached by each `go` invocation through GOWORK, so a dependent module
+        // resolves an import of a sibling library locally instead of trying to fetch it. The
+        // declarations are the file's only source, so it cannot drift from a hand-maintained one, and
+        // it stays a build artifact rather than clutter in the source tree. The directive is the
+        // toolchain's own version (`go env GOVERSION`); without a usable `go` the build cannot proceed,
+        // so a missing version is a hard error rather than a silently malformed file.
+        let toolchain_version: GoToolchainVersion =
+            GoToolchainVersion::query(runtime, &workspace_root.to_absolute_directory())
+                .ok_or(SindriError::GoToolchainVersionUnknown)?;
+        let go_work_file: AbsoluteFile = GoWork::file(&absolute_build_directory);
+        GoWork::project(&module_graph, workspace_root, toolchain_version)
+            .write(&absolute_build_directory, runtime)
+            .map_err(|source| SindriError::Io {
+                path: go_work_file.as_ref().to_path_buf(),
+                source,
+            })?;
         // Modules build in dependency-first order (the graph's node order), each in its own directory
         // and its own state subtree, so a dependency is fully built before anything that depends on
-        // it. A failing task makes `execute_graph` return early via `?`, so a broken build writes no
-        // telemetry: the partial trace is dropped, keeping every telemetry.json a whole-build record.
+        // it. Each module compiles with the go-compile command its artifact type requires. A failing
+        // task makes `execute_graph` return early via `?`, so a broken build writes no telemetry: the
+        // partial trace is dropped, keeping every telemetry.json a whole-build record.
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
         for node in module_graph.nodes() {
+            let plugin: Plugin = go_plugin(node.module().artifact_type(), Some(&go_work_file));
+            let graph: TaskGraph = self
+                .build_task_graph(&[&plugin], &compile_step)
+                .expect("compile is a built-in lifecycle step");
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
                 .join_directory(node.identity().directory());
@@ -211,8 +235,19 @@ mod tests {
         CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Failed)
     }
 
+    /// The stubbed reply to `go env GOVERSION`, which every `compile` run queries to write the
+    /// generated `go.work`'s `go` directive.
+    fn go_version() -> CommandOutput {
+        CommandOutput::new(
+            Stdout::new(b"go1.26.4\n".to_vec()),
+            Stderr::default(),
+            TaskStatus::Succeeded,
+        )
+    }
+
     /// A runtime seeded with a minimal Go workspace and module, ready for a `compile` run. Callers
-    /// register the command outcomes (`gofmt`, `go build`) the test wants to exercise.
+    /// register the command outcomes (`gofmt`, `go build`) the test wants to exercise; the toolchain
+    /// version query is stubbed here since every compile issues it.
     fn go_workspace() -> DummyRuntimeBuilder {
         DummyRuntime::builder()
             .file(
@@ -223,6 +258,7 @@ mod tests {
                 "/workspace/sindri.build",
                 r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
             )
+            .command("go env GOVERSION", go_version())
             .current_directory("/workspace")
     }
 
@@ -284,7 +320,7 @@ mod tests {
     #[test]
     fn write_hides_empty_steps_by_default() {
         let lifecycle: Lifecycle = Lifecycle::new();
-        let plugin: Plugin = go_plugin();
+        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
         let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&[&plugin], false, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
@@ -296,7 +332,7 @@ mod tests {
     #[test]
     fn write_shows_empty_steps_with_all_flag() {
         let lifecycle: Lifecycle = Lifecycle::new();
-        let plugin: Plugin = go_plugin();
+        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
         let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&[&plugin], true, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
@@ -314,6 +350,7 @@ mod tests {
                 "/workspace/sindri.build",
                 r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
             )
+            .command("go env GOVERSION", go_version())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .current_directory("/workspace")
@@ -342,6 +379,7 @@ mod tests {
                 "/workspace/lib/sindri.build",
                 r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
             )
+            .command("go env GOVERSION", go_version())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .current_directory("/workspace")
@@ -367,6 +405,15 @@ mod tests {
                 .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
                 .is_some(),
             "the dependency module should have built and persisted its state"
+        );
+        // A go.work projecting both modules is written into the build directory before the build.
+        let go_work: Vec<u8> = runtime
+            .written_file("/workspace/.target/go.work")
+            .expect("a go.work should be generated in the build directory");
+        let go_work: String = String::from_utf8(go_work).unwrap();
+        assert!(
+            go_work.contains("/workspace/lib") && go_work.contains("use ("),
+            "go.work should list the dependency module, got:\n{go_work}"
         );
     }
 

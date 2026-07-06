@@ -2,6 +2,7 @@ pub mod cli;
 pub mod error;
 pub mod executor;
 pub mod glob;
+pub mod go_work;
 pub mod hash;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;

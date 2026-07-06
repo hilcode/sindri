@@ -212,6 +212,12 @@ impl Runtime for SystemRuntime {
     fn run_command(&self, command: &Command, working_directory: &Path) -> IoResult<CommandOutput> {
         let output: Output = ProcessCommand::new(command.program())
             .args(command.arguments().iter().map(|argument| argument.as_str()))
+            .envs(
+                command
+                    .environment()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
             .current_dir(working_directory)
             .output()?;
         Ok(CommandOutput::new(

@@ -1,42 +1,36 @@
 # Examples
 
 Small, self-contained projects that exercise Sindri's current functionality. Each
-directory is a single-module workspace: a `sindri.workspace` marking the workspace
-root and a `sindri.build` describing the module, alongside the module's own sources.
-
-Multi-module workspaces and inter-module dependencies are not implemented yet
-(see `PLAN.md`, Phase 5), so every example keeps its `sindri.workspace` and
-`sindri.build` in the same directory.
+example is a workspace rooted at a `sindri.workspace` file, with one or more modules
+described by `sindri.build` files alongside their own sources.
 
 ## The examples
 
-| Directory  | What it shows                                                              |
-| ---------- | -------------------------------------------------------------------------- |
-| `hello/`   | The smallest possible Go executable module — one `main.go`.                |
-| `greeter/` | A Go executable split across a `main` package and a `greeting/` subpackage, so incremental rebuilds after editing a single file are observable. |
+| Directory       | What it shows                                                         |
+| --------------- | -------------------------------------------------------------------- |
+| `hello/`        | The smallest possible Go executable module — one `main.go`.          |
+| `greeter/`      | A Go executable split across a `main` package and a `greeting/` subpackage, so incremental rebuilds after editing a single file are observable. |
+| `multi-module/` | An executable module that declares a `{ module = … }` dependency on a local Go library module in a `lib/greeting/` subdirectory — two modules built in dependency-first order. |
 
 ## Running them
 
-Install the `sindri` binary once from the repository root, then drive the examples
-with the `justfile` in this directory:
+Drive the examples with the `justfile` in this directory:
 
 ```sh
-# From the repository root — builds and installs `sindri` onto your PATH.
-just install            # or: just install release
-
 cd examples
 just compile-all        # compile every example
 just compile hello      # compile just one
 just lifecycle hello    # print its resolved lifecycle steps and tasks
 ```
 
+Each recipe first rebuilds and reinstalls `sindri` if the sources changed (the
+`install` dependency defers to `cargo`, so it is a no-op when nothing changed), then
+calls `sindri` from your `PATH`. You never have to remember to reinstall after editing
+the tool — including its embedded `*.ncl` contracts.
+
 `compile` runs the `format` step (`gofmt`) and then the `compile` step
 (`go build`). The built binary lands under
 `.target/default/compile/go-compile/output/`.
-
-The recipes call `sindri` from your `PATH`, so `just install` must have run first.
-To invoke the tool directly instead, run `sindri compile` from inside an example
-directory.
 
 ### Incremental correctness
 
@@ -52,5 +46,28 @@ Edit a source file (for example `greeter/greeting/greeting.go`) and compile agai
 see just the affected task re-run. Deleting the built binary and recompiling
 triggers a rebuild too — outputs are tracked, not just inputs.
 
+### Multi-module builds
+
+`multi-module/` shows an executable that depends on a local library module. Its
+`sindri.build` declares:
+
+```nickel
+dependencies = { compile = [ { module = "//lib/greeting" } ] }
+```
+
+`sindri compile` loads the whole reachable module graph and builds the library before
+the executable that consumes it. Because `go build` only resolves an import of a
+sibling module when a `go.work` lists both module directories, Sindri generates that
+`go.work` — from the declared dependencies, so it never drifts from a hand-maintained
+file — and points `go` at it via the `GOWORK` environment variable before the compile
+runs. The file lives inside the build directory, so it is a pure build artifact that
+never touches the source tree:
+
+```
+just compile multi-module           # builds lib/greeting, then app
+cat multi-module/.target/go.work    # generated: a `use` entry per module
+```
+
 `just clean-all` removes every example's build output (`just clean <example>` for
-one). The `.target/` build directory each run produces is git-ignored.
+one). The `.target/` build directory each run produces — including the generated
+`go.work` — is git-ignored.
