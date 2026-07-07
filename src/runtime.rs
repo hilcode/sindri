@@ -299,6 +299,19 @@ impl DummyRuntime {
         self.writes.lock().unwrap().get(path.as_ref()).cloned()
     }
 
+    /// Every path written by [`FileSystem::write`], paired with its bytes. Lets a test replay a second
+    /// build with the first build's persisted state visible as real files: [`FileSystem::write`] records
+    /// into a log that [`FileSystem::read`] does not consult, so without re-registering these a replayed
+    /// build would treat every task as uncached.
+    pub fn written_files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, contents): (&PathBuf, &Vec<u8>)| -> (PathBuf, Vec<u8>) { (path.clone(), contents.clone()) })
+            .collect()
+    }
+
     /// Whether [`FileSystem::create_directories`] was called for `path`.
     pub fn created_directory(&self, path: impl AsRef<Path>) -> bool {
         self.created_directories.lock().unwrap().contains(path.as_ref())

@@ -86,6 +86,63 @@ fn multi_module_dir() -> TempDir {
     directory
 }
 
+/// Like [`multi_module_dir`], but with the executable in its own `app/` subdirectory, disjoint from the
+/// library's `lib/` directory, so neither module's source glob sweeps the other. This isolates the
+/// dependency edge: only edge propagation — not input-glob overlap — can tie `app`'s freshness to the
+/// library's, which is exactly what multi-module incrementality must guarantee.
+fn isolated_multi_module_dir() -> TempDir {
+    let directory: TempDir = workspace_dir();
+    let app: PathBuf = directory.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("sindri.build"),
+        r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+             dependencies = { compile = [ { module = "//lib" } ] } }"#,
+    )
+    .unwrap();
+    fs::write(app.join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
+    fs::write(
+        app.join("main.go"),
+        "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/greeting\"\n)\n\nfunc main() {\n\tfmt.Println(greeting.Message(\"Sindri\"))\n}\n",
+    )
+    .unwrap();
+    let lib: PathBuf = directory.path().join("lib");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(
+        lib.join("sindri.build"),
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0" }"#,
+    )
+    .unwrap();
+    fs::write(lib.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
+    fs::write(lib.join("greeting.go"), greeting_source("Hello")).unwrap();
+    directory
+}
+
+/// The library source, parameterised by the word its `Message` greets with, so a test can edit the
+/// dependency's behaviour and observe whether the dependent picked up the change.
+fn greeting_source(word: &str) -> String {
+    format!(
+        "package greeting\n\nimport \"fmt\"\n\nfunc Message(name string) string {{\n\treturn fmt.Sprintf(\"{word}, %s!\", name)\n}}\n"
+    )
+}
+
+/// The lone binary the `app` executable's `go-compile` writes into its own tracked output directory
+/// (`.target/app/compile/go-compile/output/`), read back so a test can tell whether it was rebuilt.
+fn app_binary(workspace: &Path) -> Vec<u8> {
+    let output_directory: PathBuf = workspace
+        .join(".target")
+        .join("app")
+        .join("compile")
+        .join("go-compile")
+        .join("output");
+    let entry: fs::DirEntry = fs::read_dir(&output_directory)
+        .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
+        .next()
+        .expect("the executable's compile should leave exactly one binary")
+        .unwrap();
+    fs::read(entry.path()).unwrap()
+}
+
 #[test]
 fn version_long_flag() {
     let output: Output = sindri().arg("--version").output().unwrap();
@@ -224,6 +281,49 @@ fn compile_module_with_local_go_library_dependency_builds() {
     assert!(
         go_work.contains("lib/greeting"),
         "the generated go.work should list the local library, got:\n{go_work}"
+    );
+}
+
+#[test]
+fn second_multi_module_compile_is_silent_and_editing_the_dependency_rebuilds_the_dependent() {
+    let directory: TempDir = isolated_multi_module_dir();
+    let app: PathBuf = directory.path().join("app");
+    let first: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first compile failed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let original_binary: Vec<u8> = app_binary(directory.path());
+
+    // Nothing changed: the second compile must be silent (both modules cache-hit).
+    let second: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(second.status.success(), "second compile failed");
+    assert!(
+        second.stdout.is_empty(),
+        "a second compile on an unchanged multi-module tree should be silent; got: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    // Edit only the dependency. The dependent's own sources are untouched and live in a disjoint
+    // directory, so only the dependency edge can rebuild it — and it must, or its binary would keep
+    // embedding the library's old behaviour.
+    fs::write(directory.path().join("lib").join("greeting.go"), greeting_source("Hi")).unwrap();
+    let rebuild: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(
+        rebuild.status.success(),
+        "rebuild after editing the dependency failed; stderr: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "editing the dependency should re-run a compile; got: {}",
+        String::from_utf8_lossy(&rebuild.stdout)
+    );
+    assert_ne!(
+        app_binary(directory.path()),
+        original_binary,
+        "the dependent's binary should change, proving it rebuilt against the edited dependency"
     );
 }
 

@@ -316,6 +316,39 @@ mod tests {
     }
 
     #[test]
+    fn tracked_files_are_recorded_by_workspace_relative_path() {
+        // The same module laid out under two different workspace roots computes identical state, because
+        // inputs are recorded by workspace-relative `/`-separated path rather than absolute path. This is
+        // what lets persisted state survive a workspace move or rename. A non-root module directory
+        // (`lib`) is used so the relativization is genuinely exercised.
+        let task: Task = go_task();
+        let first_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace-a")));
+        let first_module: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace-a/lib"));
+        let first_output: AbsoluteDirectory =
+            AbsoluteDirectory::new(PathBuf::from("/workspace-a/.target/lib/compile/go-compile/output"));
+        let first_runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace-a/lib/main.go", "package lib")
+            .build();
+        let first: TaskState =
+            TaskState::compute(&task, &first_module, &first_output, &first_root, &first_runtime).unwrap();
+        let second_root: WorkspaceRoot =
+            WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/elsewhere/workspace-b")));
+        let second_module: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/elsewhere/workspace-b/lib"));
+        let second_output: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from(
+            "/elsewhere/workspace-b/.target/lib/compile/go-compile/output",
+        ));
+        let second_runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/elsewhere/workspace-b/lib/main.go", "package lib")
+            .build();
+        let second: TaskState =
+            TaskState::compute(&task, &second_module, &second_output, &second_root, &second_runtime).unwrap();
+        assert_eq!(
+            first, second,
+            "state must be identical across workspace roots, so moving the workspace does not invalidate it"
+        );
+    }
+
+    #[test]
     fn state_round_trips_through_persistence() {
         let runtime: DummyRuntime = workspace_with("package main").build();
         let task: Task = go_task();

@@ -53,6 +53,50 @@ impl ExecutionConfig {
     }
 }
 
+/// Where a module lives for the purpose of building it: the absolute directory its sources occupy and
+/// its commands run in, paired with the [`ModulePath`] that keys its state subtree under the build
+/// directory. Together they pin one module within a multi-module build, so no two modules' work or
+/// state can collide.
+pub struct ModuleLocation {
+    working_directory: AbsoluteDirectory,
+    module_path: ModulePath,
+}
+
+impl ModuleLocation {
+    pub fn new(working_directory: AbsoluteDirectory, module_path: ModulePath) -> ModuleLocation {
+        ModuleLocation {
+            working_directory,
+            module_path,
+        }
+    }
+
+    pub fn working_directory(&self) -> &AbsoluteDirectory {
+        &self.working_directory
+    }
+
+    pub fn module_path(&self) -> &ModulePath {
+        &self.module_path
+    }
+}
+
+/// Whether a module ran (rebuilt) any of its tasks on a build. The module scheduler carries it across
+/// dependency edges: a module whose dependency rebuilt must itself rebuild — even when its own sources
+/// are unchanged — because each module tracks only its own source and a dependency's files are never
+/// folded into the dependent's tracked input set, so the rebuilt signal is the only thing that ties a
+/// dependent's freshness to its dependencies'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModuleRebuilt(bool);
+
+impl ModuleRebuilt {
+    pub fn new(rebuilt: bool) -> ModuleRebuilt {
+        ModuleRebuilt(rebuilt)
+    }
+
+    pub fn is_rebuilt(&self) -> bool {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub struct TaskOutcome {
     task: Task,
@@ -301,25 +345,34 @@ fn persist_outcome(
 
 pub fn execute_graph(
     graph: &TaskGraph,
-    working_directory: &AbsoluteDirectory,
+    location: &ModuleLocation,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
-    module_path: &ModulePath,
+    dependency_rebuilt: ModuleRebuilt,
     config: &ExecutionConfig,
     runtime: &impl Runtime,
-) -> MietteResult<Vec<TaskOutcome>> {
+) -> MietteResult<(Vec<TaskOutcome>, ModuleRebuilt)> {
+    let working_directory: &AbsoluteDirectory = location.working_directory();
     let step_groups: Vec<Vec<TaskGraphNodeId>> = group_nodes_by_step(graph.nodes());
     let mut all_outcomes: Vec<TaskOutcome> = Vec::new();
     for group in &step_groups {
-        let plans: Vec<TaskPlan> = plan_group(
+        let mut plans: Vec<TaskPlan> = plan_group(
             group,
             graph.nodes(),
             working_directory,
             workspace_root,
             build_directory,
-            module_path,
+            location.module_path(),
             runtime,
         )?;
+        if dependency_rebuilt.is_rebuilt() {
+            // A rebuilt dependency invalidates this module wholesale: its outputs were produced against
+            // the dependency's previous sources, which are not part of this module's tracked inputs, so
+            // no per-task dirtiness check would notice. Force every task to run.
+            for plan in &mut plans {
+                plan.cache = CacheStatus::Miss;
+            }
+        }
         if config.verbosity != Verbosity::Quiet {
             for plan in &plans {
                 if plan.cache == CacheStatus::Miss {
@@ -357,7 +410,12 @@ pub fn execute_graph(
             .into());
         }
     }
-    Ok(all_outcomes)
+    let rebuilt: ModuleRebuilt = ModuleRebuilt::new(
+        all_outcomes
+            .iter()
+            .any(|outcome: &TaskOutcome| outcome.cache() == CacheStatus::Miss),
+    );
+    Ok((all_outcomes, rebuilt))
 }
 
 /// Print a task's completion line. Cache hits stay silent unless `--verbose`; misses always show
@@ -460,15 +518,18 @@ mod tests {
     ) -> MietteResult<Vec<TaskOutcome>> {
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
+        let location: ModuleLocation =
+            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
         execute_graph(
             graph,
-            working_directory,
+            &location,
             &workspace_root,
             &build_directory,
-            &ModulePath::new(RelativeDirectory::new("")),
+            ModuleRebuilt::new(false),
             config,
             runtime,
         )
+        .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
     }
 
     /// Run a graph with real process spawning, isolating its persisted state in a fresh temporary
@@ -478,14 +539,42 @@ mod tests {
         let working_directory: AbsoluteDirectory = AbsoluteDirectory::new(scratch.path().to_path_buf());
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
+        let location: ModuleLocation =
+            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
         execute_graph(
             graph,
-            &working_directory,
+            &location,
             &workspace_root,
             &build_directory,
-            &ModulePath::new(RelativeDirectory::new("")),
+            ModuleRebuilt::new(false),
             config,
             &system_runtime(),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// Run a graph against a stub runtime with an explicit dependency-rebuilt signal, returning both the
+    /// outcomes and whether the module rebuilt — the two facts the module scheduler threads across
+    /// dependency edges.
+    fn run_with_dependency(
+        graph: &TaskGraph,
+        working_directory: &AbsoluteDirectory,
+        dependency_rebuilt: ModuleRebuilt,
+        runtime: &impl Runtime,
+    ) -> (Vec<TaskOutcome>, ModuleRebuilt) {
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
+        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
+        let location: ModuleLocation =
+            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        execute_graph(
+            graph,
+            &location,
+            &workspace_root,
+            &build_directory,
+            dependency_rebuilt,
+            &default_config(),
+            runtime,
         )
         .unwrap()
     }
@@ -673,5 +762,51 @@ mod tests {
             outcomes[0].fiber, outcomes[1].fiber,
             "parallel tasks should have distinct fibers"
         );
+    }
+
+    #[test]
+    fn a_rebuilt_dependency_forces_an_otherwise_clean_task_to_run() {
+        // A single compile task with no tracked inputs or outputs, so once its state is on disk it is a
+        // cache hit. Its command is stubbed for when it does run.
+        let graph: TaskGraph = make_graph(vec![("go-compile", "compile", "go build")]);
+        let state_file: PathBuf = PathBuf::from("/workspace/.target/compile/go-compile/state.bin");
+        // A first run persists fresh state; a stub runtime's writes are invisible to reads, so the state
+        // is re-registered as a real file for the runs that must observe it as a cache hit.
+        let seed: DummyRuntime = DummyRuntime::builder().command("go build", succeeded("")).build();
+        run(&graph, &workspace_directory(), &default_config(), &seed).unwrap();
+        let state_bytes: Vec<u8> = seed
+            .written_file(&state_file)
+            .expect("the first run should persist state");
+        // With the state visible and no dependency rebuilt, the task is skipped and the module reports
+        // that it did not rebuild.
+        let clean: DummyRuntime = DummyRuntime::builder()
+            .command("go build", succeeded(""))
+            .file(&state_file, &state_bytes)
+            .build();
+        let (clean_outcomes, clean_rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
+            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(false), &clean);
+        assert_eq!(
+            clean_outcomes[0].cache(),
+            CacheStatus::Hit,
+            "an unchanged task with no dependency rebuild should be a cache hit"
+        );
+        assert!(
+            !clean_rebuilt.is_rebuilt(),
+            "a module whose tasks all hit did not rebuild"
+        );
+        // The identical unchanged state, but a dependency rebuilt: the task is forced to run despite the
+        // hit, and the module reports itself rebuilt so its own dependents are forced in turn.
+        let forced: DummyRuntime = DummyRuntime::builder()
+            .command("go build", succeeded(""))
+            .file(&state_file, &state_bytes)
+            .build();
+        let (forced_outcomes, forced_rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
+            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(true), &forced);
+        assert_eq!(
+            forced_outcomes[0].cache(),
+            CacheStatus::Miss,
+            "a rebuilt dependency forces the otherwise-clean task to run"
+        );
+        assert!(forced_rebuilt.is_rebuilt(), "a forced module reports itself rebuilt");
     }
 }

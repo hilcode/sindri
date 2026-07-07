@@ -1,5 +1,7 @@
 use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
+use crate::executor::ModuleLocation;
+use crate::executor::ModuleRebuilt;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
 use crate::go_work::GoToolchainVersion;
@@ -13,7 +15,6 @@ use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
 use crate::types::BuildFile;
-use crate::types::ModulePath;
 #[cfg(test)]
 use crate::types::Stdout;
 use crate::types::Step;
@@ -140,6 +141,7 @@ impl Lifecycle {
         // task makes `execute_graph` return early via `?`, so a broken build writes no telemetry: the
         // partial trace is dropped, keeping every telemetry.json a whole-build record.
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
+        let mut module_rebuilt: Vec<ModuleRebuilt> = Vec::with_capacity(module_graph.nodes().len());
         for node in module_graph.nodes() {
             let plugin: Plugin = go_plugin(node.module().artifact_type(), Some(&go_work_file));
             let graph: TaskGraph = self
@@ -148,16 +150,25 @@ impl Lifecycle {
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
                 .join_directory(node.identity().directory());
-            let module_path: ModulePath = node.identity().module_path();
-            let module_outcomes: Vec<TaskOutcome> = execute_graph(
+            let location: ModuleLocation = ModuleLocation::new(module_directory, node.identity().module_path());
+            // A module must rebuild if any module it depends on rebuilt on this run. Dependency indices
+            // are all smaller than this node's — nodes are stored dependency-first — so their rebuilt
+            // status is already recorded.
+            let dependency_rebuilt: ModuleRebuilt = ModuleRebuilt::new(
+                node.dependencies()
+                    .iter()
+                    .any(|&index: &usize| module_rebuilt[index].is_rebuilt()),
+            );
+            let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) = execute_graph(
                 &graph,
-                &module_directory,
+                &location,
                 workspace_root,
                 &absolute_build_directory,
-                &module_path,
+                dependency_rebuilt,
                 config,
                 runtime,
             )?;
+            module_rebuilt.push(rebuilt);
             outcomes.extend(module_outcomes);
         }
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
@@ -260,6 +271,43 @@ mod tests {
             )
             .command("go env GOVERSION", go_version())
             .current_directory("/workspace")
+    }
+
+    /// A two-module workspace: an `app` executable in `/workspace/app` depending on a local `//lib`
+    /// library in the sibling `/workspace/lib`. The directories are disjoint, so neither module's source
+    /// glob sweeps the other — the dependency edge is the only thing that can tie `app`'s freshness to
+    /// `lib`'s. Every command a compile issues (toolchain query, `gofmt`, `go build`) is stubbed.
+    fn multi_module_workspace() -> DummyRuntimeBuilder {
+        DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/app/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+            )
+            .file("/workspace/app/main.go", "package main\n\nfunc main() {}\n")
+            .file(
+                "/workspace/lib/sindri.build",
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .file("/workspace/lib/lib.go", "package lib\n")
+            .command("go env GOVERSION", go_version())
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .current_directory("/workspace/app")
+    }
+
+    /// Re-register a previous run's persisted files (task state records, the generated `go.work`) as real
+    /// files in a fresh builder, so a replayed build observes them: a stub runtime records writes into a
+    /// log its reads do not consult, so without this every task would look uncached on the replay.
+    fn replay_with_state(mut builder: DummyRuntimeBuilder, previous: &DummyRuntime) -> DummyRuntimeBuilder {
+        for (path, contents) in previous.written_files() {
+            builder = builder.file(path, contents);
+        }
+        builder
     }
 
     fn make_task(name: &str, step: &str) -> Task {
@@ -414,6 +462,68 @@ mod tests {
         assert!(
             go_work.contains("/workspace/lib") && go_work.contains("use ("),
             "go.work should list the dependency module, got:\n{go_work}"
+        );
+    }
+
+    #[test]
+    fn editing_a_dependency_forces_the_dependent_via_the_edge() {
+        // A first build persists every module's state.
+        let seed: DummyRuntime = multi_module_workspace().build();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .unwrap();
+        // Replay with every module's state seeded — so an unchanged module is a cache hit — but the
+        // dependency's source edited, so `lib` rebuilds and, through the edge, must force `app`.
+        let rebuild: DummyRuntime = replay_with_state(multi_module_workspace(), &seed)
+            .file("/workspace/lib/lib.go", "package lib\n\nvar Changed = true\n")
+            .build();
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&rebuild).unwrap(), &config, &rebuild)
+            .unwrap();
+        assert!(
+            rebuild
+                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
+                .is_some(),
+            "the edited dependency should rebuild"
+        );
+        assert!(
+            rebuild
+                .written_file("/workspace/.target/app/compile/go-compile/state.bin")
+                .is_some(),
+            "the dependent should rebuild via the edge even though its own source is unchanged"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_multi_module_tree_rebuilds_nothing() {
+        let seed: DummyRuntime = multi_module_workspace().build();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .unwrap();
+        // Replay with every module's state seeded and nothing changed: no task re-runs, so none
+        // re-persists state, and a build that ran no tasks prints nothing.
+        let replay: DummyRuntime = replay_with_state(multi_module_workspace(), &seed).build();
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&replay).unwrap(), &config, &replay)
+            .unwrap();
+        assert!(
+            replay
+                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
+                .is_none(),
+            "an unchanged dependency should not rebuild"
+        );
+        assert!(
+            replay
+                .written_file("/workspace/.target/app/compile/go-compile/state.bin")
+                .is_none(),
+            "an unchanged dependent should not rebuild"
+        );
+        assert!(
+            replay.captured_output().is_empty(),
+            "an unchanged multi-module tree should be silent; got: {:?}",
+            replay.captured_output().as_str()
         );
     }
 
