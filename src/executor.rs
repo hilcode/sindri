@@ -476,8 +476,10 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::mpsc;
     use std::sync::mpsc::Receiver;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::sync::mpsc::Sender;
     use std::thread;
+    use std::thread::JoinHandle;
     use tempfile::TempDir;
 
     fn system_runtime() -> impl Runtime {
@@ -735,13 +737,6 @@ mod tests {
         );
     }
 
-    /// A command that writes the current time in nanoseconds since the epoch to `marker.start`,
-    /// sleeps for `duration`, then does the same to `marker.end` — so a test can read the two
-    /// files' own recorded content back afterwards and compare when this command actually ran
-    /// against another one's. The clock reading is data the command itself produces, not filesystem
-    /// metadata: a file's modification time is only as precise as the filesystem's own timestamp
-    /// granularity (historically as coarse as two seconds on FAT), which this sidesteps entirely.
-    /// Comparing two commands' own recorded intervals for overlap also holds regardless of how slow
     /// A stub that blocks on `barrier` before returning. The executor spawns same-step tasks on
     /// separate real OS threads (see `run_misses`), so this can only return for both tasks if both
     /// were genuinely dispatched before either finished — a structural proof of concurrent dispatch
@@ -766,13 +761,19 @@ mod tests {
         timeout: Duration,
     ) -> Vec<TaskOutcome> {
         let (sender, receiver): (Sender<RunOutcome>, Receiver<RunOutcome>) = mpsc::channel();
-        thread::spawn(move || {
+        let handle: JoinHandle<()> = thread::spawn(move || {
             let _ = sender.send(run(&graph, &working_directory, &config, &runtime));
         });
-        receiver
-            .recv_timeout(timeout)
-            .expect("tasks in the same step did not run concurrently (dispatch hung waiting on the barrier)")
-            .unwrap()
+        match receiver.recv_timeout(timeout) {
+            Ok(outcome) => outcome.unwrap(),
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("tasks in the same step did not run concurrently (dispatch hung waiting on the barrier)")
+            }
+            Err(RecvTimeoutError::Disconnected) => match handle.join() {
+                Ok(()) => panic!("background thread exited without sending a result"),
+                Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+            },
+        }
     }
 
     #[test]

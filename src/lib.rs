@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod error;
 pub mod executor;
+pub mod file_set;
 pub mod glob;
 pub mod go_work;
 pub mod hash;

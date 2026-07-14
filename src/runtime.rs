@@ -1,3 +1,5 @@
+use crate::file_set::CompiledFileSetPattern;
+use crate::file_set::FileSetPattern;
 use crate::glob::GlobPatterns;
 use crate::local_time_with_elapsed::LocalTimeWithElapsed;
 use crate::types::AbsoluteFile;
@@ -48,6 +50,10 @@ pub trait FileSystem {
     /// recursive walk that prunes excluded subtrees as it descends, so unrelated trees are never
     /// entered. Used to expand a task's input and output globs for incremental hashing.
     fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>>;
+    /// Every regular file beneath `base` selected by the ordered include globs of `pattern`, as
+    /// absolute paths. Drives a recursive walk that classifies each file it finds; used to resolve a
+    /// task's input and output [`FileSetPattern`](crate::file_set::FileSetPattern)s.
+    fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>>;
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>>;
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()>;
     fn create_directories(&self, path: &Path) -> IoResult<()>;
@@ -121,6 +127,23 @@ impl FileSystem for SystemFileSystem {
         Ok(files)
     }
 
+    fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
+        let compiled: CompiledFileSetPattern = pattern.compile().map_err(IoError::other)?;
+        let mut walker: WalkBuilder = WalkBuilder::new(base);
+        walker.standard_filters(false).follow_links(false);
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in walker.build() {
+            let entry: WalkEntry = entry.map_err(IoError::other)?;
+            if entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+                let relative: &Path = entry.path().strip_prefix(base).unwrap_or_else(|_| entry.path());
+                if compiled.classify_file(relative) {
+                    files.push(entry.into_path());
+                }
+            }
+        }
+        Ok(files)
+    }
+
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
         match symlink_metadata(path) {
             Ok(metadata) => Ok(Some(metadata.file_type().into())),
@@ -189,6 +212,10 @@ impl FileSystem for SystemRuntime {
 
     fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
         self.file_system.matching_files(base, patterns)
+    }
+
+    fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
+        self.file_system.matching_file_set(base, pattern)
     }
 
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
@@ -444,6 +471,21 @@ impl FileSystem for DummyRuntime {
         for path in self.files.keys() {
             if let Ok(relative) = path.strip_prefix(base) {
                 if compiled.is_match(relative) {
+                    files.push(path.clone());
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
+        // The dummy holds its files in a flat in-memory map with no on-disk directory tree, so there
+        // is nothing to walk: iterate every registered file under `base` and classify it directly.
+        let compiled: CompiledFileSetPattern = pattern.compile().map_err(IoError::other)?;
+        let mut files: Vec<PathBuf> = Vec::new();
+        for path in self.files.keys() {
+            if let Ok(relative) = path.strip_prefix(base) {
+                if compiled.classify_file(relative) {
                     files.push(path.clone());
                 }
             }
