@@ -82,6 +82,13 @@ pub enum SindriError {
         output: String,
     },
 
+    #[error("could not evaluate the task script:\n\n{nickel_message}")]
+    #[diagnostic(
+        help("a script must evaluate to a list of command records, each with at least a `program`"),
+        code(sindri::script::eval)
+    )]
+    ScriptEvaluation { nickel_message: String },
+
     #[error("could not determine the Go toolchain version")]
     #[diagnostic(
         help("ensure the `go` command is available (it is provided by the Devenv shell)"),
@@ -146,6 +153,9 @@ mod tests {
             task_name: TaskName::new("go-compile"),
             command: Command::new("go", ["build", "./..."]),
             output: "error: undefined".into(),
+        });
+        assert_has_help_and_code(&SindriError::ScriptEvaluation {
+            nickel_message: "missing definition for `program`".into(),
         });
         assert_has_help_and_code(&SindriError::GoToolchainVersionUnknown);
     }

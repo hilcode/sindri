@@ -12,6 +12,7 @@ pub mod module_graph;
 pub mod nickel_eval;
 pub mod plugin;
 pub mod runtime;
+pub mod script;
 pub mod state;
 pub mod telemetry;
 pub mod types;

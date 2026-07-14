@@ -86,6 +86,14 @@ impl Nickel {
         })
     }
 
+    /// Evaluate a self-contained Nickel source string (no file imports) deeply, labelling any error's
+    /// source spans with `source_name`. Used for task scripts, whose source Sindri assembles in memory
+    /// rather than reads from a config file; the caller wraps the returned message in its own error.
+    pub fn evaluate_source(source: &str, source_name: &str) -> Result<Expr, String> {
+        let mut context: Context = Context::new().with_source_name(source_name.to_string());
+        context.eval_deep(source).map_err(format_nickel_error)
+    }
+
     pub fn evaluate(config_file: &ConfigFile, file_system: &impl FileSystem) -> SindriResult<Expr> {
         let display: String = config_file.workspace_path().to_string();
         let source: String =
