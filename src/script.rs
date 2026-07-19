@@ -2,6 +2,7 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::nickel_eval::Nickel;
+use crate::parameter::ParameterBinding;
 use crate::types::AbsoluteDirectory;
 use crate::types::RelativeDirectory;
 use crate::types::RelativeFile;
@@ -47,11 +48,13 @@ impl Command {
     }
 }
 
-/// The values Sindri supplies to a [`Script`] expression: the resolved input files, the task's output
-/// directory, the workspace root, and the module directory each command's `working-directory` defaults
-/// to. Paths reach the script as strings — workspace-relative for `files`, absolute for the two
-/// directories — since a script computes with them but never reads them.
+/// The values Sindri supplies to a [`Script`] expression: the task's bound parameters, the resolved
+/// input files, the task's output directory, the workspace root, and the module directory each
+/// command's `working-directory` defaults to. Paths reach the script as strings — workspace-relative
+/// for `files`, absolute for the two directories — since a script computes with them but never reads
+/// them.
 pub struct ScriptInputs<'inputs> {
+    parameters: &'inputs ParameterBinding,
     input_files: &'inputs FileSet,
     output_directory: &'inputs AbsoluteDirectory,
     workspace_root: &'inputs WorkspaceRoot,
@@ -60,12 +63,14 @@ pub struct ScriptInputs<'inputs> {
 
 impl<'inputs> ScriptInputs<'inputs> {
     pub fn new(
+        parameters: &'inputs ParameterBinding,
         input_files: &'inputs FileSet,
         output_directory: &'inputs AbsoluteDirectory,
         workspace_root: &'inputs WorkspaceRoot,
         module_directory: &'inputs RelativeDirectory,
     ) -> ScriptInputs<'inputs> {
         ScriptInputs {
+            parameters,
             input_files,
             output_directory,
             workspace_root,
@@ -73,20 +78,20 @@ impl<'inputs> ScriptInputs<'inputs> {
         }
     }
 
-    /// The Nickel record literal the script is applied to. `params` is empty until plugin parameters
-    /// land, but the field exists so the script's input shape does not change when they do.
+    /// The Nickel record literal the script is applied to.
     fn to_nickel_record(&self) -> String {
         let files: Vec<String> = self
             .input_files
             .files()
             .iter()
-            .map(|file: &RelativeFile| -> String { nickel_string(&file.to_string()) })
+            .map(|file: &RelativeFile| -> String { Nickel::string_literal(&file.to_string()) })
             .collect();
         format!(
-            "{{ params = {{}}, files = [ {files} ], \"output-directory\" = {output_directory}, \"workspace-root\" = {workspace_root} }}",
+            "{{ params = {parameters}, files = [ {files} ], \"output-directory\" = {output_directory}, \"workspace-root\" = {workspace_root} }}",
+            parameters = self.parameters.to_nickel_record(),
             files = files.join(", "),
-            output_directory = nickel_string(&self.output_directory.as_ref().to_string_lossy()),
-            workspace_root = nickel_string(&self.workspace_root.as_ref().to_string_lossy()),
+            output_directory = Nickel::string_literal(&self.output_directory.as_ref().to_string_lossy()),
+            workspace_root = Nickel::string_literal(&self.workspace_root.as_ref().to_string_lossy()),
         )
     }
 }
@@ -131,7 +136,7 @@ impl Script {
              let script = ({script}) in\n\
              std.array.map (fun command => command | Command) (script {inputs})",
             command_contract = COMMAND_CONTRACT,
-            module_directory = nickel_string(&inputs.module_directory.as_ref().to_string_lossy()),
+            module_directory = Nickel::string_literal(&inputs.module_directory.as_ref().to_string_lossy()),
             script = self.source,
             inputs = inputs.to_nickel_record(),
         );
@@ -145,29 +150,17 @@ impl Script {
     }
 }
 
-/// Render `value` as a Nickel string literal, escaping the characters that would otherwise end the
-/// string or be read as an escape. Used to embed Sindri-supplied paths into the assembled source.
-fn nickel_string(value: &str) -> String {
-    let mut escaped: String = String::with_capacity(value.len() + 2);
-    escaped.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other => escaped.push(other),
-        }
-    }
-    escaped.push('"');
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file_set::FileSetPattern;
+    use crate::parameter::Parameter;
+    use crate::parameter::ParameterDeclarations;
+    use crate::parameter::ParameterName;
+    use crate::parameter::ParameterType;
+    use crate::parameter::ParameterValue;
+    use crate::parameter::ParameterValues;
+    use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use std::path::PathBuf;
 
@@ -191,24 +184,24 @@ mod tests {
     }
 
     fn evaluate(script_source: &str, files: &[&str]) -> SindriResult<Vec<Command>> {
+        let parameters: ParameterBinding = ParameterBinding::empty();
         let input_files: FileSet = file_set(files);
         let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
-        let inputs: ScriptInputs =
-            ScriptInputs::new(&input_files, &output_directory, &workspace_root, &module_directory);
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &parameters,
+            &input_files,
+            &output_directory,
+            &workspace_root,
+            &module_directory,
+        );
         Script::new(script_source).evaluate(&inputs)
     }
 
     #[test]
     fn a_script_exposes_its_source() {
         assert_eq!(Script::new("fun inputs => []").source(), "fun inputs => []");
-    }
-
-    #[test]
-    fn nickel_string_escapes_characters_that_would_end_or_be_read_as_an_escape() {
-        assert_eq!(nickel_string("plain"), "\"plain\"");
-        assert_eq!(nickel_string("a\"b\\c\nd\re\tf"), "\"a\\\"b\\\\c\\nd\\re\\tf\"");
     }
 
     #[test]
@@ -265,18 +258,85 @@ mod tests {
     }
 
     #[test]
+    fn a_script_can_read_a_bound_parameter() {
+        let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+            PluginName::new("plugin"),
+            ParameterName::new("mode"),
+            ParameterType::new("String"),
+        )]);
+        let values: ParameterValues = ParameterValues::new([(
+            PluginName::new("plugin"),
+            ParameterName::new("mode"),
+            ParameterValue::new("\"debug\""),
+        )]);
+        let parameters: ParameterBinding = ParameterBinding::resolve(&declared, &values).unwrap();
+        let input_files: FileSet = file_set(&[]);
+        let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
+        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &parameters,
+            &input_files,
+            &output_directory,
+            &workspace_root,
+            &module_directory,
+        );
+        let commands: Vec<Command> =
+            Script::new("fun inputs => [ { program = \"echo\", arguments = [ inputs.params.\"plugin\".mode ] } ]")
+                .evaluate(&inputs)
+                .unwrap();
+        assert_eq!(commands[0].arguments(), &[SmolStr::new("debug")]);
+    }
+
+    #[test]
+    fn a_script_reading_an_undeclared_parameter_is_a_contract_error() {
+        let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+            PluginName::new("plugin"),
+            ParameterName::new("mode"),
+            ParameterType::new("String"),
+        )]);
+        let values: ParameterValues = ParameterValues::new([(
+            PluginName::new("plugin"),
+            ParameterName::new("mode"),
+            ParameterValue::new("\"debug\""),
+        )]);
+        let parameters: ParameterBinding = ParameterBinding::resolve(&declared, &values).unwrap();
+        let input_files: FileSet = file_set(&[]);
+        let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
+        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &parameters,
+            &input_files,
+            &output_directory,
+            &workspace_root,
+            &module_directory,
+        );
+        let result: SindriResult<Vec<Command>> =
+            Script::new("fun inputs => [ { program = \"echo\", arguments = [ inputs.params.verbose ] } ]")
+                .evaluate(&inputs);
+        assert!(matches!(result, Err(SindriError::ScriptEvaluation { .. })));
+    }
+
+    #[test]
     fn the_go_scripts_yield_their_toolchain_commands() {
         for (script, program, first_argument) in [
             (Script::go_format(), "gofmt", "-l"),
             (Script::go_compile(), "go", "build"),
             (Script::go_test(), "go", "test"),
         ] {
+            let parameters: ParameterBinding = ParameterBinding::empty();
             let input_files: FileSet = file_set(&[]);
             let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
             let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
             let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
-            let inputs: ScriptInputs =
-                ScriptInputs::new(&input_files, &output_directory, &workspace_root, &module_directory);
+            let inputs: ScriptInputs = ScriptInputs::new(
+                &parameters,
+                &input_files,
+                &output_directory,
+                &workspace_root,
+                &module_directory,
+            );
             let commands: Vec<Command> = script.evaluate(&inputs).unwrap();
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].program(), program);

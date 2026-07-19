@@ -94,6 +94,26 @@ impl Nickel {
         context.eval_deep(source).map_err(format_nickel_error)
     }
 
+    /// Render `value` as a Nickel string literal, escaping the characters that would otherwise end
+    /// the string or be read as an escape. Used to embed Sindri-supplied strings — paths, field
+    /// names — into Nickel source Sindri assembles in memory.
+    pub fn string_literal(value: &str) -> String {
+        let mut escaped: String = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for character in value.chars() {
+            match character {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                other => escaped.push(other),
+            }
+        }
+        escaped.push('"');
+        escaped
+    }
+
     pub fn evaluate(config_file: &ConfigFile, file_system: &impl FileSystem) -> SindriResult<Expr> {
         let display: String = config_file.workspace_path().to_string();
         let source: String =
@@ -139,6 +159,15 @@ mod tests {
             AbsoluteFile::new(PathBuf::from("/file.ncl")),
             RelativeFile::new("file.ncl"),
         )
+    }
+
+    #[test]
+    fn string_literal_escapes_characters_that_would_end_or_be_read_as_an_escape() {
+        assert_eq!(Nickel::string_literal("plain"), "\"plain\"");
+        assert_eq!(
+            Nickel::string_literal("a\"b\\c\nd\re\tf"),
+            "\"a\\\"b\\\\c\\nd\\re\\tf\""
+        );
     }
 
     #[test]

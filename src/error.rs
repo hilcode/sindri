@@ -1,3 +1,5 @@
+use crate::parameter::ParameterName;
+use crate::parameter::PluginName;
 use crate::plugin::TaskName;
 use crate::types::Command;
 use crate::types::ModuleCycle;
@@ -95,6 +97,27 @@ pub enum SindriError {
         code(sindri::go::toolchain_version_unknown)
     )]
     GoToolchainVersionUnknown,
+
+    #[error("missing a value for parameter `{plugin}.{parameter}`")]
+    #[diagnostic(
+        help("supply a value for `{plugin}.{parameter}` in the module or build configuration"),
+        code(sindri::parameter::missing)
+    )]
+    ParameterMissing {
+        plugin: PluginName,
+        parameter: ParameterName,
+    },
+
+    #[error("value for parameter `{plugin}.{parameter}` does not satisfy its declared type:\n\n{nickel_message}")]
+    #[diagnostic(
+        help("change the value so it satisfies `{plugin}.{parameter}`'s declared type"),
+        code(sindri::parameter::invalid)
+    )]
+    ParameterInvalid {
+        plugin: PluginName,
+        parameter: ParameterName,
+        nickel_message: String,
+    },
 }
 
 #[cfg(test)]
@@ -158,5 +181,14 @@ mod tests {
             nickel_message: "missing definition for `program`".into(),
         });
         assert_has_help_and_code(&SindriError::GoToolchainVersionUnknown);
+        assert_has_help_and_code(&SindriError::ParameterMissing {
+            plugin: PluginName::new("plugin"),
+            parameter: ParameterName::new("mode"),
+        });
+        assert_has_help_and_code(&SindriError::ParameterInvalid {
+            plugin: PluginName::new("plugin"),
+            parameter: ParameterName::new("mode"),
+            nickel_message: "value does not satisfy the contract".into(),
+        });
     }
 }
