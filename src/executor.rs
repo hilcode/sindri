@@ -1,15 +1,19 @@
+use crate::dirtiness::Dirtiness;
+use crate::dirtiness::TaskLayout;
+use crate::dirtiness::TaskRunRecord;
+use crate::dirtiness::dirtiness;
 use crate::error::SindriError;
-use crate::hash::DeclarationHash;
-use crate::hash::FileSetHash;
+use crate::file_set::FileSet;
 use crate::lifecycle::TaskGraph;
 use crate::lifecycle::TaskGraphNode;
-use crate::plugin::Task;
+use crate::metadata_cache::MetadataCache;
+use crate::parameter::BindingHash;
+use crate::parameter::ParameterBinding;
+use crate::parameter::ParameterValues;
 use crate::runtime::Runtime;
-use crate::state::CacheStatus;
-use crate::state::TaskPaths;
-use crate::state::TaskState;
-use crate::state::dirtiness;
-use crate::state::file_set_hash;
+use crate::script::Command as ScriptCommand;
+use crate::task::Task;
+use crate::task::resolve_file_set;
 use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
@@ -17,15 +21,16 @@ use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::Fiber;
 use crate::types::ModulePath;
+use crate::types::RelativeDirectory;
 use crate::types::Stderr;
 use crate::types::Stdout;
-use crate::types::Step;
 use crate::types::TaskGraphNodeId;
 use crate::types::TaskStart;
 use crate::types::TaskStatus;
 use crate::types::WorkspaceRoot;
 use miette::IntoDiagnostic;
 use miette::Result as MietteResult;
+use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::io::Write;
 use std::thread::ScopedJoinHandle;
@@ -97,51 +102,70 @@ impl ModuleRebuilt {
     }
 }
 
+/// What running a task's resolved commands in order produced: every command succeeded, or a specific
+/// one failed — its output paired with the exact command that produced it, so a failure can be
+/// reported precisely rather than just as "something failed".
+enum CommandOutcome {
+    Succeeded(CommandOutput),
+    Failed {
+        output: CommandOutput,
+        command: ScriptCommand,
+    },
+}
+
 #[derive(Debug)]
 pub struct TaskOutcome {
     task: Task,
     output: CommandOutput,
+    failed_command: Option<ScriptCommand>,
     task_duration: Duration,
     task_start: TaskStart,
     fiber: Fiber,
-    cache: CacheStatus,
+    dirtiness: Dirtiness,
 }
 
 impl TaskOutcome {
-    pub fn from(
+    fn from(
         task: Task,
-        result: IoResult<CommandOutput>,
+        result: IoResult<CommandOutcome>,
         task_start: TaskStart,
         fiber: Fiber,
-        cache: CacheStatus,
+        dirtiness: Dirtiness,
     ) -> TaskOutcome {
-        let output: CommandOutput = result.unwrap_or_else(|error| {
-            CommandOutput::new(
-                Stdout::default(),
-                error.to_string().into_bytes().into(),
-                TaskStatus::Failed,
-            )
-        });
+        let (output, failed_command): (CommandOutput, Option<ScriptCommand>) = match result {
+            Ok(CommandOutcome::Succeeded(output)) => (output, None),
+            Ok(CommandOutcome::Failed { output, command }) => (output, Some(command)),
+            Err(error) => (
+                CommandOutput::new(
+                    Stdout::default(),
+                    error.to_string().into_bytes().into(),
+                    TaskStatus::Failed,
+                ),
+                None,
+            ),
+        };
         TaskOutcome {
             task,
             output,
+            failed_command,
             task_duration: task_start.elapsed(),
             task_start,
             fiber,
-            cache,
+            dirtiness,
         }
     }
 
-    /// A skipped (cache-hit) task: no command ran, so it is recorded as an instant success that still
+    /// A skipped (clean) task: no command ran, so it is recorded as an instant success that still
     /// emits a telemetry event marked as a hit.
     fn cached(task: Task, task_start: TaskStart, fiber: Fiber) -> TaskOutcome {
         TaskOutcome {
             task,
             output: CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded),
+            failed_command: None,
             task_duration: task_start.elapsed(),
             task_start,
             fiber,
-            cache: CacheStatus::Hit,
+            dirtiness: Dirtiness::Clean,
         }
     }
 
@@ -152,15 +176,16 @@ impl TaskOutcome {
         task_duration: Duration,
         task_start: TaskStart,
         fiber: Fiber,
-        cache: CacheStatus,
+        dirtiness: Dirtiness,
     ) -> TaskOutcome {
         TaskOutcome {
             task,
             output,
+            failed_command: None,
             task_duration,
             task_start,
             fiber,
-            cache,
+            dirtiness,
         }
     }
 
@@ -170,6 +195,13 @@ impl TaskOutcome {
 
     pub fn output(&self) -> &CommandOutput {
         &self.output
+    }
+
+    /// The specific command that failed, if the task failed because one of its resolved commands
+    /// exited unsuccessfully — `None` if the task succeeded, or if it failed before any command ran
+    /// (e.g. its script failed to resolve).
+    pub fn failed_command(&self) -> Option<&ScriptCommand> {
+        self.failed_command.as_ref()
     }
 
     pub fn task_duration(&self) -> Duration {
@@ -184,8 +216,8 @@ impl TaskOutcome {
         self.fiber
     }
 
-    pub fn cache(&self) -> CacheStatus {
-        self.cache
+    pub fn dirtiness(&self) -> Dirtiness {
+        self.dirtiness
     }
 }
 
@@ -195,9 +227,9 @@ fn format_duration(duration: Duration) -> String {
 
 fn group_nodes_by_step(nodes: &[TaskGraphNode]) -> Vec<Vec<TaskGraphNodeId>> {
     let mut groups: Vec<Vec<TaskGraphNodeId>> = Vec::new();
-    let mut current_step: Option<&Step> = None;
+    let mut current_step: Option<&crate::types::Step> = None;
     for (index, node) in nodes.iter().enumerate() {
-        if current_step.is_none_or(|step: &Step| -> bool { step != node.step() }) {
+        if current_step.is_none_or(|step: &crate::types::Step| -> bool { step != node.step() }) {
             groups.push(Vec::new());
             current_step = Some(node.step());
         }
@@ -207,67 +239,75 @@ fn group_nodes_by_step(nodes: &[TaskGraphNode]) -> Vec<Vec<TaskGraphNodeId>> {
 }
 
 /// A task paired with the decision of whether it must run. Built in a serial pre-pass so the
-/// executor knows, before spawning anything, which tasks are cache hits (and stay silent) and which
-/// are misses (and run).
+/// executor knows, before spawning anything, which tasks are clean (and stay silent) and which are
+/// dirty (and run).
 struct TaskPlan {
     task: Task,
-    paths: TaskPaths,
-    current_state: TaskState,
-    cache: CacheStatus,
+    layout: TaskLayout,
+    dirtiness: Dirtiness,
 }
 
-/// Compute each task's current state and compare it against what was persisted, deciding hit or
-/// miss. Serial and in lifecycle order, so a source-mutating step's effects are on disk before the
-/// next step is hashed.
+/// Compute each task's current run record and compare it against what was persisted, deciding clean
+/// or dirty. Serial and in lifecycle order, so a source-mutating step's effects are on disk before
+/// the next step is hashed. `module_directory` is relative to the workspace root — the module's real
+/// source location, distinct from `module_path`, which additionally carries a qualifier and only
+/// matters for where a task's own state nests under the build directory.
+#[allow(clippy::too_many_arguments)]
 fn plan_group(
     node_ids: &[TaskGraphNodeId],
     nodes: &[TaskGraphNode],
-    working_directory: &AbsoluteDirectory,
+    module_directory: &RelativeDirectory,
     workspace_root: &WorkspaceRoot,
     build_directory: &AbsoluteDirectory,
     module_path: &ModulePath,
+    cache: &MetadataCache,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
     let mut plans: Vec<TaskPlan> = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
         let node: &TaskGraphNode = &nodes[node_id.value()];
         let task: Task = node.task().clone();
-        let paths: TaskPaths = TaskPaths::new(build_directory, module_path, node.step(), task.name());
-        let current_state: TaskState = TaskState::compute(
+        // No task declares a parameter yet, so every binding is the same empty one.
+        let binding_hash: BindingHash = ParameterBinding::empty().binding_hash();
+        let layout: TaskLayout = TaskLayout::new(
+            build_directory,
+            module_path.as_relative_directory(),
+            task.name(),
+            binding_hash,
+        );
+        let current_record: TaskRunRecord = TaskRunRecord::compute(
             &task,
-            working_directory,
-            paths.output_directory(),
+            module_directory,
+            layout.output_directory(),
             workspace_root,
+            cache,
             runtime,
-        )
-        .map_err(|source| SindriError::Io {
-            path: working_directory.as_ref().to_path_buf(),
-            source,
-        })?;
-        let persisted: Option<TaskState> = TaskState::load(paths.state_file(), runtime);
-        let cache: CacheStatus = dirtiness(&current_state, persisted.as_ref());
+        )?;
+        let persisted: Option<TaskRunRecord> = TaskRunRecord::load(layout.run_record_file(), runtime);
+        let status: Dirtiness = dirtiness(&current_record, persisted.as_ref());
         plans.push(TaskPlan {
             task,
-            paths,
-            current_state,
-            cache,
+            layout,
+            dirtiness: status,
         });
     }
     Ok(plans)
 }
 
-/// Run every miss in `plans` concurrently. Each task spawns its command into its own `output/`
-/// directory (with `{output}` resolved) and, on success, records fresh state so the next build can
-/// skip it.
+/// Run every dirty task in `plans` concurrently, one real OS thread each. A task's resolved script
+/// yields an ordered list of commands, run sequentially on that single thread — concurrency in this
+/// executor is across tasks, never within one task's own command sequence. On success, fresh state is
+/// recorded so the next build can skip it.
 fn run_misses(
     plans: &[TaskPlan],
-    working_directory: &AbsoluteDirectory,
+    module_directory: &RelativeDirectory,
     workspace_root: &WorkspaceRoot,
+    cache: &MetadataCache,
     runtime: &impl Runtime,
 ) -> Vec<TaskOutcome> {
     let misses: Vec<&TaskPlan> = plans
         .iter()
-        .filter(|plan: &&TaskPlan| -> bool { plan.cache == CacheStatus::Miss })
+        .filter(|plan: &&TaskPlan| -> bool { plan.dirtiness == Dirtiness::Dirty })
         .collect();
     std::thread::scope(|scope| {
         let handles: Vec<_> = misses
@@ -276,22 +316,21 @@ fn run_misses(
             .map(|(index, &plan)| {
                 let fiber: Fiber = Fiber::new(index);
                 let task: Task = plan.task.clone();
-                let output_directory: AbsoluteDirectory = plan.paths.output_directory().clone();
-                let state_file: AbsoluteFile = plan.paths.state_file().clone();
-                let inputs: FileSetHash = plan.current_state.inputs();
-                let declaration: DeclarationHash = plan.current_state.declaration();
+                let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
+                let run_record_file: AbsoluteFile = plan.layout.run_record_file().clone();
                 scope.spawn(move || -> TaskOutcome {
                     let task_start: TaskStart = TaskStart::new(runtime.now());
-                    let result: IoResult<CommandOutput> = run_one(&task, &output_directory, working_directory, runtime);
-                    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, CacheStatus::Miss);
+                    let result: IoResult<CommandOutcome> =
+                        run_one(&task, module_directory, &output_directory, workspace_root, runtime);
+                    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
                     if outcome.output().status().is_success() {
                         persist_outcome(
                             outcome.task(),
+                            module_directory,
                             &output_directory,
-                            &state_file,
-                            inputs,
-                            declaration,
+                            &run_record_file,
                             workspace_root,
+                            cache,
                             runtime,
                         );
                     }
@@ -306,40 +345,113 @@ fn run_misses(
     })
 }
 
-/// Create a task's output directory, resolve `{output}`, and spawn the command. A setup failure
-/// surfaces as the task's command failure.
+/// Resolve a task's script and run its commands in order, stopping at the first failure (mirroring
+/// shell `&&` chaining) — a later command in the sequence is assumed to depend on the ones before it
+/// having actually succeeded. A setup failure (script resolution, e.g. a malformed pattern or a
+/// parameter error) surfaces the same way a real command failure does: as the task's own failure.
 fn run_one(
     task: &Task,
+    module_directory: &RelativeDirectory,
     output_directory: &AbsoluteDirectory,
-    working_directory: &AbsoluteDirectory,
-    runtime: &impl Runtime,
-) -> IoResult<CommandOutput> {
-    runtime.create_directories(output_directory.as_ref())?;
-    let command: Command = task.command().with_output_directory(output_directory.as_ref());
-    runtime.run_command(&command, working_directory.as_ref())
-}
-
-/// Record a successful task's fresh state. Best effort: a failure here only means the task is not
-/// cached and re-runs next time, so it is logged rather than allowed to fail a build that succeeded.
-fn persist_outcome(
-    task: &Task,
-    output_directory: &AbsoluteDirectory,
-    state_file: &AbsoluteFile,
-    inputs: FileSetHash,
-    declaration: DeclarationHash,
     workspace_root: &WorkspaceRoot,
     runtime: &impl Runtime,
-) {
-    let outputs: FileSetHash = match file_set_hash(output_directory, task.outputs(), workspace_root, runtime) {
-        Ok(outputs) => outputs,
-        Err(error) => {
-            let _ = runtime.log(&format!("could not hash outputs for `{}`: {error}", task.name()));
-            return;
+) -> IoResult<CommandOutcome> {
+    runtime.create_directories(output_directory.as_ref())?;
+    let commands: Vec<ScriptCommand> = task
+        .resolve(
+            &ParameterValues::default(),
+            module_directory,
+            output_directory,
+            workspace_root,
+            runtime,
+        )
+        .map_err(IoError::other)?;
+    let mut output: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded);
+    for command in &commands {
+        let working_directory: AbsoluteDirectory = workspace_root
+            .to_absolute_directory()
+            .join_directory(command.working_directory());
+        output = runtime.run_command(&to_process_command(command), working_directory.as_ref())?;
+        if !output.status().is_success() {
+            return Ok(CommandOutcome::Failed {
+                output,
+                command: command.clone(),
+            });
         }
-    };
-    let state: TaskState = TaskState::new(inputs, outputs, declaration);
-    if let Err(error) = state.persist(state_file, runtime) {
-        let _ = runtime.log(&format!("could not persist state for `{}`: {error}", task.name()));
+    }
+    Ok(CommandOutcome::Succeeded(output))
+}
+
+/// Adapt a script-resolved [`ScriptCommand`] to the [`Command`] shape [`Runtime::run_command`]
+/// spawns. The working directory is not carried here — it is resolved to an absolute path and passed
+/// to `run_command` separately.
+fn to_process_command(command: &ScriptCommand) -> Command {
+    let mut process_command: Command = Command::new(command.program(), command.arguments().iter().cloned());
+    for (name, value) in command.environment() {
+        process_command = process_command.with_environment_variable(name.clone(), value.clone());
+    }
+    process_command
+}
+
+/// Render a script-resolved command as a single space-joined line for diagnostics, the same
+/// convention [`Command`]'s own `Display` uses for a process-ready command.
+fn render_command(command: &ScriptCommand) -> String {
+    let mut rendered: String = command.program().to_string();
+    for argument in command.arguments() {
+        rendered.push(' ');
+        rendered.push_str(argument);
+    }
+    rendered
+}
+
+/// Record a successful task's fresh run record. Best effort: a failure here only means the task is
+/// not cached and re-runs next time, so it is logged rather than allowed to fail a build that
+/// succeeded.
+fn persist_outcome(
+    task: &Task,
+    module_directory: &RelativeDirectory,
+    output_directory: &AbsoluteDirectory,
+    run_record_file: &AbsoluteFile,
+    workspace_root: &WorkspaceRoot,
+    cache: &MetadataCache,
+    runtime: &impl Runtime,
+) {
+    // The task's own commands just ran and are the only thing that can have changed its output —
+    // drop the metadata cache's memo for those files so the fresh record below reads them for real,
+    // instead of reusing whatever a pre-run dirtiness check already cached as missing or stale.
+    let output_files: FileSet =
+        match resolve_file_set(task.output().pattern(), output_directory, workspace_root, runtime) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = runtime.log(&format!("could not resolve the output of `{}`: {error}", task.name()));
+                return;
+            }
+        };
+    cache.invalidate(&output_files);
+    let record: TaskRunRecord =
+        match TaskRunRecord::compute(task, module_directory, output_directory, workspace_root, cache, runtime) {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = runtime.log(&format!(
+                    "could not compute a run record for `{}`: {error}",
+                    task.name()
+                ));
+                return;
+            }
+        };
+    if let Err(error) = record.persist(run_record_file, runtime) {
+        let _ = runtime.log(&format!(
+            "could not persist a run record for `{}`: {error}",
+            task.name()
+        ));
+    }
+    // Settle the metadata cache's own per-file records too, so a later build can trust them via a
+    // cheap stat check instead of reading their content again.
+    if let Err(error) = cache.persist(&output_files, workspace_root, runtime) {
+        let _ = runtime.log(&format!(
+            "could not persist metadata-cache records for `{}`: {error}",
+            task.name()
+        ));
     }
 }
 
@@ -352,17 +464,20 @@ pub fn execute_graph(
     config: &ExecutionConfig,
     runtime: &impl Runtime,
 ) -> MietteResult<(Vec<TaskOutcome>, ModuleRebuilt)> {
-    let working_directory: &AbsoluteDirectory = location.working_directory();
+    let module_directory: RelativeDirectory = workspace_root.relativize_directory(location.working_directory());
+    let cache_directory: AbsoluteDirectory = build_directory.join_directory(&RelativeDirectory::new(".metadata-cache"));
+    let cache: MetadataCache = MetadataCache::new(cache_directory);
     let step_groups: Vec<Vec<TaskGraphNodeId>> = group_nodes_by_step(graph.nodes());
     let mut all_outcomes: Vec<TaskOutcome> = Vec::new();
     for group in &step_groups {
         let mut plans: Vec<TaskPlan> = plan_group(
             group,
             graph.nodes(),
-            working_directory,
+            &module_directory,
             workspace_root,
             build_directory,
             location.module_path(),
+            &cache,
             runtime,
         )?;
         if dependency_rebuilt.is_rebuilt() {
@@ -370,25 +485,25 @@ pub fn execute_graph(
             // the dependency's previous sources, which are not part of this module's tracked inputs, so
             // no per-task dirtiness check would notice. Force every task to run.
             for plan in &mut plans {
-                plan.cache = CacheStatus::Miss;
+                plan.dirtiness = Dirtiness::Dirty;
             }
         }
         if config.verbosity != Verbosity::Quiet {
             for plan in &plans {
-                if plan.cache == CacheStatus::Miss {
+                if plan.dirtiness == Dirtiness::Dirty {
                     writeln!(runtime.output(), "  \u{2192} {}", plan.task.name()).into_diagnostic()?;
                 }
             }
         }
         let mut miss_outcomes: std::vec::IntoIter<TaskOutcome> =
-            run_misses(&plans, working_directory, workspace_root, runtime).into_iter();
+            run_misses(&plans, &module_directory, workspace_root, &cache, runtime).into_iter();
         let batch_start: usize = all_outcomes.len();
         for plan in &plans {
-            let outcome: TaskOutcome = match plan.cache {
-                CacheStatus::Hit => {
+            let outcome: TaskOutcome = match plan.dirtiness {
+                Dirtiness::Clean => {
                     TaskOutcome::cached(plan.task.clone(), TaskStart::new(runtime.now()), Fiber::new(0))
                 }
-                CacheStatus::Miss => miss_outcomes.next().expect("one outcome per miss task"),
+                Dirtiness::Dirty => miss_outcomes.next().expect("one outcome per dirty task"),
             };
             all_outcomes.push(outcome);
         }
@@ -404,7 +519,10 @@ pub fn execute_graph(
             let failed: &TaskOutcome = &all_outcomes[failure_idx];
             return Err(SindriError::TaskFailed {
                 task_name: failed.task.name().clone(),
-                command: failed.task.command().clone(),
+                command: failed.failed_command().map_or_else(
+                    || "no command ran (the task failed before one could)".to_string(),
+                    render_command,
+                ),
                 output: failed.output.combined_output(),
             }
             .into());
@@ -413,24 +531,24 @@ pub fn execute_graph(
     let rebuilt: ModuleRebuilt = ModuleRebuilt::new(
         all_outcomes
             .iter()
-            .any(|outcome: &TaskOutcome| outcome.cache() == CacheStatus::Miss),
+            .any(|outcome: &TaskOutcome| outcome.dirtiness() == Dirtiness::Dirty),
     );
     Ok((all_outcomes, rebuilt))
 }
 
-/// Print a task's completion line. Cache hits stay silent unless `--verbose`; misses always show
+/// Print a task's completion line. Clean tasks stay silent unless `--verbose`; dirty tasks always show
 /// their result and, when verbose, their captured output.
 fn report_outcome(outcome: &TaskOutcome, config: &ExecutionConfig, runtime: &impl Runtime) -> MietteResult<()> {
     if config.verbosity == Verbosity::Quiet {
         return Ok(());
     }
-    match outcome.cache() {
-        CacheStatus::Hit => {
+    match outcome.dirtiness() {
+        Dirtiness::Clean => {
             if config.verbosity == Verbosity::Verbose {
                 writeln!(runtime.output(), "  \u{2713} {} (cached)", outcome.task().name()).into_diagnostic()?;
             }
         }
-        CacheStatus::Miss => {
+        Dirtiness::Dirty => {
             let symbol: &str = if outcome.output().status().is_success() {
                 "\u{2713}"
             } else {
@@ -458,16 +576,19 @@ fn report_outcome(outcome: &TaskOutcome, config: &ExecutionConfig, runtime: &imp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glob::GlobPatterns;
+    use crate::file_set::FileSetPattern;
     use crate::lifecycle::TaskGraph;
     use crate::lifecycle::TaskGraphBuilder;
     use crate::lifecycle::TaskGraphNode;
-    use crate::plugin::Task;
-    use crate::plugin::TaskName;
+    use crate::parameter::ParameterDeclarations;
     use crate::runtime::Bootstrap;
     use crate::runtime::DummyRuntime;
     use crate::runtime::SystemFileSystem;
-    use crate::types::Command;
+    use crate::script::Script;
+    use crate::task::DeclaredTaskInput;
+    use crate::task::ManagedTaskInput;
+    use crate::task::TaskName;
+    use crate::task::TaskOutput;
     use crate::types::RelativeDirectory;
     use crate::types::Stderr;
     use crate::types::Step;
@@ -480,33 +601,26 @@ mod tests {
     use std::sync::mpsc::Sender;
     use std::thread;
     use std::thread::JoinHandle;
-    use tempfile::TempDir;
 
     fn system_runtime() -> impl Runtime {
         SystemFileSystem.into_runtime(BuildStart::now(), None).unwrap()
     }
 
-    /// Splits a whitespace-separated command line into a [`Command`]. A test-only convenience —
-    /// real callers construct the program and arguments explicitly.
-    fn parse_command(command: &str) -> Command {
-        let mut parts: std::str::SplitWhitespace<'_> = command.split_whitespace();
-        let program: &str = parts.next().unwrap_or("");
-        Command::new(program, parts)
+    fn make_task(name: &str, command: &str) -> Task {
+        Task::new(
+            TaskName::new(name),
+            Script::new(format!("fun inputs => [ {{ program = \"{command}\" }} ]")),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        )
     }
 
     fn make_graph(tasks: Vec<(&str, &str, &str)>) -> TaskGraph {
         let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
         for (name, step, command) in tasks {
-            builder.add_node(TaskGraphNode::new(
-                Task::new(
-                    TaskName::new(name),
-                    Step::new(step),
-                    parse_command(command),
-                    GlobPatterns::new(vec![], vec![]),
-                    GlobPatterns::new(vec![], vec![]),
-                ),
-                Step::new(step),
-            ));
+            builder.add_node(TaskGraphNode::new(make_task(name, command), Step::new(step)));
         }
         builder.build()
     }
@@ -542,7 +656,7 @@ mod tests {
     /// Run a graph with real process spawning, isolating its persisted state in a fresh temporary
     /// directory so repeated test runs never observe each other's cached state.
     fn run_real(graph: &TaskGraph, config: &ExecutionConfig) -> Vec<TaskOutcome> {
-        let scratch: TempDir = TempDir::new().unwrap();
+        let scratch: tempfile::TempDir = tempfile::TempDir::new().unwrap();
         let working_directory: AbsoluteDirectory = AbsoluteDirectory::new(scratch.path().to_path_buf());
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
@@ -619,34 +733,31 @@ mod tests {
     // A real command is executed here to keep coverage of actual process spawning and stdout capture.
     #[test]
     fn succeeding_command_exits_zero_and_captures_stdout() {
-        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo hello")]);
+        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo")]);
         let outcomes: Vec<TaskOutcome> = run_real(&graph, &default_config());
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].output().status(), TaskStatus::Succeeded);
-        assert_eq!(outcomes[0].output().stdout().as_bytes().trim_ascii_end(), b"hello");
     }
 
-    // A real command is executed here to prove the structured command passes an argument
-    // containing whitespace as a single argument rather than splitting it.
+    // A real command is executed here to prove a script's `environment` record actually reaches the
+    // spawned process — the same mechanism T8b's GOWORK wiring will depend on.
     #[test]
-    fn argument_with_a_space_is_passed_as_one_argument() {
+    fn a_scripts_environment_reaches_the_spawned_process() {
         let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
         builder.add_node(TaskGraphNode::new(
             Task::new(
-                TaskName::new("echo-task"),
-                Step::new("compile"),
-                Command::new("echo", ["hello world"]),
-                GlobPatterns::new(vec![], vec![]),
-                GlobPatterns::new(vec![], vec![]),
+                TaskName::new("env-task"),
+                Script::new("fun inputs => [ { program = \"sh\", arguments = [ \"-c\", \"echo $GREETING\" ], environment = { GREETING = \"hello\" } } ]"),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
             ),
             Step::new("compile"),
         ));
-        let graph: TaskGraph = builder.build();
-        let outcomes: Vec<TaskOutcome> = run_real(&graph, &default_config());
-        assert_eq!(
-            outcomes[0].output().stdout().as_bytes().trim_ascii_end(),
-            b"hello world"
-        );
+        let outcomes: Vec<TaskOutcome> = run_real(&builder.build(), &default_config());
+        assert_eq!(outcomes[0].output().status(), TaskStatus::Succeeded);
+        assert_eq!(outcomes[0].output().stdout().to_string_lossy().trim(), "hello");
     }
 
     #[test]
@@ -654,86 +765,137 @@ mod tests {
         let graph: TaskGraph = make_graph(vec![("false-task", "compile", "false")]);
         let runtime: DummyRuntime = DummyRuntime::builder().command("false", failed("")).build();
         let result: MietteResult<Vec<TaskOutcome>> = run(&graph, &workspace_directory(), &default_config(), &runtime);
-        assert!(result.is_err());
+        assert!(result.is_err(), "a failing command should fail the whole run");
     }
 
     #[test]
     fn task_failure_error_contains_command() {
-        let graph: TaskGraph = make_graph(vec![("false-task", "compile", "false")]);
+        // A dedicated task (rather than `make_task`, which never supplies arguments) so the error can
+        // be checked for the full command line, not just the program name.
+        let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
+        builder.add_node(TaskGraphNode::new(
+            Task::new(
+                TaskName::new("false-task"),
+                Script::new("fun inputs => [ { program = \"false\", arguments = [ \"--flag\" ] } ]"),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
+            ),
+            Step::new("compile"),
+        ));
         let runtime: DummyRuntime = DummyRuntime::builder().command("false", failed("")).build();
-        let error: miette::Error = run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap_err();
+        let result: MietteResult<Vec<TaskOutcome>> =
+            run(&builder.build(), &workspace_directory(), &default_config(), &runtime);
+        let error: String = result.unwrap_err().to_string();
         assert!(
-            error.to_string().contains("false"),
-            "error message should contain the command; got: {error}"
+            error.contains("false --flag"),
+            "error should name the exact failing command: {error}"
+        );
+    }
+
+    #[test]
+    fn failing_task_output_shown_in_error_regardless_of_verbosity() {
+        let graph: TaskGraph = make_graph(vec![("false-task", "compile", "false")]);
+        let runtime: DummyRuntime = DummyRuntime::builder().command("false", failed("boom")).build();
+        let result: MietteResult<Vec<TaskOutcome>> =
+            run(&graph, &workspace_directory(), &config(Verbosity::Quiet), &runtime);
+        let error: String = result.unwrap_err().to_string();
+        assert!(
+            error.contains("boom"),
+            "error should surface the command's output: {error}"
         );
     }
 
     #[test]
     fn quiet_suppresses_progress_lines_on_success() {
-        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo hello")]);
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .command("echo hello", succeeded("hello\n"))
-            .build();
+        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo")]);
+        let runtime: DummyRuntime = DummyRuntime::builder().command("echo", succeeded("hello\n")).build();
         run(&graph, &workspace_directory(), &config(Verbosity::Quiet), &runtime).unwrap();
-        assert!(
-            runtime.captured_output().is_empty(),
-            "expected no output with quiet; got: {:?}",
-            runtime.captured_output()
-        );
+        assert!(runtime.captured_output().is_empty());
     }
 
     #[test]
     fn quiet_still_returns_error_on_failure() {
         let graph: TaskGraph = make_graph(vec![("false-task", "compile", "false")]);
         let runtime: DummyRuntime = DummyRuntime::builder().command("false", failed("")).build();
-        assert!(
-            run(&graph, &workspace_directory(), &config(Verbosity::Quiet), &runtime).is_err(),
-            "expected an error even with quiet verbosity"
-        );
-    }
-
-    #[test]
-    fn failing_task_output_shown_in_error_regardless_of_verbosity() {
-        let graph: TaskGraph = make_graph(vec![("ls-task", "compile", "ls /sindri_test_nonexistent")]);
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .command("ls /sindri_test_nonexistent", failed("No such file or directory"))
-            .build();
-        let error: miette::Error =
-            run(&graph, &workspace_directory(), &config(Verbosity::Quiet), &runtime).unwrap_err();
-        assert!(
-            error.to_string().contains("No such file or directory"),
-            "failing task output should be in the error even with quiet verbosity; got: {error}"
-        );
-        assert!(
-            runtime.captured_output().is_empty(),
-            "quiet verbosity should suppress progress output; got: {:?}",
-            runtime.captured_output()
-        );
-    }
-
-    #[test]
-    fn verbose_shows_stdout_on_success() {
-        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo hello")]);
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .command("echo hello", succeeded("hello\n"))
-            .build();
-        run(&graph, &workspace_directory(), &config(Verbosity::Verbose), &runtime).unwrap();
-        assert!(
-            runtime.captured_output().as_str().contains("hello"),
-            "verbose output should include task stdout"
-        );
+        let result: MietteResult<Vec<TaskOutcome>> =
+            run(&graph, &workspace_directory(), &config(Verbosity::Quiet), &runtime);
+        assert!(result.is_err());
     }
 
     #[test]
     fn normal_hides_stdout_on_success() {
-        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo hello")]);
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .command("echo hello", succeeded("hello\n"))
-            .build();
-        run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap();
+        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo")]);
+        let runtime: DummyRuntime = DummyRuntime::builder().command("echo", succeeded("hello\n")).build();
+        run(&graph, &workspace_directory(), &config(Verbosity::Normal), &runtime).unwrap();
+        assert!(!runtime.captured_output().as_str().contains("hello"));
+    }
+
+    #[test]
+    fn verbose_shows_stdout_on_success() {
+        let graph: TaskGraph = make_graph(vec![("echo-task", "compile", "echo")]);
+        let runtime: DummyRuntime = DummyRuntime::builder().command("echo", succeeded("hello\n")).build();
+        run(&graph, &workspace_directory(), &config(Verbosity::Verbose), &runtime).unwrap();
+        assert!(runtime.captured_output().as_str().contains("hello"));
+    }
+
+    #[test]
+    fn failing_command_output_shown_in_error_regardless_of_verbosity() {
+        let graph: TaskGraph = make_graph(vec![("false-task", "compile", "false")]);
+        let runtime: DummyRuntime = DummyRuntime::builder().command("false", failed("nope")).build();
+        let result: MietteResult<Vec<TaskOutcome>> =
+            run(&graph, &workspace_directory(), &config(Verbosity::Normal), &runtime);
+        let error: String = result.unwrap_err().to_string();
+        assert!(error.contains("nope"), "error should surface stderr: {error}");
+    }
+
+    #[test]
+    fn a_rebuilt_dependency_forces_an_otherwise_clean_task_to_run() {
+        // A single compile task with no tracked inputs or outputs, so once its run record is on disk
+        // it is a cache hit. Its command is stubbed for when it does run.
+        let graph: TaskGraph = make_graph(vec![("go-compile", "compile", "go")]);
+        let seed: DummyRuntime = DummyRuntime::builder().command("go", succeeded("")).build();
+        let (_, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
+            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(false), &seed);
+        assert!(rebuilt.is_rebuilt(), "the first run should always report a rebuild");
+        let mut replay: crate::runtime::DummyRuntimeBuilder = DummyRuntime::builder().command("go", succeeded(""));
+        for (path, contents) in seed.written_files() {
+            replay = replay.file(path, contents);
+        }
+        let replay: DummyRuntime = replay.build();
+        let (outcomes, rebuilt_again): (Vec<TaskOutcome>, ModuleRebuilt) =
+            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(false), &replay);
         assert!(
-            !runtime.captured_output().as_str().contains("hello"),
-            "task stdout should be hidden at normal verbosity"
+            !rebuilt_again.is_rebuilt(),
+            "an unchanged task should be a cache hit on replay"
+        );
+        assert_eq!(outcomes[0].dirtiness(), Dirtiness::Clean);
+        let (forced_outcomes, forced_rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
+            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(true), &replay);
+        assert!(
+            forced_rebuilt.is_rebuilt(),
+            "a forced dependency rebuild should force this module too"
+        );
+        assert_eq!(forced_outcomes[0].dirtiness(), Dirtiness::Dirty);
+    }
+
+    #[test]
+    fn parallel_tasks_have_distinct_fibers() {
+        let graph: TaskGraph = make_graph(vec![
+            ("task-a", "compile", "command-a"),
+            ("task-b", "compile", "command-b"),
+        ]);
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .command("command-a", succeeded(""))
+            .command("command-b", succeeded(""))
+            .build();
+        let outcomes: Vec<TaskOutcome> = run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_ne!(
+            outcomes[0].fiber(),
+            outcomes[1].fiber(),
+            "parallel tasks should have distinct fibers"
         );
     }
 
@@ -798,69 +960,5 @@ mod tests {
                 .all(|outcome: &TaskOutcome| -> bool { outcome.output().status().is_success() }),
             "both tasks should have run their stubbed command successfully"
         );
-    }
-
-    #[test]
-    fn parallel_tasks_have_distinct_fibers() {
-        let graph: TaskGraph = make_graph(vec![
-            ("task-a", "compile", "command-a"),
-            ("task-b", "compile", "command-b"),
-        ]);
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .command("command-a", succeeded(""))
-            .command("command-b", succeeded(""))
-            .build();
-        let outcomes: Vec<TaskOutcome> = run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap();
-        assert_eq!(outcomes.len(), 2);
-        assert_ne!(
-            outcomes[0].fiber, outcomes[1].fiber,
-            "parallel tasks should have distinct fibers"
-        );
-    }
-
-    #[test]
-    fn a_rebuilt_dependency_forces_an_otherwise_clean_task_to_run() {
-        // A single compile task with no tracked inputs or outputs, so once its state is on disk it is a
-        // cache hit. Its command is stubbed for when it does run.
-        let graph: TaskGraph = make_graph(vec![("go-compile", "compile", "go build")]);
-        let state_file: PathBuf = PathBuf::from("/workspace/.target/compile/go-compile/state.bin");
-        // A first run persists fresh state; a stub runtime's writes are invisible to reads, so the state
-        // is re-registered as a real file for the runs that must observe it as a cache hit.
-        let seed: DummyRuntime = DummyRuntime::builder().command("go build", succeeded("")).build();
-        run(&graph, &workspace_directory(), &default_config(), &seed).unwrap();
-        let state_bytes: Vec<u8> = seed
-            .written_file(&state_file)
-            .expect("the first run should persist state");
-        // With the state visible and no dependency rebuilt, the task is skipped and the module reports
-        // that it did not rebuild.
-        let clean: DummyRuntime = DummyRuntime::builder()
-            .command("go build", succeeded(""))
-            .file(&state_file, &state_bytes)
-            .build();
-        let (clean_outcomes, clean_rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
-            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(false), &clean);
-        assert_eq!(
-            clean_outcomes[0].cache(),
-            CacheStatus::Hit,
-            "an unchanged task with no dependency rebuild should be a cache hit"
-        );
-        assert!(
-            !clean_rebuilt.is_rebuilt(),
-            "a module whose tasks all hit did not rebuild"
-        );
-        // The identical unchanged state, but a dependency rebuilt: the task is forced to run despite the
-        // hit, and the module reports itself rebuilt so its own dependents are forced in turn.
-        let forced: DummyRuntime = DummyRuntime::builder()
-            .command("go build", succeeded(""))
-            .file(&state_file, &state_bytes)
-            .build();
-        let (forced_outcomes, forced_rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
-            run_with_dependency(&graph, &workspace_directory(), ModuleRebuilt::new(true), &forced);
-        assert_eq!(
-            forced_outcomes[0].cache(),
-            CacheStatus::Miss,
-            "a rebuilt dependency forces the otherwise-clean task to run"
-        );
-        assert!(forced_rebuilt.is_rebuilt(), "a forced module reports itself rebuilt");
     }
 }

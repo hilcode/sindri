@@ -168,6 +168,7 @@ mod tests {
     use crate::runtime::Runtime;
     use crate::runtime::SystemFileSystem;
     use crate::types::BuildStart;
+    use crate::types::RelativeDirectory;
     use std::collections::BTreeSet;
     use std::fs::create_dir_all;
     use std::fs::write;
@@ -331,6 +332,20 @@ mod tests {
                 "nested/helper.go".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn resolving_against_a_nonexistent_base_on_the_real_filesystem_yields_an_empty_set() {
+        // A task's output directory does not exist yet before its first successful run, and gets
+        // resolved against regardless — a missing base must be an empty set, not a walk error.
+        let temporary_directory: TempDir = TempDir::new().unwrap();
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(temporary_directory.path().to_path_buf()));
+        let missing: AbsoluteDirectory = root
+            .to_absolute_directory()
+            .join_directory(&RelativeDirectory::new("output"));
+        let file_set: FileSet =
+            FileSet::resolve(&FileSetPattern::new(["**/*"]), &missing, &root, &system_runtime()).unwrap();
+        assert!(file_set.is_empty());
     }
 
     #[test]

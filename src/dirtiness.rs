@@ -143,6 +143,16 @@ pub enum Dirtiness {
     Dirty,
 }
 
+impl Dirtiness {
+    /// The Chrome-trace `args.cache` value for this status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Dirtiness::Clean => "hit",
+            Dirtiness::Dirty => "miss",
+        }
+    }
+}
+
 pub fn dirtiness(current: &TaskRunRecord, persisted: Option<&TaskRunRecord>) -> Dirtiness {
     match persisted {
         Some(previous) if previous == current => Dirtiness::Clean,

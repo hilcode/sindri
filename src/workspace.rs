@@ -2,7 +2,7 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::nickel_eval::Contract;
 use crate::nickel_eval::Nickel;
-use crate::plugin::PluginName;
+use crate::parameter::PluginName;
 use crate::runtime::FileSystem;
 use crate::runtime::Runtime;
 use crate::types::{
@@ -177,6 +177,7 @@ mod tests {
     use super::*;
     use crate::error::SindriError;
     use crate::runtime::DummyRuntime;
+    use std::io::ErrorKind;
     use std::path::Path;
 
     const MINIMAL: &str = r#"{ name = "test-project", sindri_version = "0.1.0" }"#;
@@ -229,6 +230,17 @@ mod tests {
     }
 
     #[test]
+    fn find_workspace_root_reports_io_errors_from_file_kind() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .directory("/workspace")
+            .error("/workspace/sindri.workspace", ErrorKind::PermissionDenied)
+            .build();
+        let error: SindriError =
+            WorkspaceRoot::find(&AbsoluteDirectory::new(PathBuf::from("/workspace")), &runtime).unwrap_err();
+        assert!(matches!(error, SindriError::Io { .. }));
+    }
+
+    #[test]
     fn load_valid_workspace_config() {
         let config: WorkspaceConfig = load(MINIMAL).unwrap();
         assert_eq!(config.name().as_ref(), "test-project");
@@ -265,6 +277,26 @@ mod tests {
     #[test]
     fn load_workspace_config_passes_contract() {
         load(MINIMAL).unwrap();
+    }
+
+    #[test]
+    fn locate_finds_the_workspace_from_the_current_directory() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", MINIMAL)
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        assert_eq!(workspace.workspace_root().as_ref(), Path::new("/workspace"));
+        assert_eq!(workspace.config().name().as_ref(), "test-project");
+    }
+
+    #[test]
+    fn locate_reports_io_errors_from_current_directory() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .current_directory_error(ErrorKind::PermissionDenied)
+            .build();
+        let result: SindriResult<Workspace> = Workspace::locate(&runtime);
+        assert!(matches!(result, Err(SindriError::Io { .. })));
     }
 
     #[test]

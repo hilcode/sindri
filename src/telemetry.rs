@@ -58,7 +58,7 @@ impl Telemetry {
                     pid: 0,
                     tid: outcome.fiber(),
                     args: TraceArgs {
-                        cache: outcome.cache().label(),
+                        cache: outcome.dirtiness().label(),
                     },
                 }
             })
@@ -74,17 +74,20 @@ impl Telemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glob::GlobPatterns;
-    use crate::plugin::Task;
-    use crate::plugin::TaskName;
+    use crate::dirtiness::Dirtiness;
+    use crate::file_set::FileSetPattern;
+    use crate::parameter::ParameterDeclarations;
     use crate::runtime::DummyRuntime;
     use crate::runtime::Runtime;
-    use crate::state::CacheStatus;
-    use crate::types::Command;
+    use crate::script::Script;
+    use crate::task::DeclaredTaskInput;
+    use crate::task::ManagedTaskInput;
+    use crate::task::Task;
+    use crate::task::TaskName;
+    use crate::task::TaskOutput;
     use crate::types::CommandOutput;
     use crate::types::Stderr;
     use crate::types::Stdout;
-    use crate::types::Step;
     use crate::types::TaskStart;
     use crate::types::TaskStatus;
     use std::path::Path;
@@ -98,7 +101,7 @@ mod tests {
     }
 
     fn make_outcome(task_name: &str, fiber: Fiber, task_duration: Duration, task_start: TaskStart) -> TaskOutcome {
-        cached_outcome(task_name, fiber, task_duration, task_start, CacheStatus::Miss)
+        cached_outcome(task_name, fiber, task_duration, task_start, Dirtiness::Dirty)
     }
 
     fn cached_outcome(
@@ -106,21 +109,22 @@ mod tests {
         fiber: Fiber,
         task_duration: Duration,
         task_start: TaskStart,
-        cache: CacheStatus,
+        dirtiness: Dirtiness,
     ) -> TaskOutcome {
         TaskOutcome::new(
             Task::new(
                 TaskName::new(task_name),
-                Step::new("compile"),
-                Command::new("true", [] as [&str; 0]),
-                GlobPatterns::new(vec![], vec![]),
-                GlobPatterns::new(vec![], vec![]),
+                Script::new("fun inputs => []"),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
             ),
             CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded),
             task_duration,
             task_start,
             fiber,
-            cache,
+            dirtiness,
         )
     }
 
@@ -208,14 +212,14 @@ mod tests {
                 Fiber::new(0),
                 Duration::from_millis(100),
                 task_start,
-                CacheStatus::Miss,
+                Dirtiness::Dirty,
             ),
             cached_outcome(
                 "skipped",
                 Fiber::new(1),
                 Duration::from_millis(1),
                 task_start,
-                CacheStatus::Hit,
+                Dirtiness::Clean,
             ),
         ];
         let parsed: serde_json::Value = write_and_parse(&outcomes, build_start, &runtime);

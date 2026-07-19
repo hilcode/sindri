@@ -2,6 +2,7 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::nickel_eval::Nickel;
 use blake3::Hasher;
+use serde::Deserialize;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -14,7 +15,8 @@ const FIELD_SEPARATOR: [u8; 1] = [0];
 
 /// The plugin that owns a [`Parameter`], namespacing its name so two plugins may each define a
 /// parameter of the same name without collision.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(transparent)]
 pub struct PluginName(SmolStr);
 
 impl PluginName {

@@ -4,13 +4,13 @@ use crate::executor::ModuleLocation;
 use crate::executor::ModuleRebuilt;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
+use crate::go_plugin::GoPlugin;
 use crate::go_work::GoToolchainVersion;
 use crate::go_work::GoWork;
 use crate::module::ArtifactType;
 use crate::module_graph::ModuleGraph;
-use crate::plugin::go_plugin;
-use crate::plugin::{Plugin, Task};
 use crate::runtime::Runtime;
+use crate::task::Task;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
@@ -96,10 +96,10 @@ impl Lifecycle {
     }
 
     pub fn run_lifecycle(&self, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
-        // The listing is workspace-generic, with no module and no generated workspace file in hand;
-        // show the executable form of the go-compile task as a representative.
-        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
-        self.write(&[&plugin], show_all, &mut runtime.output())
+        // The listing is workspace-generic, with no module in hand; show the executable form of the
+        // go-compile task as a representative.
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
+        self.write(&tasks, show_all, &mut runtime.output())
     }
 
     pub fn run_compile(
@@ -119,12 +119,11 @@ impl Lifecycle {
         let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
         // Project the declared module dependencies into Go's local-dependency view, written inside the
-        // build directory and reached by each `go` invocation through GOWORK, so a dependent module
-        // resolves an import of a sibling library locally instead of trying to fetch it. The
-        // declarations are the file's only source, so it cannot drift from a hand-maintained one, and
-        // it stays a build artifact rather than clutter in the source tree. The directive is the
-        // toolchain's own version (`go env GOVERSION`); without a usable `go` the build cannot proceed,
-        // so a missing version is a hard error rather than a silently malformed file.
+        // build directory, so the declarations remain the file's only source and it cannot drift from a
+        // hand-maintained one. The directive is the toolchain's own version (`go env GOVERSION`);
+        // without a usable `go` the build cannot proceed, so a missing version is a hard error rather
+        // than a silently malformed file. Consuming this file via `GOWORK` — and tracking it as a
+        // managed input — is not yet wired into the task model; it still exists as a build artifact only.
         let toolchain_version: GoToolchainVersion =
             GoToolchainVersion::query(runtime, &workspace_root.to_absolute_directory())
                 .ok_or(SindriError::GoToolchainVersionUnknown)?;
@@ -137,15 +136,15 @@ impl Lifecycle {
             })?;
         // Modules build in dependency-first order (the graph's node order), each in its own directory
         // and its own state subtree, so a dependency is fully built before anything that depends on
-        // it. Each module compiles with the go-compile command its artifact type requires. A failing
+        // it. Each module compiles with the go-compile script its artifact type requires. A failing
         // task makes `execute_graph` return early via `?`, so a broken build writes no telemetry: the
         // partial trace is dropped, keeping every telemetry.json a whole-build record.
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
         let mut module_rebuilt: Vec<ModuleRebuilt> = Vec::with_capacity(module_graph.nodes().len());
         for node in module_graph.nodes() {
-            let plugin: Plugin = go_plugin(node.module().artifact_type(), Some(&go_work_file));
+            let tasks: Vec<(Task, Step)> = GoPlugin::tasks(node.module().artifact_type());
             let graph: TaskGraph = self
-                .build_task_graph(&[&plugin], &compile_step)
+                .build_task_graph(&tasks, &compile_step)
                 .expect("compile is a built-in lifecycle step");
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
@@ -179,12 +178,15 @@ impl Lifecycle {
         &self.steps
     }
 
-    pub fn write(&self, plugins: &[&Plugin], show_all: bool, writer: &mut impl Write) -> IoResult<()> {
+    /// Print each lifecycle step and the tasks bound to it, one task name per line. A task's
+    /// commands are not previewed here — they come from evaluating its `Script`, which needs real
+    /// inputs (a workspace, a resolved file set) this purely informational listing does not have.
+    pub fn write(&self, tasks: &[(Task, Step)], show_all: bool, writer: &mut impl Write) -> IoResult<()> {
         for step in &self.steps {
-            let step_tasks: Vec<&Task> = plugins
+            let step_tasks: Vec<&Task> = tasks
                 .iter()
-                .flat_map(|plugin: &&Plugin| -> std::slice::Iter<'_, Task> { plugin.tasks().iter() })
-                .filter(|task: &&Task| -> bool { task.step() == step })
+                .filter(|(_, task_step): &&(Task, Step)| -> bool { task_step == step })
+                .map(|(task, _): &(Task, Step)| -> &Task { task })
                 .collect();
             if step_tasks.is_empty() {
                 if show_all {
@@ -194,27 +196,25 @@ impl Lifecycle {
             } else {
                 writeln!(writer, "{step}")?;
                 for task in &step_tasks {
-                    writeln!(writer, "    {:<20} {}", task.name(), task.command())?;
+                    writeln!(writer, "    {}", task.name())?;
                 }
             }
         }
         Ok(())
     }
 
-    pub fn build_task_graph(&self, plugins: &[&Plugin], target: &Step) -> Option<TaskGraph> {
+    pub fn build_task_graph(&self, tasks: &[(Task, Step)], target: &Step) -> Option<TaskGraph> {
         let target_index: usize = self.steps.iter().position(|step: &Step| -> bool { step == target })?;
         let steps_in_scope: &[Step] = &self.steps[..=target_index];
 
         let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
         for step in steps_in_scope {
-            for plugin in plugins {
-                for task in plugin.tasks() {
-                    if task.step() == step {
-                        builder.add_node(TaskGraphNode {
-                            task: task.clone(),
-                            step: step.clone(),
-                        });
-                    }
+            for (task, task_step) in tasks {
+                if task_step == step {
+                    builder.add_node(TaskGraphNode {
+                        task: task.clone(),
+                        step: step.clone(),
+                    });
                 }
             }
         }
@@ -227,12 +227,16 @@ impl Lifecycle {
 mod tests {
     use super::*;
     use crate::executor::Verbosity;
-    use crate::glob::GlobPatterns;
-    use crate::plugin::{Plugin, PluginName, Task, TaskName, go_plugin};
+    use crate::file_set::FileSetPattern;
+    use crate::parameter::ParameterDeclarations;
     use crate::runtime::DummyRuntime;
     use crate::runtime::DummyRuntimeBuilder;
+    use crate::script::Script;
+    use crate::task::DeclaredTaskInput;
+    use crate::task::ManagedTaskInput;
+    use crate::task::TaskName;
+    use crate::task::TaskOutput;
     use crate::types::BuildStart;
-    use crate::types::Command;
     use crate::types::CommandOutput;
     use crate::types::Stderr;
     use crate::types::TaskStatus;
@@ -273,36 +277,10 @@ mod tests {
             .current_directory("/workspace")
     }
 
-    /// A two-module workspace: an `app` executable in `/workspace/app` depending on a local `//lib`
-    /// library in the sibling `/workspace/lib`. The directories are disjoint, so neither module's source
-    /// glob sweeps the other — the dependency edge is the only thing that can tie `app`'s freshness to
-    /// `lib`'s. Every command a compile issues (toolchain query, `gofmt`, `go build`) is stubbed.
-    fn multi_module_workspace() -> DummyRuntimeBuilder {
-        DummyRuntime::builder()
-            .file(
-                "/workspace/sindri.workspace",
-                r#"{ name = "test", sindri_version = "0.1.0" }"#,
-            )
-            .file(
-                "/workspace/app/sindri.build",
-                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
-                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
-            )
-            .file("/workspace/app/main.go", "package main\n\nfunc main() {}\n")
-            .file(
-                "/workspace/lib/sindri.build",
-                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
-            )
-            .file("/workspace/lib/lib.go", "package lib\n")
-            .command("go env GOVERSION", go_version())
-            .command("gofmt -l .", succeeded())
-            .command("go build", succeeded())
-            .current_directory("/workspace/app")
-    }
-
-    /// Re-register a previous run's persisted files (task state records, the generated `go.work`) as real
-    /// files in a fresh builder, so a replayed build observes them: a stub runtime records writes into a
-    /// log its reads do not consult, so without this every task would look uncached on the replay.
+    /// Re-register a previous run's persisted files (task run records, the generated `go.work`) as
+    /// real files in a fresh builder, so a replayed build observes them: a stub runtime records
+    /// writes into a log its reads do not consult, so without this every task would look uncached on
+    /// the replay.
     fn replay_with_state(mut builder: DummyRuntimeBuilder, previous: &DummyRuntime) -> DummyRuntimeBuilder {
         for (path, contents) in previous.written_files() {
             builder = builder.file(path, contents);
@@ -310,18 +288,15 @@ mod tests {
         builder
     }
 
-    fn make_task(name: &str, step: &str) -> Task {
+    fn make_task(name: &str) -> Task {
         Task::new(
             TaskName::new(name),
-            Step::new(step),
-            Command::new("", [] as [&str; 0]),
-            GlobPatterns::new(vec![], vec![]),
-            GlobPatterns::new(vec![], vec![]),
+            Script::new("fun inputs => []"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
         )
-    }
-
-    fn make_plugin(tasks: Vec<Task>) -> Plugin {
-        Plugin::new(PluginName::new("test"), tasks)
     }
 
     #[test]
@@ -349,16 +324,16 @@ mod tests {
 
     #[test]
     fn nodes_are_ordered_by_lifecycle_step() {
-        let plugin: Plugin = make_plugin(vec![
-            make_task("compile-task", "compile"),
-            make_task("test-task", "test"),
-        ]);
+        let tasks: Vec<(Task, Step)> = vec![
+            (make_task("compile-task"), Step::new("compile")),
+            (make_task("test-task"), Step::new("test")),
+        ];
         let lifecycle: Lifecycle = Lifecycle::new();
-        let graph: TaskGraph = lifecycle.build_task_graph(&[&plugin], &Step::new("test")).unwrap();
-        let names: Vec<&str> = graph
+        let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("test")).unwrap();
+        let names: Vec<String> = graph
             .nodes()
             .iter()
-            .map(|node: &TaskGraphNode| -> &str { node.task().name().as_ref() })
+            .map(|node: &TaskGraphNode| -> String { node.task().name().to_string() })
             .collect();
         // The executor derives step ordering positionally from this node order, so build_task_graph
         // must emit every compile-step task before every test-step task.
@@ -368,9 +343,9 @@ mod tests {
     #[test]
     fn write_hides_empty_steps_by_default() {
         let lifecycle: Lifecycle = Lifecycle::new();
-        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
         let mut buffer: Stdout = Stdout::default();
-        lifecycle.write(&[&plugin], false, &mut buffer).unwrap();
+        lifecycle.write(&tasks, false, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
         assert!(output.contains("go-compile"));
         assert!(output.contains("go-test"));
@@ -380,9 +355,9 @@ mod tests {
     #[test]
     fn write_shows_empty_steps_with_all_flag() {
         let lifecycle: Lifecycle = Lifecycle::new();
-        let plugin: Plugin = go_plugin(&ArtifactType::Executable, None);
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
         let mut buffer: Stdout = Stdout::default();
-        lifecycle.write(&[&plugin], true, &mut buffer).unwrap();
+        lifecycle.write(&tasks, true, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
         assert!(output.contains("(no tasks)"));
     }
@@ -440,19 +415,21 @@ mod tests {
             runtime.logged(),
             vec!["Module loaded: lib".to_string(), "Module loaded: app".to_string()]
         );
-        // Each module persisted its compile state under its own subtree: the root module directly
-        // under `.target`, the `lib` module under `.target/lib`.
+        // Each module persisted its compile run record under its own subtree: the root module
+        // directly under `.target`, the `lib` module under `.target/lib`.
         assert!(
             runtime
-                .written_file("/workspace/.target/compile/go-compile/state.bin")
-                .is_some(),
-            "the entry module should have built and persisted its state"
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/go-compile")),
+            "the entry module should have built and persisted a run record"
         );
         assert!(
             runtime
-                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
-                .is_some(),
-            "the dependency module should have built and persisted its state"
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/lib/go-compile")),
+            "the dependency module should have built and persisted a run record"
         );
         // A go.work projecting both modules is written into the build directory before the build.
         let go_work: Vec<u8> = runtime
@@ -465,9 +442,38 @@ mod tests {
         );
     }
 
+    /// A two-module workspace: an `app` executable in `/workspace/app` depending on a local `//lib`
+    /// library in the sibling `/workspace/lib`. The directories are disjoint, so neither module's
+    /// source glob sweeps the other — the dependency edge is the only thing that can tie `app`'s
+    /// freshness to `lib`'s. `ModuleRebuilt` propagation does not depend on `go.work`/`GOWORK` (that
+    /// wiring is a later phase) — a `DummyRuntime` stub matches a command by its text alone, so
+    /// whether the real environment resolves a sibling import is irrelevant here.
+    fn multi_module_workspace() -> DummyRuntimeBuilder {
+        DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/app/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+            )
+            .file("/workspace/app/main.go", "package main\n\nfunc main() {}\n")
+            .file(
+                "/workspace/lib/sindri.build",
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .file("/workspace/lib/lib.go", "package lib\n")
+            .command("go env GOVERSION", go_version())
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .current_directory("/workspace/app")
+    }
+
     #[test]
     fn editing_a_dependency_forces_the_dependent_via_the_edge() {
-        // A first build persists every module's state.
+        // A first build persists every module's run record.
         let seed: DummyRuntime = multi_module_workspace().build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::new()
@@ -483,46 +489,45 @@ mod tests {
             .unwrap();
         assert!(
             rebuild
-                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
-                .is_some(),
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/lib/go-compile")),
             "the edited dependency should rebuild"
         );
         assert!(
             rebuild
-                .written_file("/workspace/.target/app/compile/go-compile/state.bin")
-                .is_some(),
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/app/go-compile")),
             "the dependent should rebuild via the edge even though its own source is unchanged"
         );
     }
 
     #[test]
     fn an_unchanged_multi_module_tree_rebuilds_nothing() {
-        let seed: DummyRuntime = multi_module_workspace().build();
+        let seed: DummyRuntime = go_workspace()
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
         Lifecycle::new()
             .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
             .unwrap();
-        // Replay with every module's state seeded and nothing changed: no task re-runs, so none
-        // re-persists state, and a build that ran no tasks prints nothing.
-        let replay: DummyRuntime = replay_with_state(multi_module_workspace(), &seed).build();
+        // Replay with the module's run record seeded and nothing changed: no task re-runs, so none
+        // re-persists a record, and a build that ran no tasks prints nothing.
+        let replay: DummyRuntime = replay_with_state(
+            go_workspace()
+                .command("gofmt -l .", succeeded())
+                .command("go build", succeeded()),
+            &seed,
+        )
+        .build();
         Lifecycle::new()
             .run_compile(&Workspace::locate(&replay).unwrap(), &config, &replay)
             .unwrap();
         assert!(
-            replay
-                .written_file("/workspace/.target/lib/compile/go-compile/state.bin")
-                .is_none(),
-            "an unchanged dependency should not rebuild"
-        );
-        assert!(
-            replay
-                .written_file("/workspace/.target/app/compile/go-compile/state.bin")
-                .is_none(),
-            "an unchanged dependent should not rebuild"
-        );
-        assert!(
             replay.captured_output().is_empty(),
-            "an unchanged multi-module tree should be silent; got: {:?}",
+            "an unchanged tree should be silent; got: {:?}",
             replay.captured_output().as_str()
         );
     }
@@ -581,8 +586,8 @@ mod tests {
             output.as_str(),
         );
         assert!(
-            output.as_str().contains("go build"),
-            "expected the go build task in the output, got:\n{}",
+            output.as_str().contains("go-compile"),
+            "expected the go-compile task in the output, got:\n{}",
             output.as_str(),
         );
     }

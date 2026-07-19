@@ -30,7 +30,9 @@ the tool — including its embedded `*.ncl` contracts.
 
 `compile` runs the `format` step (`gofmt`) and then the `compile` step
 (`go build`). The built binary lands under
-`.target/default/compile/go-compile/output/`.
+`.target/go-compile/<binding-hash>/` — the hash names this particular build's
+parameter binding, so different bindings of the same task can one day coexist
+side by side without overwriting each other.
 
 ### Incremental correctness
 
@@ -67,6 +69,10 @@ never touches the source tree:
 just compile multi-module           # builds lib/greeting, then app
 cat multi-module/.target/go.work    # generated: a `use` entry per module
 ```
+
+> **Known gap:** `go.work` is generated, but nothing points `go` at it via `GOWORK`
+> yet, so `just compile multi-module` currently fails to resolve the sibling import.
+> Wiring the generated file back into the build as a tracked input is in progress.
 
 `just clean-all` removes every example's build output (`just clean <example>` for
 one). The `.target/` build directory each run produces — including the generated

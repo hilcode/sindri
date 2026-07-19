@@ -154,11 +154,51 @@ mod tests {
     use nickel_lang::Record;
     use std::path::PathBuf;
 
+    const CONTRACT: Contract = Contract::new("{ name | String }", r#"{ name = "demo" }"#);
+
     fn config_file() -> ConfigFile {
         ConfigFile::new(
             AbsoluteFile::new(PathBuf::from("/file.ncl")),
             RelativeFile::new("file.ncl"),
         )
+    }
+
+    #[test]
+    fn contract_exposes_its_definition_and_minimal_example() {
+        assert_eq!(CONTRACT.definition(), "{ name | String }");
+        assert_eq!(CONTRACT.minimal_example(), r#"{ name = "demo" }"#);
+    }
+
+    #[test]
+    fn evaluate_with_contract_missing_path() {
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let result: SindriResult<Expr> = Nickel::evaluate_with_contract(&config_file(), &CONTRACT, &runtime);
+        assert!(matches!(result, Err(SindriError::Io { .. })));
+    }
+
+    #[test]
+    fn evaluate_with_contract_empty_file() {
+        let runtime: DummyRuntime = DummyRuntime::builder().file("/file.ncl", "  \n  ").build();
+        let result: SindriResult<Expr> = Nickel::evaluate_with_contract(&config_file(), &CONTRACT, &runtime);
+        assert!(matches!(result, Err(SindriError::Schema { .. })));
+    }
+
+    #[test]
+    fn evaluate_with_contract_syntax_error() {
+        let runtime: DummyRuntime = DummyRuntime::builder().file("/file.ncl", "{ name = }").build();
+        let result: SindriResult<Expr> = Nickel::evaluate_with_contract(&config_file(), &CONTRACT, &runtime);
+        assert!(matches!(result, Err(SindriError::NickelEval { .. })));
+    }
+
+    #[test]
+    fn evaluate_with_contract_passes_a_conforming_source() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/file.ncl", r#"{ name = "demo" }"#)
+            .build();
+        let expression: Expr = Nickel::evaluate_with_contract(&config_file(), &CONTRACT, &runtime).unwrap();
+        let record: Record = expression.as_record().expect("expected a record");
+        let name: Expr = record.value_by_name("name").expect("missing field 'name'");
+        assert_eq!(name.as_str().expect("expected a string"), "demo");
     }
 
     #[test]

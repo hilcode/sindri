@@ -1,7 +1,6 @@
 use crate::parameter::ParameterName;
 use crate::parameter::PluginName;
-use crate::plugin::TaskName;
-use crate::types::Command;
+use crate::task::TaskName;
 use crate::types::ModuleCycle;
 use crate::types::ModuleIdentity;
 use miette::Diagnostic;
@@ -80,7 +79,7 @@ pub enum SindriError {
     #[diagnostic(help("check the command output above for details"), code(sindri::task::failed))]
     TaskFailed {
         task_name: TaskName,
-        command: Command,
+        command: String,
         output: String,
     },
 
@@ -174,7 +173,7 @@ mod tests {
         });
         assert_has_help_and_code(&SindriError::TaskFailed {
             task_name: TaskName::new("go-compile"),
-            command: Command::new("go", ["build", "./..."]),
+            command: "go build".into(),
             output: "error: undefined".into(),
         });
         assert_has_help_and_code(&SindriError::ScriptEvaluation {

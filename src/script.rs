@@ -120,6 +120,10 @@ impl Script {
         Script::new(include_str!("scripts/go-compile.ncl"))
     }
 
+    pub fn go_compile_executable() -> Script {
+        Script::new(include_str!("scripts/go-compile-executable.ncl"))
+    }
+
     pub fn go_test() -> Script {
         Script::new(include_str!("scripts/go-test.ncl"))
     }
@@ -367,6 +371,7 @@ mod tests {
         for (script, program, first_argument) in [
             (Script::go_format(), "gofmt", "-l"),
             (Script::go_compile(), "go", "build"),
+            (Script::go_compile_executable(), "go", "build"),
             (Script::go_test(), "go", "test"),
         ] {
             let parameters: ParameterBinding = ParameterBinding::empty();
@@ -387,5 +392,34 @@ mod tests {
             assert_eq!(commands[0].program(), program);
             assert_eq!(commands[0].arguments()[0], SmolStr::new(first_argument));
         }
+    }
+
+    #[test]
+    fn go_compile_executable_writes_its_binary_to_the_output_directory() {
+        let parameters: ParameterBinding = ParameterBinding::empty();
+        let input_files: FileSet = file_set(&[]);
+        let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
+        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &parameters,
+            &input_files,
+            &output_directory,
+            &workspace_root,
+            &module_directory,
+        );
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let commands: Vec<Command> = Script::go_compile_executable()
+            .evaluate(&inputs, &script_path(), &runtime)
+            .unwrap();
+        assert_eq!(
+            commands[0].arguments(),
+            &[
+                SmolStr::new("build"),
+                SmolStr::new("-o"),
+                SmolStr::new("/workspace/.target/out/"),
+                SmolStr::new("./...")
+            ]
+        );
     }
 }

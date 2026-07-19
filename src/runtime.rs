@@ -1,6 +1,5 @@
 use crate::file_set::CompiledFileSetPattern;
 use crate::file_set::FileSetPattern;
-use crate::glob::GlobPatterns;
 use crate::local_time_with_elapsed::LocalTimeWithElapsed;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
@@ -11,8 +10,6 @@ use crate::types::FileKind;
 use crate::types::FileMetadata;
 use ignore::DirEntry as WalkEntry;
 use ignore::WalkBuilder;
-use ignore::overrides::Override;
-use ignore::overrides::OverrideBuilder;
 use std::env::current_dir;
 use std::fs::DirEntry as DirectoryEntry;
 use std::fs::File;
@@ -54,10 +51,6 @@ pub trait FileSystem {
     /// hashing layer, which needs the bytes exactly as stored.
     fn read(&self, path: &Path) -> IoResult<Vec<u8>>;
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>>;
-    /// Every regular file beneath `base` that the glob patterns select, as absolute paths. Drives a
-    /// recursive walk that prunes excluded subtrees as it descends, so unrelated trees are never
-    /// entered. Used to expand a task's input and output globs for incremental hashing.
-    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>>;
     /// Every regular file beneath `base` selected by the ordered include globs of `pattern`, as
     /// absolute paths. Drives a recursive walk that classifies each file it finds.
     fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>>;
@@ -110,32 +103,13 @@ impl FileSystem for SystemFileSystem {
         Ok(entries)
     }
 
-    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
-        // Includes become whitelist globs and excludes become negated globs; the `ignore` walker
-        // then yields only whitelisted files and prunes excluded directory subtrees as it descends.
-        let mut override_builder: OverrideBuilder = OverrideBuilder::new(base);
-        for include in patterns.includes() {
-            override_builder.add(include.as_str()).map_err(IoError::other)?;
-        }
-        for exclude in patterns.excludes() {
-            override_builder
-                .add(&format!("!{}", exclude.as_str()))
-                .map_err(IoError::other)?;
-        }
-        let overrides: Override = override_builder.build().map_err(IoError::other)?;
-        let mut walker: WalkBuilder = WalkBuilder::new(base);
-        walker.standard_filters(false).follow_links(false).overrides(overrides);
-        let mut files: Vec<PathBuf> = Vec::new();
-        for entry in walker.build() {
-            let entry: WalkEntry = entry.map_err(IoError::other)?;
-            if entry.file_type().is_some_and(|file_type| file_type.is_file()) {
-                files.push(entry.into_path());
-            }
-        }
-        Ok(files)
-    }
-
     fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
+        // A task's output directory does not exist yet before its first successful run, and a
+        // resolved FileSet is queried against it regardless (to judge dirtiness before running, and
+        // to hash a fresh output afterwards) — a missing base is an empty set, not a walk error.
+        if self.file_kind(base)?.is_none() {
+            return Ok(Vec::new());
+        }
         let compiled: CompiledFileSetPattern = pattern.compile().map_err(IoError::other)?;
         let mut walker: WalkBuilder = WalkBuilder::new(base);
         walker.standard_filters(false).follow_links(false);
@@ -223,10 +197,6 @@ impl FileSystem for SystemRuntime {
         self.file_system.read_directory(path)
     }
 
-    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
-        self.file_system.matching_files(base, patterns)
-    }
-
     fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
         self.file_system.matching_file_set(base, pattern)
     }
@@ -287,8 +257,6 @@ impl Runtime for SystemRuntime {
     }
 }
 
-#[cfg(test)]
-use crate::glob::CompiledGlobs;
 #[cfg(test)]
 use crate::types::Stdout;
 #[cfg(test)]
@@ -373,6 +341,8 @@ pub struct DummyRuntime {
     symlinks: HashSet<PathBuf>,
     commands: HashMap<CommandPrefix, CommandStub>,
     current_directory: PathBuf,
+    current_directory_error: Option<ErrorKind>,
+    errors: HashMap<PathBuf, ErrorKind>,
     now: Instant,
     writes: Mutex<HashMap<PathBuf, Vec<u8>>>,
     created_directories: Mutex<HashSet<PathBuf>>,
@@ -447,7 +417,10 @@ impl DummyRuntime {
 #[cfg(test)]
 impl FileSystem for DummyRuntime {
     fn current_directory(&self) -> IoResult<PathBuf> {
-        Ok(self.current_directory.clone())
+        match self.current_directory_error {
+            Some(kind) => Err(IoError::new(kind, "simulated current-directory failure")),
+            None => Ok(self.current_directory.clone()),
+        }
     }
 
     fn read_to_string(&self, path: &Path) -> IoResult<String> {
@@ -474,6 +447,12 @@ impl FileSystem for DummyRuntime {
     }
 
     fn read_directory(&self, path: &Path) -> IoResult<Vec<DirEntry>> {
+        if let Some(kind) = self.errors.get(path) {
+            return Err(IoError::new(
+                *kind,
+                format!("simulated failure reading {}", path.display()),
+            ));
+        }
         if self.kind_of(path) != Some(FileKind::Directory) {
             return Err(IoError::new(
                 ErrorKind::NotFound,
@@ -502,20 +481,6 @@ impl FileSystem for DummyRuntime {
         Ok(entries)
     }
 
-    fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>> {
-        // No real tree to walk: match the registered files directly against the compiled patterns.
-        let compiled: CompiledGlobs = patterns.compiled().map_err(IoError::other)?;
-        let mut files: Vec<PathBuf> = Vec::new();
-        for path in self.files.keys() {
-            if let Ok(relative) = path.strip_prefix(base) {
-                if compiled.is_match(relative) {
-                    files.push(path.clone());
-                }
-            }
-        }
-        Ok(files)
-    }
-
     fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>> {
         // The dummy holds its files in a flat in-memory map with no on-disk directory tree, so there
         // is nothing to walk: iterate every registered file under `base` and classify it directly.
@@ -532,7 +497,13 @@ impl FileSystem for DummyRuntime {
     }
 
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
-        Ok(self.kind_of(path))
+        match self.errors.get(path) {
+            Some(kind) => Err(IoError::new(
+                *kind,
+                format!("simulated failure reading {}", path.display()),
+            )),
+            None => Ok(self.kind_of(path)),
+        }
     }
 
     fn file_metadata(&self, path: &Path) -> IoResult<FileMetadata> {
@@ -607,6 +578,8 @@ pub struct DummyRuntimeBuilder {
     symlinks: HashSet<PathBuf>,
     commands: HashMap<CommandPrefix, CommandStub>,
     current_directory: PathBuf,
+    current_directory_error: Option<ErrorKind>,
+    errors: HashMap<PathBuf, ErrorKind>,
     now: Instant,
     /// The modification time the next plain [`file`](DummyRuntimeBuilder::file) call assigns,
     /// advanced by one second each time — so files registered in separate calls get distinct,
@@ -623,6 +596,8 @@ impl DummyRuntimeBuilder {
             symlinks: HashSet::new(),
             commands: HashMap::new(),
             current_directory: PathBuf::from("/"),
+            current_directory_error: None,
+            errors: HashMap::new(),
             now: Instant::now(),
             next_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         }
@@ -697,8 +672,17 @@ impl DummyRuntimeBuilder {
         self
     }
 
-    pub fn now(mut self, now: Instant) -> DummyRuntimeBuilder {
-        self.now = now;
+    /// Make [`FileSystem::current_directory`] fail with `kind` instead of returning the configured
+    /// current directory.
+    pub fn current_directory_error(mut self, kind: ErrorKind) -> DummyRuntimeBuilder {
+        self.current_directory_error = Some(kind);
+        self
+    }
+
+    /// Make [`FileSystem::file_kind`] and [`FileSystem::read_directory`] fail with `kind` when called
+    /// on `path`, instead of consulting the registered files/directories/symlinks.
+    pub fn error(mut self, path: impl AsRef<Path>, kind: ErrorKind) -> DummyRuntimeBuilder {
+        self.errors.insert(path.as_ref().to_path_buf(), kind);
         self
     }
 
@@ -709,6 +693,8 @@ impl DummyRuntimeBuilder {
             symlinks: self.symlinks,
             commands: self.commands,
             current_directory: self.current_directory,
+            current_directory_error: self.current_directory_error,
+            errors: self.errors,
             now: self.now,
             writes: Mutex::new(HashMap::new()),
             created_directories: Mutex::new(HashSet::new()),
@@ -838,5 +824,36 @@ mod tests {
     fn current_directory_returns_the_configured_path() {
         let runtime: DummyRuntime = DummyRuntime::builder().current_directory("/workspace/source").build();
         assert_eq!(runtime.current_directory().unwrap(), PathBuf::from("/workspace/source"));
+    }
+
+    #[test]
+    fn current_directory_error_overrides_the_configured_path() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .current_directory_error(ErrorKind::PermissionDenied)
+            .build();
+        assert_eq!(
+            runtime.current_directory().unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn error_makes_file_kind_and_read_directory_fail_for_that_path() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .directory("/workspace")
+            .error("/workspace/sindri.build", ErrorKind::PermissionDenied)
+            .error("/workspace", ErrorKind::PermissionDenied)
+            .build();
+        assert_eq!(
+            runtime
+                .file_kind(Path::new("/workspace/sindri.build"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            runtime.read_directory(Path::new("/workspace")).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 }

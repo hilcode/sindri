@@ -298,6 +298,7 @@ mod tests {
     use crate::runtime::DummyRuntimeBuilder;
     use crate::types::WorkingDirectory;
     use crate::workspace::WorkspaceConfig;
+    use std::io::ErrorKind;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -368,6 +369,34 @@ mod tests {
         let workspace: Workspace = make_workspace(&runtime, "");
         let error: SindriError = BuildFile::find(&workspace, &runtime).unwrap_err();
         assert!(matches!(error, SindriError::SymlinkNotSupported { .. }));
+    }
+
+    #[test]
+    fn find_build_file_rejects_qualified_build_file_symlink() {
+        let runtime: DummyRuntime = workspace_runtime().symlink("/workspace/sindri-kotlin.build").build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let error: SindriError = BuildFile::find(&workspace, &runtime).unwrap_err();
+        assert!(matches!(error, SindriError::SymlinkNotSupported { .. }));
+    }
+
+    #[test]
+    fn find_build_file_reports_io_errors_from_file_kind() {
+        let runtime: DummyRuntime = workspace_runtime()
+            .error("/workspace/sindri.build", ErrorKind::PermissionDenied)
+            .build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let error: SindriError = BuildFile::find(&workspace, &runtime).unwrap_err();
+        assert!(matches!(error, SindriError::Io { .. }));
+    }
+
+    #[test]
+    fn find_build_file_reports_io_errors_from_read_directory() {
+        let runtime: DummyRuntime = workspace_runtime()
+            .error("/workspace", ErrorKind::PermissionDenied)
+            .build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let error: SindriError = BuildFile::find(&workspace, &runtime).unwrap_err();
+        assert!(matches!(error, SindriError::Io { .. }));
     }
 
     #[test]
@@ -534,5 +563,25 @@ mod tests {
     fn dependency_rejects_setting_both_module_and_artifact() {
         let both: &str = r#"{ "module": "//libs/common", "artifact": "example-org:some-lib" }"#;
         assert!(serde_json::from_str::<Dependency>(both).is_err());
+    }
+
+    #[test]
+    fn dependency_rejects_setting_neither_module_nor_artifact() {
+        let neither: &str = r#"{}"#;
+        assert!(serde_json::from_str::<Dependency>(neither).is_err());
+    }
+
+    #[test]
+    fn artifact_type_name_reports_the_wire_name_for_every_kind() {
+        assert_eq!(ArtifactType::Library.name(), "library");
+        assert_eq!(ArtifactType::Executable.name(), "executable");
+        assert_eq!(ArtifactType::WebArchive.name(), "web-archive");
+        assert_eq!(ArtifactType::ContainerImage.name(), "container-image");
+    }
+
+    #[test]
+    fn artifact_dependency_has_no_module_identity() {
+        let artifact: Dependency = Dependency::Artifact(ArtifactIdentity(SmolStr::new("example-org:some-lib")));
+        assert_eq!(artifact.module_identity(), None);
     }
 }
