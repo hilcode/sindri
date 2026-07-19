@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -194,6 +195,29 @@ impl DirEntry {
 
     pub fn kind(&self) -> FileKind {
         self.kind
+    }
+}
+
+/// A file's cheaply obtained metadata — its size and modification time, from a `stat`-equivalent
+/// call rather than a read of its content. Cheap enough to check before falling back to a full
+/// content hash when deciding whether a file might have changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileMetadata {
+    size: u64,
+    modified: SystemTime,
+}
+
+impl FileMetadata {
+    pub fn new(size: u64, modified: SystemTime) -> FileMetadata {
+        FileMetadata { size, modified }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn modified(&self) -> SystemTime {
+        self.modified
     }
 }
 
@@ -445,7 +469,8 @@ impl<'deserialize> Deserialize<'deserialize> for Language {
 /// half of the path type-system: resolve it against an absolute base with
 /// [`AbsoluteDirectory::join_file`] to obtain an [`AbsoluteFile`]. A `PathBuf` only becomes a
 /// `RelativeFile` here, at the edge, so everything downstream is typed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RelativeFile(PathBuf);
 
 impl RelativeFile {

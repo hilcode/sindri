@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod dirtiness;
 pub mod error;
 pub mod executor;
 pub mod file_set;
@@ -7,6 +8,7 @@ pub mod go_work;
 pub mod hash;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;
+pub mod metadata_cache;
 pub mod module;
 pub mod module_graph;
 pub mod nickel_eval;

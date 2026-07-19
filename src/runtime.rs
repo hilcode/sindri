@@ -8,6 +8,7 @@ use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::DirEntry;
 use crate::types::FileKind;
+use crate::types::FileMetadata;
 use ignore::DirEntry as WalkEntry;
 use ignore::WalkBuilder;
 use ignore::overrides::Override;
@@ -15,8 +16,10 @@ use ignore::overrides::OverrideBuilder;
 use std::env::current_dir;
 use std::fs::DirEntry as DirectoryEntry;
 use std::fs::File;
+use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::fs::create_dir_all;
+use std::fs::metadata;
 use std::fs::read;
 use std::fs::read_dir;
 use std::fs::read_to_string;
@@ -36,6 +39,11 @@ use std::sync::MutexGuard;
 use std::time::Instant;
 use time::UtcOffset;
 
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::SystemTime;
+
 /// Read/write access to the filesystem. This is the only capability the bootstrap phase needs:
 /// the workspace is located and its configuration read before any [`Runtime`] exists, because the
 /// log destination — and thus the runtime — is not known until then.
@@ -51,10 +59,10 @@ pub trait FileSystem {
     /// entered. Used to expand a task's input and output globs for incremental hashing.
     fn matching_files(&self, base: &Path, patterns: &GlobPatterns) -> IoResult<Vec<PathBuf>>;
     /// Every regular file beneath `base` selected by the ordered include globs of `pattern`, as
-    /// absolute paths. Drives a recursive walk that classifies each file it finds; used to resolve a
-    /// task's input and output [`FileSetPattern`](crate::file_set::FileSetPattern)s.
+    /// absolute paths. Drives a recursive walk that classifies each file it finds.
     fn matching_file_set(&self, base: &Path, pattern: &FileSetPattern) -> IoResult<Vec<PathBuf>>;
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>>;
+    fn file_metadata(&self, path: &Path) -> IoResult<FileMetadata>;
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()>;
     fn create_directories(&self, path: &Path) -> IoResult<()>;
 }
@@ -152,6 +160,11 @@ impl FileSystem for SystemFileSystem {
         }
     }
 
+    fn file_metadata(&self, path: &Path) -> IoResult<FileMetadata> {
+        let file_metadata: Metadata = metadata(path)?;
+        Ok(FileMetadata::new(file_metadata.len(), file_metadata.modified()?))
+    }
+
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()> {
         write(path, contents)
     }
@@ -220,6 +233,10 @@ impl FileSystem for SystemRuntime {
 
     fn file_kind(&self, path: &Path) -> IoResult<Option<FileKind>> {
         self.file_system.file_kind(path)
+    }
+
+    fn file_metadata(&self, path: &Path) -> IoResult<FileMetadata> {
+        self.file_system.file_metadata(path)
     }
 
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()> {
@@ -338,12 +355,20 @@ enum CommandStub {
     Handler(Box<dyn Fn() -> CommandOutput + Send + Sync>),
 }
 
+/// A registered file's content and modification time, standing in for what a real filesystem's
+/// `stat`/read calls would report.
+#[cfg(test)]
+struct StoredFile {
+    contents: Vec<u8>,
+    modified: SystemTime,
+}
+
 /// An in-memory [`Runtime`] for hermetic tests. Build one with [`DummyRuntime::builder`],
 /// registering the files, directories, symlinks and canned command outputs a test needs. It also
 /// implements [`FileSystem`] and [`Bootstrap`], so it can stand in anywhere from bootstrap onward.
 #[cfg(test)]
 pub struct DummyRuntime {
-    files: HashMap<PathBuf, Vec<u8>>,
+    files: HashMap<PathBuf, StoredFile>,
     directories: HashSet<PathBuf>,
     symlinks: HashSet<PathBuf>,
     commands: HashMap<CommandPrefix, CommandStub>,
@@ -353,6 +378,7 @@ pub struct DummyRuntime {
     created_directories: Mutex<HashSet<PathBuf>>,
     logs: Mutex<Vec<String>>,
     output: Mutex<Stdout>,
+    reads: Mutex<Vec<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -377,6 +403,17 @@ impl DummyRuntime {
             .iter()
             .map(|(path, contents): (&PathBuf, &Vec<u8>)| -> (PathBuf, Vec<u8>) { (path.clone(), contents.clone()) })
             .collect()
+    }
+
+    /// How many times [`FileSystem::read`] was called for `path`. Lets a test prove a caching layer
+    /// actually avoids redundant reads, rather than merely returning the right answer.
+    pub fn read_count(&self, path: impl AsRef<Path>) -> usize {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|read: &&PathBuf| -> bool { read.as_path() == path.as_ref() })
+            .count()
     }
 
     /// Whether [`FileSystem::create_directories`] was called for `path`.
@@ -415,8 +452,8 @@ impl FileSystem for DummyRuntime {
 
     fn read_to_string(&self, path: &Path) -> IoResult<String> {
         match self.files.get(path) {
-            Some(contents) => {
-                String::from_utf8(contents.clone()).map_err(|error| IoError::new(ErrorKind::InvalidData, error))
+            Some(file) => {
+                String::from_utf8(file.contents.clone()).map_err(|error| IoError::new(ErrorKind::InvalidData, error))
             }
             None => Err(IoError::new(
                 ErrorKind::NotFound,
@@ -426,8 +463,9 @@ impl FileSystem for DummyRuntime {
     }
 
     fn read(&self, path: &Path) -> IoResult<Vec<u8>> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
         match self.files.get(path) {
-            Some(contents) => Ok(contents.clone()),
+            Some(file) => Ok(file.contents.clone()),
             None => Err(IoError::new(
                 ErrorKind::NotFound,
                 format!("no such file: {}", path.display()),
@@ -497,6 +535,16 @@ impl FileSystem for DummyRuntime {
         Ok(self.kind_of(path))
     }
 
+    fn file_metadata(&self, path: &Path) -> IoResult<FileMetadata> {
+        match self.files.get(path) {
+            Some(file) => Ok(FileMetadata::new(file.contents.len() as u64, file.modified)),
+            None => Err(IoError::new(
+                ErrorKind::NotFound,
+                format!("no such file: {}", path.display()),
+            )),
+        }
+    }
+
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()> {
         self.writes
             .lock()
@@ -554,12 +602,16 @@ impl Bootstrap for DummyRuntime {
 
 #[cfg(test)]
 pub struct DummyRuntimeBuilder {
-    files: HashMap<PathBuf, Vec<u8>>,
+    files: HashMap<PathBuf, StoredFile>,
     directories: HashSet<PathBuf>,
     symlinks: HashSet<PathBuf>,
     commands: HashMap<CommandPrefix, CommandStub>,
     current_directory: PathBuf,
     now: Instant,
+    /// The modification time the next plain [`file`](DummyRuntimeBuilder::file) call assigns,
+    /// advanced by one second each time — so files registered in separate calls get distinct,
+    /// deterministic timestamps without a test having to name one explicitly.
+    next_modified: SystemTime,
 }
 
 #[cfg(test)]
@@ -572,14 +624,37 @@ impl DummyRuntimeBuilder {
             commands: HashMap::new(),
             current_directory: PathBuf::from("/"),
             now: Instant::now(),
+            next_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         }
     }
 
-    /// Register a file with the given contents. Ancestor directories are created automatically.
+    /// Register a file with the given contents, modified at an unspecified but deterministic time
+    /// distinct from every other file registered this way. Ancestor directories are created
+    /// automatically.
     pub fn file(mut self, path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> DummyRuntimeBuilder {
+        let modified: SystemTime = self.next_modified;
+        self.next_modified += Duration::from_secs(1);
+        self.file_modified_at(path, contents, modified)
+    }
+
+    /// Register a file with the given contents and an explicit modification time — for a test that
+    /// needs precise control over whether two files' (or two versions of one file's) timestamps are
+    /// equal or distinct, rather than the arbitrary but deterministic time [`file`](Self::file) picks.
+    pub fn file_modified_at(
+        mut self,
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+        modified: SystemTime,
+    ) -> DummyRuntimeBuilder {
         let path: PathBuf = path.as_ref().to_path_buf();
         self.register_ancestors(&path);
-        self.files.insert(path, contents.as_ref().to_vec());
+        self.files.insert(
+            path,
+            StoredFile {
+                contents: contents.as_ref().to_vec(),
+                modified,
+            },
+        );
         self
     }
 
@@ -639,6 +714,7 @@ impl DummyRuntimeBuilder {
             created_directories: Mutex::new(HashSet::new()),
             logs: Mutex::new(Vec::new()),
             output: Mutex::new(Stdout::default()),
+            reads: Mutex::new(Vec::new()),
         }
     }
 

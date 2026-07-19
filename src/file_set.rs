@@ -136,30 +136,21 @@ impl FileSet {
     pub fn len(&self) -> usize {
         self.files.len()
     }
-
-    /// A digest over each member file's raw content, read via `file_system` (relative to
-    /// `workspace_root`) and folded in path order — the signal for whether a tracked file changed,
-    /// appeared, or disappeared.
-    pub fn content_hash(&self, workspace_root: &WorkspaceRoot, file_system: &impl FileSystem) -> IoResult<ContentHash> {
-        let mut hasher: Hasher = Hasher::new();
-        for file in &self.files {
-            let absolute: AbsoluteFile = workspace_root.to_absolute_directory().join_file(file);
-            let content: Vec<u8> = file_system.read(absolute.as_ref())?;
-            hasher.update(file.as_ref().to_string_lossy().as_bytes());
-            hasher.update(&FIELD_SEPARATOR);
-            hasher.update(&content);
-            hasher.update(&FIELD_SEPARATOR);
-        }
-        Ok(ContentHash(*hasher.finalize().as_bytes()))
-    }
 }
 
 /// A blake3 digest of a resolved [`FileSet`]'s file contents, read byte-for-byte with no
 /// normalization and folded in path order so the digest does not depend on resolution order.
 /// Distinct from the other hash newtypes so a content digest can never be compared against a
 /// pattern or binding digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ContentHash([u8; 32]);
+
+impl ContentHash {
+    pub(crate) fn new(bytes: [u8; 32]) -> ContentHash {
+        ContentHash(bytes)
+    }
+}
 
 /// Sort `files` and drop adjacent duplicates, giving the deterministic order every [`FileSet`] is
 /// held in regardless of how its members were discovered or combined.
@@ -303,63 +294,6 @@ mod tests {
             union,
             BTreeSet::from(["a.go".to_string(), "b.go".to_string(), "go.work".to_string()])
         );
-    }
-
-    #[test]
-    fn content_hash_reproduces_for_the_same_file_set() {
-        let runtime: DummyRuntime = DummyRuntime::builder()
-            .file("/workspace/a.go", "alpha")
-            .file("/workspace/b.go", "beta")
-            .build();
-        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
-        let file_set: FileSet = FileSet::resolve(
-            &FileSetPattern::new(["**/*.go"]),
-            &root.to_absolute_directory(),
-            &root,
-            &runtime,
-        )
-        .unwrap();
-        let first: ContentHash = file_set.content_hash(&root, &runtime).unwrap();
-        let second: ContentHash = file_set.content_hash(&root, &runtime).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn content_hash_changes_when_a_tracked_files_content_changes() {
-        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
-        let hash_with = |content: &str| -> ContentHash {
-            let runtime: DummyRuntime = DummyRuntime::builder().file("/workspace/a.go", content).build();
-            let file_set: FileSet = FileSet::resolve(
-                &FileSetPattern::new(["**/*.go"]),
-                &root.to_absolute_directory(),
-                &root,
-                &runtime,
-            )
-            .unwrap();
-            file_set.content_hash(&root, &runtime).unwrap()
-        };
-        assert_ne!(hash_with("alpha"), hash_with("alpha!"));
-    }
-
-    #[test]
-    fn content_hash_changes_when_a_file_is_added_or_removed() {
-        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
-        let runtime_before: DummyRuntime = DummyRuntime::builder().file("/workspace/a.go", "alpha").build();
-        let runtime_after: DummyRuntime = DummyRuntime::builder()
-            .file("/workspace/a.go", "alpha")
-            .file("/workspace/b.go", "beta")
-            .build();
-        let hash_of = |runtime: &DummyRuntime| -> ContentHash {
-            let file_set: FileSet = FileSet::resolve(
-                &FileSetPattern::new(["**/*.go"]),
-                &root.to_absolute_directory(),
-                &root,
-                runtime,
-            )
-            .unwrap();
-            file_set.content_hash(&root, runtime).unwrap()
-        };
-        assert_ne!(hash_of(&runtime_before), hash_of(&runtime_after));
     }
 
     #[test]

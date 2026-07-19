@@ -17,6 +17,8 @@ use crate::types::RelativeDirectory;
 use crate::types::RelativeFile;
 use crate::types::WorkspaceRoot;
 use blake3::Hasher;
+use serde::Deserialize;
+use serde::Serialize;
 use smol_str::SmolStr;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -269,7 +271,8 @@ impl Task {
 /// contents or the chosen parameter values: its name, its script's transitive Nickel source, its
 /// input and output pattern hashes, its declared parameters, and a `(Sindri version, Nickel
 /// version)` salt. When it changes, the task is stale by definition and must run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct DefinitionHash([u8; 32]);
 
 fn update_field(hasher: &mut Hasher, field: &str) {
@@ -278,8 +281,8 @@ fn update_field(hasher: &mut Hasher, field: &str) {
 }
 
 /// Resolve `pattern` against `base`, converting the low-level filesystem error into a
-/// [`SindriError`] so [`Task::resolve`] returns one uniform error type.
-fn resolve_file_set(
+/// [`SindriError`] so callers return one uniform error type.
+pub(crate) fn resolve_file_set(
     pattern: &FileSetPattern,
     base: &AbsoluteDirectory,
     root: &WorkspaceRoot,
@@ -370,6 +373,27 @@ mod tests {
     }
 
     #[test]
+    fn resolution_surfaces_an_invalid_managed_pattern_as_an_io_error() {
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let task: Task = Task::new(
+            TaskName::new("go-compile"),
+            Script::new("fun inputs => [ { program = \"go\" } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(["["])),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        );
+        let result: SindriResult<Vec<Command>> = task.resolve(
+            &ParameterValues::default(),
+            &module_directory(),
+            &output_directory(),
+            &workspace_root(),
+            &runtime,
+        );
+        assert!(matches!(result, Err(SindriError::Io { .. })));
+    }
+
+    #[test]
     fn a_file_matched_only_by_the_managed_pattern_is_in_the_effective_input() {
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(format!("{WORKSPACE}/{MODULE}/main.go"), "")
@@ -403,7 +427,9 @@ mod tests {
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let task: Task = Task::new(
             TaskName::new("go-compile"),
-            Script::new("fun inputs => [ { program = \"go\", arguments = [ \"build\", inputs.params.\"sindri-go\".mode ] } ]"),
+            Script::new(
+                "fun inputs => [ { program = \"go\", arguments = [ \"build\", inputs.params.\"sindri-go\".mode ] } ]",
+            ),
             DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"])),
             ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
             TaskOutput::new(FileSetPattern::new(["**/*"])),
@@ -557,7 +583,9 @@ mod tests {
         // `go_compile_task`'s import-based one.
         let task: Task = Task::new(
             TaskName::new("go-compile"),
-            Script::new("fun inputs => [ { program = \"go\", arguments = [ \"build\", inputs.params.\"sindri-go\".mode ] } ]"),
+            Script::new(
+                "fun inputs => [ { program = \"go\", arguments = [ \"build\", inputs.params.\"sindri-go\".mode ] } ]",
+            ),
             DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"])),
             ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
             TaskOutput::new(FileSetPattern::new(["**/*"])),

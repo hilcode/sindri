@@ -174,6 +174,12 @@ impl ParameterValues {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BindingHash([u8; 32]);
 
+impl BindingHash {
+    pub fn to_hex(&self) -> String {
+        blake3::Hash::from(self.0).to_hex().to_string()
+    }
+}
+
 /// The resolved values for every parameter a task's `Script` requires, checked against its
 /// [`ParameterDeclarations`] before the script is ever evaluated: [`ParameterBinding::resolve`]
 /// guarantees a value exists for each declared parameter and that the value satisfies the
@@ -240,10 +246,11 @@ impl ParameterBinding {
     pub fn to_nickel_record(&self) -> String {
         let mut by_plugin: BTreeMap<&PluginName, Vec<String>> = BTreeMap::new();
         for ((plugin, name), value) in &self.values {
-            by_plugin
-                .entry(plugin)
-                .or_default()
-                .push(format!("{} = {}", Nickel::string_literal(&name.to_string()), value.source()));
+            by_plugin.entry(plugin).or_default().push(format!(
+                "{} = {}",
+                Nickel::string_literal(&name.to_string()),
+                value.source()
+            ));
         }
         let plugins: Vec<String> = by_plugin
             .into_iter()
@@ -340,12 +347,28 @@ mod tests {
     #[test]
     fn two_plugins_sharing_a_parameter_name_do_not_collide() {
         let declared: ParameterDeclarations = ParameterDeclarations::new([
-            Parameter::new(PluginName::new("plugin-a"), ParameterName::new("mode"), ParameterType::new("String")),
-            Parameter::new(PluginName::new("plugin-b"), ParameterName::new("mode"), ParameterType::new("String")),
+            Parameter::new(
+                PluginName::new("plugin-a"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            ),
+            Parameter::new(
+                PluginName::new("plugin-b"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            ),
         ]);
         let values: ParameterValues = ParameterValues::new([
-            (PluginName::new("plugin-a"), ParameterName::new("mode"), ParameterValue::new(r#""debug""#)),
-            (PluginName::new("plugin-b"), ParameterName::new("mode"), ParameterValue::new(r#""release""#)),
+            (
+                PluginName::new("plugin-a"),
+                ParameterName::new("mode"),
+                ParameterValue::new(r#""debug""#),
+            ),
+            (
+                PluginName::new("plugin-b"),
+                ParameterName::new("mode"),
+                ParameterValue::new(r#""release""#),
+            ),
         ]);
         let binding: ParameterBinding = ParameterBinding::resolve(&declared, &values).unwrap();
         assert_eq!(
