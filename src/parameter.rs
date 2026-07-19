@@ -116,6 +116,14 @@ impl ParameterDeclarations {
     pub fn is_empty(&self) -> bool {
         self.parameters.is_empty()
     }
+
+    /// The declared parameters in `(plugin, name)` order, so a definition hash folded over this
+    /// iterator is stable regardless of the order the parameters were declared in.
+    pub fn iter(&self) -> impl Iterator<Item = (&PluginName, &ParameterName, &ParameterType)> {
+        self.parameters
+            .iter()
+            .map(|((plugin, name), parameter_type)| (plugin, name, parameter_type))
+    }
 }
 
 /// A single parameter's bound value, held as Nickel expression source. It is embedded directly into
@@ -301,6 +309,24 @@ mod tests {
         let result: SindriResult<ParameterBinding> = ParameterBinding::resolve(&declared, &values(r#""turbo""#));
         let error: SindriError = result.unwrap_err();
         assert!(matches!(error, SindriError::ParameterInvalid { .. }));
+    }
+
+    #[test]
+    fn declared_parameters_are_iterated_in_plugin_and_name_order() {
+        let declared: ParameterDeclarations = ParameterDeclarations::new([
+            Parameter::new(
+                PluginName::new("z-plugin"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            ),
+            Parameter::new(
+                PluginName::new("a-plugin"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            ),
+        ]);
+        let plugins: Vec<PluginName> = declared.iter().map(|(plugin, _, _)| plugin.clone()).collect();
+        assert_eq!(plugins, vec![PluginName::new("a-plugin"), PluginName::new("z-plugin")]);
     }
 
     #[test]

@@ -1409,6 +1409,7 @@ dependencies = [
  "ignore",
  "miette",
  "nickel-lang",
+ "nickel-lang-core",
  "rmp-serde",
  "serde",
  "serde_json",

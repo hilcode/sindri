@@ -2,12 +2,15 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::nickel_eval::Nickel;
+use crate::nickel_import::evaluate_hermetically;
 use crate::parameter::ParameterBinding;
+use crate::runtime::FileSystem;
 use crate::types::AbsoluteDirectory;
+use crate::types::AbsoluteFile;
 use crate::types::RelativeDirectory;
 use crate::types::RelativeFile;
 use crate::types::WorkspaceRoot;
-use nickel_lang::Expr;
+use nickel_lang_core::eval::value::NickelValue;
 use serde::Deserialize;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
@@ -130,7 +133,18 @@ impl Script {
     /// module directory as the `working-directory` default), and the list is deserialized. A script
     /// that yields a non-list, a non-record element, or a command missing its `program` fails here as
     /// a build-definition error.
-    pub fn evaluate(&self, inputs: &ScriptInputs) -> SindriResult<Vec<Command>> {
+    ///
+    /// Evaluation is hermetic: the script is addressed as if it lived at `script_path`, so its own
+    /// `import` statements resolve relative to that location, through `file_system` and bounded to
+    /// `inputs`'s workspace root — never the real disk. This is the same mechanism
+    /// `Task::definition_hash` uses to discover a script's transitive source, so a script's imports
+    /// behave identically whether Sindri is hashing it or running it.
+    pub fn evaluate(
+        &self,
+        inputs: &ScriptInputs,
+        script_path: &AbsoluteFile,
+        file_system: &impl FileSystem,
+    ) -> SindriResult<Vec<Command>> {
         let source: String = format!(
             "let Command = ({command_contract}) {module_directory} in\n\
              let script = ({script}) in\n\
@@ -140,9 +154,8 @@ impl Script {
             script = self.source,
             inputs = inputs.to_nickel_record(),
         );
-        let expression: Expr = Nickel::evaluate_source(&source, "task script")
-            .map_err(|nickel_message: String| -> SindriError { SindriError::ScriptEvaluation { nickel_message } })?;
-        expression.to_serde().map_err(|error| -> SindriError {
+        let value: NickelValue = evaluate_hermetically(&source, script_path, inputs.workspace_root, file_system)?;
+        Vec::<Command>::deserialize(value).map_err(|error| -> SindriError {
             SindriError::ScriptEvaluation {
                 nickel_message: error.to_string(),
             }
@@ -183,6 +196,10 @@ mod tests {
         .unwrap()
     }
 
+    fn script_path() -> AbsoluteFile {
+        AbsoluteFile::new(PathBuf::from(format!("{WORKSPACE}/{MODULE}/script.ncl")))
+    }
+
     fn evaluate(script_source: &str, files: &[&str]) -> SindriResult<Vec<Command>> {
         let parameters: ParameterBinding = ParameterBinding::empty();
         let input_files: FileSet = file_set(files);
@@ -196,7 +213,8 @@ mod tests {
             &workspace_root,
             &module_directory,
         );
-        Script::new(script_source).evaluate(&inputs)
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        Script::new(script_source).evaluate(&inputs, &script_path(), &runtime)
     }
 
     #[test]
@@ -258,6 +276,29 @@ mod tests {
     }
 
     #[test]
+    fn a_script_can_import_a_workspace_local_helper() {
+        let parameters: ParameterBinding = ParameterBinding::empty();
+        let input_files: FileSet = file_set(&[]);
+        let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
+        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &parameters,
+            &input_files,
+            &output_directory,
+            &workspace_root,
+            &module_directory,
+        );
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(format!("{WORKSPACE}/{MODULE}/helper.ncl"), "\"go\"")
+            .build();
+        let commands: Vec<Command> = Script::new("fun inputs => [ { program = import \"helper.ncl\" } ]")
+            .evaluate(&inputs, &script_path(), &runtime)
+            .unwrap();
+        assert_eq!(commands[0].program(), "go");
+    }
+
+    #[test]
     fn a_script_can_read_a_bound_parameter() {
         let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
             PluginName::new("plugin"),
@@ -281,9 +322,10 @@ mod tests {
             &workspace_root,
             &module_directory,
         );
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
         let commands: Vec<Command> =
             Script::new("fun inputs => [ { program = \"echo\", arguments = [ inputs.params.\"plugin\".mode ] } ]")
-                .evaluate(&inputs)
+                .evaluate(&inputs, &script_path(), &runtime)
                 .unwrap();
         assert_eq!(commands[0].arguments(), &[SmolStr::new("debug")]);
     }
@@ -312,9 +354,11 @@ mod tests {
             &workspace_root,
             &module_directory,
         );
-        let result: SindriResult<Vec<Command>> =
-            Script::new("fun inputs => [ { program = \"echo\", arguments = [ inputs.params.verbose ] } ]")
-                .evaluate(&inputs);
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let result: SindriResult<Vec<Command>> = Script::new(
+            "fun inputs => [ { program = \"echo\", arguments = [ inputs.params.verbose ] } ]",
+        )
+        .evaluate(&inputs, &script_path(), &runtime);
         assert!(matches!(result, Err(SindriError::ScriptEvaluation { .. })));
     }
 
@@ -337,7 +381,8 @@ mod tests {
                 &workspace_root,
                 &module_directory,
             );
-            let commands: Vec<Command> = script.evaluate(&inputs).unwrap();
+            let runtime: DummyRuntime = DummyRuntime::builder().build();
+            let commands: Vec<Command> = script.evaluate(&inputs, &script_path(), &runtime).unwrap();
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].program(), program);
             assert_eq!(commands[0].arguments()[0], SmolStr::new(first_argument));

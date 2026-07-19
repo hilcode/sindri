@@ -2,6 +2,8 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::file_set::FileSetPattern;
+use crate::nickel_import::TransitiveSource;
+use crate::nickel_import::resolve_transitive_source;
 use crate::parameter::ParameterBinding;
 use crate::parameter::ParameterDeclarations;
 use crate::parameter::ParameterValues;
@@ -10,13 +12,32 @@ use crate::script::Command;
 use crate::script::Script;
 use crate::script::ScriptInputs;
 use crate::types::AbsoluteDirectory;
+use crate::types::AbsoluteFile;
 use crate::types::RelativeDirectory;
+use crate::types::RelativeFile;
 use crate::types::WorkspaceRoot;
+use blake3::Hasher;
 use smol_str::SmolStr;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::io::Error as IoError;
+
+/// The version of this crate, folded into every [`DefinitionHash`] alongside [`NICKEL_VERSION`]: a
+/// bump of either dirties every task, a deliberate over-approximation since both shape how a
+/// script's expression evaluates.
+const SINDRI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The version of `nickel-lang-core` this crate evaluates scripts with, read out of `Cargo.lock` by
+/// `build.rs` — so it always matches the pinned dependency exactly and can never drift the way a
+/// hand-maintained constant could.
+const NICKEL_VERSION: &str = env!("NICKEL_LANG_CORE_VERSION");
+
+/// A field delimiter folded into the definition hash between fields, so that two different
+/// splittings of the same byte stream can never collide. Without it, hashing the fields `["ab",
+/// "c"]` and `["a", "bc"]` would concatenate to the identical bytes `abc` and produce the same
+/// hash, even though they are different inputs.
+const FIELD_SEPARATOR: [u8; 1] = [0];
 
 /// The name of a [`Task`], unique within its owning module.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -170,8 +191,90 @@ impl Task {
             workspace_root,
             module_directory,
         );
-        self.script.evaluate(&inputs)
+        self.script
+            .evaluate(&inputs, &self.script_path(&module_directory_absolute), file_system)
     }
+
+    /// Where this task's script is addressed for the purpose of resolving its own relative
+    /// imports — a synthetic location within the module directory, since the script itself is
+    /// embedded Nickel source rather than a real file on disk. Shared by [`Task::resolve`] and
+    /// [`Task::definition_hash`] so both anchor the same script's imports identically.
+    fn script_path(&self, module_directory_absolute: &AbsoluteDirectory) -> AbsoluteFile {
+        module_directory_absolute.join_file(&RelativeFile::new(format!("{}.ncl", self.name)))
+    }
+
+    /// This task's definition hash (see [`DefinitionHash`]), computed against the version of Sindri
+    /// and `nickel-lang-core` this binary was built with. The script's own source is addressed as if
+    /// it lived in `module_directory`, so its own relative imports resolve there; `workspace_root`
+    /// bounds where those imports may resolve to, and `file_system` is the sole channel through
+    /// which they — and the script itself — are read, so the computation stays hermetic under a test
+    /// runtime.
+    pub fn definition_hash(
+        &self,
+        module_directory: &RelativeDirectory,
+        workspace_root: &WorkspaceRoot,
+        file_system: &impl FileSystem,
+    ) -> SindriResult<DefinitionHash> {
+        self.definition_hash_with_salt(
+            module_directory,
+            workspace_root,
+            file_system,
+            SINDRI_VERSION,
+            NICKEL_VERSION,
+        )
+    }
+
+    /// The definition hash computation, with the version salt supplied explicitly rather than read
+    /// from this build's own version constants — so a test can prove the salt actually participates
+    /// in the hash by supplying two different ones and observing two different hashes.
+    fn definition_hash_with_salt(
+        &self,
+        module_directory: &RelativeDirectory,
+        workspace_root: &WorkspaceRoot,
+        file_system: &impl FileSystem,
+        sindri_version: &str,
+        nickel_version: &str,
+    ) -> SindriResult<DefinitionHash> {
+        let module_directory_absolute: AbsoluteDirectory =
+            workspace_root.to_absolute_directory().join_directory(module_directory);
+        let script_path: AbsoluteFile = self.script_path(&module_directory_absolute);
+        let transitive_source: TransitiveSource =
+            resolve_transitive_source(self.script.source(), &script_path, workspace_root, file_system)?;
+        let mut hasher: Hasher = Hasher::new();
+        update_field(&mut hasher, &self.name.to_string());
+        for (path, content) in transitive_source.files() {
+            update_field(&mut hasher, &path.as_ref().to_string_lossy());
+            update_field(&mut hasher, content);
+        }
+        for pattern_hash in [
+            self.declared_input.pattern().pattern_hash(),
+            self.managed_input.pattern().pattern_hash(),
+            self.output.pattern().pattern_hash(),
+        ] {
+            hasher.update(pattern_hash.as_bytes());
+            hasher.update(&FIELD_SEPARATOR);
+        }
+        for (plugin, name, parameter_type) in self.declared_parameters.iter() {
+            update_field(&mut hasher, &plugin.to_string());
+            update_field(&mut hasher, &name.to_string());
+            update_field(&mut hasher, parameter_type.source());
+        }
+        update_field(&mut hasher, sindri_version);
+        update_field(&mut hasher, nickel_version);
+        Ok(DefinitionHash(*hasher.finalize().as_bytes()))
+    }
+}
+
+/// A digest over everything that describes a [`Task`] independently of the current workspace
+/// contents or the chosen parameter values: its name, its script's transitive Nickel source, its
+/// input and output pattern hashes, its declared parameters, and a `(Sindri version, Nickel
+/// version)` salt. When it changes, the task is stale by definition and must run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefinitionHash([u8; 32]);
+
+fn update_field(hasher: &mut Hasher, field: &str) {
+    hasher.update(field.as_bytes());
+    hasher.update(&FIELD_SEPARATOR);
 }
 
 /// Resolve `pattern` against `base`, converting the low-level filesystem error into a
@@ -355,5 +458,139 @@ mod tests {
             &runtime,
         );
         assert!(matches!(result, Err(SindriError::ParameterMissing { .. })));
+    }
+
+    fn go_compile_task() -> Task {
+        Task::new(
+            TaskName::new("go-compile"),
+            Script::new("let helper = import \"helper.ncl\" in fun inputs => [ { program = helper.program } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"])),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(["**/*"])),
+            ParameterDeclarations::new([Parameter::new(
+                PluginName::new("sindri-go"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            )]),
+        )
+    }
+
+    fn runtime_with_helper(helper_program: &str) -> DummyRuntime {
+        DummyRuntime::builder()
+            .file(
+                format!("{WORKSPACE}/{MODULE}/helper.ncl"),
+                format!("{{ program = \"{helper_program}\" }}"),
+            )
+            .build()
+    }
+
+    #[test]
+    fn resolution_supports_a_script_that_imports_a_workspace_local_helper() {
+        let task: Task = go_compile_task();
+        let runtime: DummyRuntime = runtime_with_helper("go");
+        let values: ParameterValues = ParameterValues::new([(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterValue::new("\"release\""),
+        )]);
+        let commands: Vec<Command> = task
+            .resolve(
+                &values,
+                &module_directory(),
+                &output_directory(),
+                &workspace_root(),
+                &runtime,
+            )
+            .unwrap();
+        assert_eq!(commands[0].program(), "go");
+    }
+
+    #[test]
+    fn editing_an_imported_script_source_changes_the_definition_hash() {
+        let task: Task = go_compile_task();
+        let before: DefinitionHash = task
+            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .unwrap();
+        let after: DefinitionHash = task
+            .definition_hash(
+                &module_directory(),
+                &workspace_root(),
+                &runtime_with_helper("go-edited"),
+            )
+            .unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn the_same_task_and_source_reproduce_the_same_definition_hash() {
+        let task: Task = go_compile_task();
+        let first: DefinitionHash = task
+            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .unwrap();
+        let second: DefinitionHash = task
+            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_version_salt_bump_changes_every_definition_hash() {
+        let task: Task = go_compile_task();
+        let runtime: DummyRuntime = runtime_with_helper("go");
+        let before: DefinitionHash = task
+            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.1.0", "0.17.0")
+            .unwrap();
+        let sindri_bumped: DefinitionHash = task
+            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.2.0", "0.17.0")
+            .unwrap();
+        let nickel_bumped: DefinitionHash = task
+            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.1.0", "0.18.0")
+            .unwrap();
+        assert_ne!(before, sindri_bumped);
+        assert_ne!(before, nickel_bumped);
+    }
+
+    #[test]
+    fn changing_a_resolved_argument_or_environment_value_does_not_change_the_definition_hash() {
+        // `Task::resolve` applies the script via `Script::evaluate`, which does not support
+        // imports, so this task's script is self-contained rather than reusing
+        // `go_compile_task`'s import-based one.
+        let task: Task = Task::new(
+            TaskName::new("go-compile"),
+            Script::new("fun inputs => [ { program = \"go\", arguments = [ \"build\", inputs.params.\"sindri-go\".mode ] } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"])),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(["**/*"])),
+            ParameterDeclarations::new([Parameter::new(
+                PluginName::new("sindri-go"),
+                ParameterName::new("mode"),
+                ParameterType::new("String"),
+            )]),
+        );
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let before: DefinitionHash = task
+            .definition_hash(&module_directory(), &workspace_root(), &runtime)
+            .unwrap();
+        for mode in ["debug", "release"] {
+            let values: ParameterValues = ParameterValues::new([(
+                PluginName::new("sindri-go"),
+                ParameterName::new("mode"),
+                ParameterValue::new(format!("\"{mode}\"")),
+            )]);
+            let commands: Vec<Command> = task
+                .resolve(
+                    &values,
+                    &module_directory(),
+                    &output_directory(),
+                    &workspace_root(),
+                    &runtime,
+                )
+                .unwrap();
+            assert_eq!(commands[0].program(), "go");
+        }
+        let after: DefinitionHash = task
+            .definition_hash(&module_directory(), &workspace_root(), &runtime)
+            .unwrap();
+        assert_eq!(before, after);
     }
 }

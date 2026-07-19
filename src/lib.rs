@@ -10,6 +10,7 @@ pub mod local_time_with_elapsed;
 pub mod module;
 pub mod module_graph;
 pub mod nickel_eval;
+pub mod nickel_import;
 pub mod parameter;
 pub mod plugin;
 pub mod runtime;
