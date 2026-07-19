@@ -472,7 +472,12 @@ mod tests {
     use crate::types::Stderr;
     use crate::types::Step;
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::mpsc;
+    use std::sync::mpsc::Receiver;
+    use std::sync::mpsc::Sender;
+    use std::thread;
     use tempfile::TempDir;
 
     fn system_runtime() -> impl Runtime {
@@ -730,19 +735,67 @@ mod tests {
         );
     }
 
-    // Real sleeps are spawned here to verify tasks in a step genuinely run in parallel.
+    /// A command that writes the current time in nanoseconds since the epoch to `marker.start`,
+    /// sleeps for `duration`, then does the same to `marker.end` — so a test can read the two
+    /// files' own recorded content back afterwards and compare when this command actually ran
+    /// against another one's. The clock reading is data the command itself produces, not filesystem
+    /// metadata: a file's modification time is only as precise as the filesystem's own timestamp
+    /// granularity (historically as coarse as two seconds on FAT), which this sidesteps entirely.
+    /// Comparing two commands' own recorded intervals for overlap also holds regardless of how slow
+    /// A stub that blocks on `barrier` before returning. The executor spawns same-step tasks on
+    /// separate real OS threads (see `run_misses`), so this can only return for both tasks if both
+    /// were genuinely dispatched before either finished — a structural proof of concurrent dispatch
+    /// that needs no timing, no sleeping, and no real subprocess.
+    fn rendezvous(barrier: Arc<Barrier>) -> impl Fn() -> CommandOutput + Send + Sync + 'static {
+        move || -> CommandOutput {
+            barrier.wait();
+            succeeded("")
+        }
+    }
+
+    type RunOutcome = MietteResult<Vec<TaskOutcome>>;
+
+    /// Run `graph` on a background thread and wait up to `timeout` for it to finish, so a regression
+    /// that serializes what should be concurrent dispatch fails the test with a clear message
+    /// instead of hanging it (and the rest of the suite) forever.
+    fn run_bounded(
+        graph: TaskGraph,
+        working_directory: AbsoluteDirectory,
+        config: ExecutionConfig,
+        runtime: DummyRuntime,
+        timeout: Duration,
+    ) -> Vec<TaskOutcome> {
+        let (sender, receiver): (Sender<RunOutcome>, Receiver<RunOutcome>) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(run(&graph, &working_directory, &config, &runtime));
+        });
+        receiver
+            .recv_timeout(timeout)
+            .expect("tasks in the same step did not run concurrently (dispatch hung waiting on the barrier)")
+            .unwrap()
+    }
+
     #[test]
     fn parallel_tasks_in_same_step_run_concurrently() {
-        let graph: TaskGraph = make_graph(vec![
-            ("sleep-a", "compile", "sleep 0.3"),
-            ("sleep-b", "compile", "sleep 0.3"),
-        ]);
-        let start: Instant = Instant::now();
-        run_real(&graph, &default_config());
-        let elapsed: Duration = start.elapsed();
+        let barrier: Arc<Barrier> = Arc::new(Barrier::new(2));
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .command_handler("task-a", rendezvous(Arc::clone(&barrier)))
+            .command_handler("task-b", rendezvous(barrier))
+            .build();
+        let graph: TaskGraph = make_graph(vec![("task-a", "compile", "task-a"), ("task-b", "compile", "task-b")]);
+        let outcomes: Vec<TaskOutcome> = run_bounded(
+            graph,
+            workspace_directory(),
+            default_config(),
+            runtime,
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcomes.len(), 2);
         assert!(
-            elapsed < Duration::from_millis(500),
-            "two 0.3s tasks in the same step should run in parallel (took {elapsed:?})"
+            outcomes
+                .iter()
+                .all(|outcome: &TaskOutcome| -> bool { outcome.output().status().is_success() }),
+            "both tasks should have run their stubbed command successfully"
         );
     }
 

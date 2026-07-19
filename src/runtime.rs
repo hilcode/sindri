@@ -248,6 +248,8 @@ use crate::glob::CompiledGlobs;
 #[cfg(test)]
 use crate::types::Stdout;
 #[cfg(test)]
+use smol_str::SmolStr;
+#[cfg(test)]
 use std::cmp::Ordering;
 #[cfg(test)]
 use std::collections::HashMap;
@@ -271,6 +273,44 @@ impl Write for CapturedOutput<'_> {
     }
 }
 
+/// The key a [`Runtime::run_command`] stub is registered and looked up under: a literal string
+/// checked against the rendered command line (`program` followed by its space-joined arguments, e.g.
+/// `"go build -o /tmp/xyz/output/ ./..."`) with [`str::starts_with`] — not a glob or any other pattern
+/// syntax. A test typically registers only as much of the line as it can predict (`"go build"`,
+/// leaving off a resolved `{output}` path it cannot spell out in advance), which is exactly why this
+/// is a prefix rather than requiring the full line. Choosing one that is also a prefix of some other
+/// registered stub's command line is a test bug — e.g. `"go"` would ambiguously match both `go build`
+/// and `go test` — but nothing here checks for that; it is on the test author to keep prefixes
+/// unambiguous within one [`DummyRuntime`].
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CommandPrefix(SmolStr);
+
+#[cfg(test)]
+impl CommandPrefix {
+    fn matches(&self, command_line: &str) -> bool {
+        command_line.starts_with(self.0.as_str())
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for CommandPrefix {
+    fn from(prefix: &str) -> CommandPrefix {
+        CommandPrefix(SmolStr::new(prefix))
+    }
+}
+
+/// A registered [`Runtime::run_command`] stub: either a canned [`CommandOutput`] returned as-is, or a
+/// handler run on the calling thread each time the stub is matched — the calling thread being one of
+/// the real OS threads the executor spawns per concurrent task, so a handler can coordinate with
+/// another handler running at the same time (e.g. via a shared [`std::sync::Barrier`]) to prove
+/// genuine concurrent dispatch deterministically, without timing anything.
+#[cfg(test)]
+enum CommandStub {
+    Output(CommandOutput),
+    Handler(Box<dyn Fn() -> CommandOutput + Send + Sync>),
+}
+
 /// An in-memory [`Runtime`] for hermetic tests. Build one with [`DummyRuntime::builder`],
 /// registering the files, directories, symlinks and canned command outputs a test needs. It also
 /// implements [`FileSystem`] and [`Bootstrap`], so it can stand in anywhere from bootstrap onward.
@@ -279,7 +319,7 @@ pub struct DummyRuntime {
     files: HashMap<PathBuf, Vec<u8>>,
     directories: HashSet<PathBuf>,
     symlinks: HashSet<PathBuf>,
-    commands: HashMap<String, CommandOutput>,
+    commands: HashMap<CommandPrefix, CommandStub>,
     current_directory: PathBuf,
     now: Instant,
     writes: Mutex<HashMap<PathBuf, Vec<u8>>>,
@@ -436,15 +476,14 @@ impl Runtime for DummyRuntime {
     }
 
     fn run_command(&self, command: &Command, _working_directory: &Path) -> IoResult<CommandOutput> {
-        // Stubs are matched by command-line prefix so a test can register `"go build"` without having
-        // to spell out a resolved `{output}` path (an absolute directory that varies per run).
         let command_line: String = command.to_string();
         match self
             .commands
             .iter()
-            .find(|(stub, _)| -> bool { command_line.starts_with(stub.as_str()) })
+            .find(|(prefix, _)| -> bool { prefix.matches(&command_line) })
         {
-            Some((_, output)) => Ok(output.clone()),
+            Some((_, CommandStub::Output(output))) => Ok(output.clone()),
+            Some((_, CommandStub::Handler(handler))) => Ok(handler()),
             None => Err(IoError::new(
                 ErrorKind::NotFound,
                 format!("command not stubbed: {command}"),
@@ -476,7 +515,7 @@ pub struct DummyRuntimeBuilder {
     files: HashMap<PathBuf, Vec<u8>>,
     directories: HashSet<PathBuf>,
     symlinks: HashSet<PathBuf>,
-    commands: HashMap<String, CommandOutput>,
+    commands: HashMap<CommandPrefix, CommandStub>,
     current_directory: PathBuf,
     now: Instant,
 }
@@ -519,8 +558,20 @@ impl DummyRuntimeBuilder {
     }
 
     /// Register the output [`Runtime::run_command`] should return for `command`.
-    pub fn command(mut self, command: impl Into<String>, output: CommandOutput) -> DummyRuntimeBuilder {
-        self.commands.insert(command.into(), output);
+    pub fn command(mut self, command: impl Into<CommandPrefix>, output: CommandOutput) -> DummyRuntimeBuilder {
+        self.commands.insert(command.into(), CommandStub::Output(output));
+        self
+    }
+
+    /// Register a handler run on the calling thread each time `command` is matched, instead of a
+    /// fixed output — e.g. to synchronize with another concurrently running stub before returning.
+    pub fn command_handler(
+        mut self,
+        command: impl Into<CommandPrefix>,
+        handler: impl Fn() -> CommandOutput + Send + Sync + 'static,
+    ) -> DummyRuntimeBuilder {
+        self.commands
+            .insert(command.into(), CommandStub::Handler(Box::new(handler)));
         self
     }
 
