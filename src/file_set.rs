@@ -101,13 +101,22 @@ impl FileSet {
         file_system: &impl FileSystem,
     ) -> IoResult<FileSet> {
         let matched: Vec<PathBuf> = file_system.matching_file_set(base.as_ref(), pattern)?;
-        let mut files: Vec<RelativeFile> = matched
+        let files: Vec<RelativeFile> = matched
             .into_iter()
             .map(|path: PathBuf| -> RelativeFile { root.relativize_file(&AbsoluteFile::new(path)) })
             .collect();
-        files.sort_by(|first: &RelativeFile, second: &RelativeFile| first.as_ref().cmp(second.as_ref()));
-        files.dedup_by(|first: &mut RelativeFile, second: &mut RelativeFile| first.as_ref() == second.as_ref());
-        Ok(FileSet { files })
+        Ok(FileSet {
+            files: sorted_deduplicated(files),
+        })
+    }
+
+    /// The union of this file set with `other`, deterministically sorted like a resolved set. Used
+    /// to combine a task's declared and managed inputs into its effective input.
+    pub fn union(&self, other: &FileSet) -> FileSet {
+        let files: Vec<RelativeFile> = self.files.iter().chain(other.files.iter()).cloned().collect();
+        FileSet {
+            files: sorted_deduplicated(files),
+        }
     }
 
     pub fn files(&self) -> &[RelativeFile] {
@@ -121,6 +130,14 @@ impl FileSet {
     pub fn len(&self) -> usize {
         self.files.len()
     }
+}
+
+/// Sort `files` and drop adjacent duplicates, giving the deterministic order every [`FileSet`] is
+/// held in regardless of how its members were discovered or combined.
+fn sorted_deduplicated(mut files: Vec<RelativeFile>) -> Vec<RelativeFile> {
+    files.sort_by(|first: &RelativeFile, second: &RelativeFile| first.as_ref().cmp(second.as_ref()));
+    files.dedup_by(|first: &mut RelativeFile, second: &mut RelativeFile| first.as_ref() == second.as_ref());
+    files
 }
 
 #[cfg(test)]
@@ -223,6 +240,40 @@ mod tests {
         .unwrap();
         assert!(!non_empty.is_empty());
         assert_eq!(non_empty.len(), 2);
+    }
+
+    #[test]
+    fn union_combines_and_deduplicates_two_file_sets_in_sorted_order() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/a.go", "")
+            .file("/workspace/b.go", "")
+            .file("/workspace/go.work", "")
+            .build();
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        let go_files: FileSet = FileSet::resolve(
+            &FileSetPattern::new(["**/*.go"]),
+            &root.to_absolute_directory(),
+            &root,
+            &runtime,
+        )
+        .unwrap();
+        let go_work: FileSet = FileSet::resolve(
+            &FileSetPattern::new(["go.work", "a.go"]),
+            &root.to_absolute_directory(),
+            &root,
+            &runtime,
+        )
+        .unwrap();
+        let union: BTreeSet<String> = go_files
+            .union(&go_work)
+            .files()
+            .iter()
+            .map(|file: &RelativeFile| -> String { file.as_ref().display().to_string() })
+            .collect();
+        assert_eq!(
+            union,
+            BTreeSet::from(["a.go".to_string(), "b.go".to_string(), "go.work".to_string()])
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod plugin;
 pub mod runtime;
 pub mod script;
 pub mod state;
+pub mod task;
 pub mod telemetry;
 pub mod types;
 pub mod workspace;
