@@ -71,6 +71,7 @@ impl TaskRunRecord {
     pub fn compute(
         task: &Task,
         module_directory: &RelativeDirectory,
+        managed_input_base: &AbsoluteDirectory,
         output_directory: &AbsoluteDirectory,
         workspace_root: &WorkspaceRoot,
         cache: &MetadataCache,
@@ -87,7 +88,7 @@ impl TaskRunRecord {
         )?;
         let managed_files: FileSet = resolve_file_set(
             task.managed_input().pattern(),
-            &module_directory_absolute,
+            managed_input_base,
             workspace_root,
             file_system,
         )?;
@@ -201,6 +202,10 @@ mod tests {
         )))
     }
 
+    fn managed_input_base() -> AbsoluteDirectory {
+        AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"))
+    }
+
     fn go_compile_task(script_source: &str) -> Task {
         Task::new(
             TaskName::new("go-compile"),
@@ -239,6 +244,7 @@ mod tests {
         TaskRunRecord::compute(
             task,
             &module_directory(),
+            &managed_input_base(),
             output_directory,
             &workspace_root(),
             &metadata_cache(),
@@ -281,6 +287,7 @@ mod tests {
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
+            &managed_input_base(),
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
@@ -303,6 +310,7 @@ mod tests {
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
+            &managed_input_base(),
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
@@ -325,6 +333,7 @@ mod tests {
         let result: SindriResult<TaskRunRecord> = TaskRunRecord::compute(
             &task,
             &module_directory(),
+            &managed_input_base(),
             &output_directory,
             &workspace_root(),
             &metadata_cache(),
@@ -405,6 +414,7 @@ mod tests {
         TaskRunRecord::compute(
             &go_compile,
             &module_directory(),
+            &managed_input_base(),
             &compile_output,
             &workspace_root(),
             &cache,
@@ -414,6 +424,7 @@ mod tests {
         TaskRunRecord::compute(
             &go_test,
             &module_directory(),
+            &managed_input_base(),
             &compile_output,
             &workspace_root(),
             &cache,

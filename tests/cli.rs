@@ -274,9 +274,6 @@ fn compile_in_valid_go_module_exits_zero() {
 }
 
 #[test]
-#[ignore = "T8a does not yet wire GOWORK into the go-compile/go-test scripts (that's T8b's \
-            managed-input work), so `go build` cannot resolve the sibling import a real \
-            multi-module build depends on. go.work itself is still generated (see below)."]
 fn compile_module_with_local_go_library_dependency_builds() {
     let directory: TempDir = multi_module_dir();
     let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
@@ -285,8 +282,15 @@ fn compile_module_with_local_go_library_dependency_builds() {
         "expected exit 0 building a module with a local library dependency; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let go_work: String = fs::read_to_string(directory.path().join(".target").join("go.work"))
-        .expect("a go.work should be generated in the build directory");
+    let go_work: String = fs::read_to_string(
+        directory
+            .path()
+            .join(".target")
+            .join("generate-go-work")
+            .join(empty_binding_hash())
+            .join("go.work"),
+    )
+    .expect("a go.work should be generated in the build directory");
     assert!(
         go_work.contains("lib/greeting"),
         "the generated go.work should list the local library, got:\n{go_work}"
@@ -294,7 +298,6 @@ fn compile_module_with_local_go_library_dependency_builds() {
 }
 
 #[test]
-#[ignore = "same GOWORK gap as compile_module_with_local_go_library_dependency_builds; deferred to T8b"]
 fn second_multi_module_compile_is_silent_and_editing_the_dependency_rebuilds_the_dependent() {
     let directory: TempDir = isolated_multi_module_dir();
     let app: PathBuf = directory.path().join("app");

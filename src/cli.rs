@@ -147,14 +147,8 @@ mod tests {
     #[test]
     fn run_compile_action_runs_the_build_commands() {
         let runtime: DummyRuntime = go_workspace()
-            .command(
-                "go env GOVERSION",
-                CommandOutput::new(
-                    Stdout::new(b"go1.26.4\n".to_vec()),
-                    Stderr::default(),
-                    TaskStatus::Succeeded,
-                ),
-            )
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .build();

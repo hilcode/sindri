@@ -4,7 +4,6 @@ pub mod error;
 pub mod executor;
 pub mod file_set;
 pub mod go_plugin;
-pub mod go_work;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;
 pub mod metadata_cache;

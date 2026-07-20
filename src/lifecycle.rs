@@ -1,20 +1,21 @@
 use crate::error::SindriError;
+use crate::executor::BuildContext;
 use crate::executor::ExecutionConfig;
 use crate::executor::ModuleLocation;
 use crate::executor::ModuleRebuilt;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
+use crate::executor::run_standalone_task;
 use crate::go_plugin::GoPlugin;
-use crate::go_work::GoToolchainVersion;
-use crate::go_work::GoWork;
+use crate::metadata_cache::MetadataCache;
 use crate::module::ArtifactType;
 use crate::module_graph::ModuleGraph;
 use crate::runtime::Runtime;
 use crate::task::Task;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
-use crate::types::AbsoluteFile;
 use crate::types::BuildFile;
+use crate::types::RelativeDirectory;
 #[cfg(test)]
 use crate::types::Stdout;
 use crate::types::Step;
@@ -118,28 +119,43 @@ impl Lifecycle {
         let compile_step: Step = Step::new("compile");
         let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
-        // Project the declared module dependencies into Go's local-dependency view, written inside the
-        // build directory, so the declarations remain the file's only source and it cannot drift from a
-        // hand-maintained one. The directive is the toolchain's own version (`go env GOVERSION`);
-        // without a usable `go` the build cannot proceed, so a missing version is a hard error rather
-        // than a silently malformed file. Consuming this file via `GOWORK` — and tracking it as a
-        // managed input — is not yet wired into the task model; it still exists as a build artifact only.
-        let toolchain_version: GoToolchainVersion =
-            GoToolchainVersion::query(runtime, &workspace_root.to_absolute_directory())
-                .ok_or(SindriError::GoToolchainVersionUnknown)?;
-        let go_work_file: AbsoluteFile = GoWork::file(&absolute_build_directory);
-        GoWork::project(&module_graph, workspace_root, toolchain_version)
-            .write(&absolute_build_directory, runtime)
-            .map_err(|source| SindriError::Io {
-                path: go_work_file.as_ref().to_path_buf(),
-                source,
-            })?;
+        let mut outcomes: Vec<TaskOutcome> = Vec::new();
+        // Regenerate go.work — Go's local-dependency view, projected from the declared module
+        // dependencies so it can never drift from them — before any module's tasks run, since
+        // go-compile/go-test need it as a managed input. Run once, workspace-wide, through the same
+        // resolve/dirtiness/run/persist sequence every other task goes through, so an unchanged module
+        // set is a cache hit rather than a full regeneration on every build. It has no managed input of
+        // its own, so the context supplied here is a placeholder — its real value (this task's own
+        // output directory) is not known until it has run.
+        let generate_go_work: Task = GoPlugin::generate_go_work_task(&module_graph, workspace_root);
+        let cache_directory: AbsoluteDirectory =
+            absolute_build_directory.join_directory(&RelativeDirectory::new(".metadata-cache"));
+        let cache: MetadataCache = MetadataCache::new(cache_directory);
+        let bootstrap_context: BuildContext = BuildContext::new(
+            workspace_root,
+            &absolute_build_directory,
+            &absolute_build_directory,
+            &cache,
+        );
+        let (go_work_outcome, go_work_output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
+            &generate_go_work,
+            &RelativeDirectory::new(""),
+            &bootstrap_context,
+            config,
+            runtime,
+        )?;
+        outcomes.push(go_work_outcome);
+        let context: BuildContext = BuildContext::new(
+            workspace_root,
+            &absolute_build_directory,
+            &go_work_output_directory,
+            &cache,
+        );
         // Modules build in dependency-first order (the graph's node order), each in its own directory
         // and its own state subtree, so a dependency is fully built before anything that depends on
         // it. Each module compiles with the go-compile script its artifact type requires. A failing
         // task makes `execute_graph` return early via `?`, so a broken build writes no telemetry: the
         // partial trace is dropped, keeping every telemetry.json a whole-build record.
-        let mut outcomes: Vec<TaskOutcome> = Vec::new();
         let mut module_rebuilt: Vec<ModuleRebuilt> = Vec::with_capacity(module_graph.nodes().len());
         for node in module_graph.nodes() {
             let tasks: Vec<(Task, Step)> = GoPlugin::tasks(node.module().artifact_type());
@@ -158,15 +174,8 @@ impl Lifecycle {
                     .iter()
                     .any(|&index: &usize| module_rebuilt[index].is_rebuilt()),
             );
-            let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) = execute_graph(
-                &graph,
-                &location,
-                workspace_root,
-                &absolute_build_directory,
-                dependency_rebuilt,
-                config,
-                runtime,
-            )?;
+            let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
+                execute_graph(&graph, &location, &context, dependency_rebuilt, config, runtime)?;
             module_rebuilt.push(rebuilt);
             outcomes.extend(module_outcomes);
         }
@@ -250,19 +259,9 @@ mod tests {
         CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Failed)
     }
 
-    /// The stubbed reply to `go env GOVERSION`, which every `compile` run queries to write the
-    /// generated `go.work`'s `go` directive.
-    fn go_version() -> CommandOutput {
-        CommandOutput::new(
-            Stdout::new(b"go1.26.4\n".to_vec()),
-            Stderr::default(),
-            TaskStatus::Succeeded,
-        )
-    }
-
     /// A runtime seeded with a minimal Go workspace and module, ready for a `compile` run. Callers
-    /// register the command outcomes (`gofmt`, `go build`) the test wants to exercise; the toolchain
-    /// version query is stubbed here since every compile issues it.
+    /// register the command outcomes (`gofmt`, `go build`) the test wants to exercise; `generate-go-work`'s
+    /// commands are stubbed here since every compile runs it.
     fn go_workspace() -> DummyRuntimeBuilder {
         DummyRuntime::builder()
             .file(
@@ -273,7 +272,8 @@ mod tests {
                 "/workspace/sindri.build",
                 r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
             )
-            .command("go env GOVERSION", go_version())
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
             .current_directory("/workspace")
     }
 
@@ -373,7 +373,8 @@ mod tests {
                 "/workspace/sindri.build",
                 r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
             )
-            .command("go env GOVERSION", go_version())
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .current_directory("/workspace")
@@ -402,7 +403,8 @@ mod tests {
                 "/workspace/lib/sindri.build",
                 r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
             )
-            .command("go env GOVERSION", go_version())
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .current_directory("/workspace")
@@ -431,14 +433,15 @@ mod tests {
                 .any(|(path, _)| path.starts_with("/workspace/.target/lib/go-compile")),
             "the dependency module should have built and persisted a run record"
         );
-        // A go.work projecting both modules is written into the build directory before the build.
-        let go_work: Vec<u8> = runtime
-            .written_file("/workspace/.target/go.work")
-            .expect("a go.work should be generated in the build directory");
-        let go_work: String = String::from_utf8(go_work).unwrap();
+        // generate-go-work ran (via the stubbed `go work init`) and persisted its own run record,
+        // before either module's tasks — real go.work content, produced by the actual `go` toolchain,
+        // is covered by the cli.rs integration tests rather than this stub run.
         assert!(
-            go_work.contains("/workspace/lib") && go_work.contains("use ("),
-            "go.work should list the dependency module, got:\n{go_work}"
+            runtime
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/generate-go-work")),
+            "generate-go-work should have run and persisted a run record"
         );
     }
 
@@ -465,7 +468,8 @@ mod tests {
                 r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
             )
             .file("/workspace/lib/lib.go", "package lib\n")
-            .command("go env GOVERSION", go_version())
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .current_directory("/workspace/app")
@@ -528,6 +532,55 @@ mod tests {
         assert!(
             replay.captured_output().is_empty(),
             "an unchanged tree should be silent; got: {:?}",
+            replay.captured_output().as_str()
+        );
+    }
+
+    #[test]
+    fn an_unchanged_go_module_set_leaves_generate_go_work_a_cache_hit() {
+        fn generate_go_work_run_records(runtime: &DummyRuntime) -> usize {
+            runtime
+                .written_files()
+                .iter()
+                .filter(|(path, _)| path.starts_with("/workspace/.target/generate-go-work"))
+                .count()
+        }
+
+        let seed: DummyRuntime = go_workspace()
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .build();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .unwrap();
+        assert_eq!(
+            generate_go_work_run_records(&seed),
+            1,
+            "the first build should persist generate-go-work's run record"
+        );
+
+        // Replay with the module set unchanged: generate-go-work's script embeds the module directory
+        // list directly in its source, so an unchanged set means an unchanged definition hash — a
+        // cache hit, with no re-run and no fresh record.
+        let replay: DummyRuntime = replay_with_state(
+            go_workspace()
+                .command("gofmt -l .", succeeded())
+                .command("go build", succeeded()),
+            &seed,
+        )
+        .build();
+        Lifecycle::new()
+            .run_compile(&Workspace::locate(&replay).unwrap(), &config, &replay)
+            .unwrap();
+        assert_eq!(
+            generate_go_work_run_records(&replay),
+            0,
+            "an unchanged module set should leave generate-go-work a cache hit"
+        );
+        assert!(
+            !replay.captured_output().as_str().contains("generate-go-work"),
+            "a cache-hit generate-go-work should print no progress line; got: {:?}",
             replay.captured_output().as_str()
         );
     }

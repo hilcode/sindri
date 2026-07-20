@@ -15,7 +15,6 @@ use crate::script::Command as ScriptCommand;
 use crate::task::Task;
 use crate::task::resolve_file_set;
 use crate::types::AbsoluteDirectory;
-use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
 use crate::types::Command;
 use crate::types::CommandOutput;
@@ -81,6 +80,51 @@ impl ModuleLocation {
 
     pub fn module_path(&self) -> &ModulePath {
         &self.module_path
+    }
+}
+
+/// The values a task resolves against that stay constant across a whole build, bundled so they thread
+/// through the resolve/dirtiness/run/persist call chain as one parameter instead of four:
+/// `workspace_root` and `build_directory` never change once a build starts, `managed_input_base` —
+/// `generate-go-work`'s own output directory — is fixed the moment that task has run, before any
+/// module's tasks resolve against it, and `cache` is the one metadata cache every task's dirtiness
+/// check and run record shares for the whole build.
+pub struct BuildContext<'context> {
+    workspace_root: &'context WorkspaceRoot,
+    build_directory: &'context AbsoluteDirectory,
+    managed_input_base: &'context AbsoluteDirectory,
+    cache: &'context MetadataCache,
+}
+
+impl<'context> BuildContext<'context> {
+    pub fn new(
+        workspace_root: &'context WorkspaceRoot,
+        build_directory: &'context AbsoluteDirectory,
+        managed_input_base: &'context AbsoluteDirectory,
+        cache: &'context MetadataCache,
+    ) -> BuildContext<'context> {
+        BuildContext {
+            workspace_root,
+            build_directory,
+            managed_input_base,
+            cache,
+        }
+    }
+
+    fn workspace_root(&self) -> &WorkspaceRoot {
+        self.workspace_root
+    }
+
+    fn build_directory(&self) -> &AbsoluteDirectory {
+        self.build_directory
+    }
+
+    fn managed_input_base(&self) -> &AbsoluteDirectory {
+        self.managed_input_base
+    }
+
+    fn cache(&self) -> &MetadataCache {
+        self.cache
     }
 }
 
@@ -247,62 +291,93 @@ struct TaskPlan {
     dirtiness: Dirtiness,
 }
 
-/// Compute each task's current run record and compare it against what was persisted, deciding clean
-/// or dirty. Serial and in lifecycle order, so a source-mutating step's effects are on disk before
-/// the next step is hashed. `module_directory` is relative to the workspace root — the module's real
-/// source location, distinct from `module_path`, which additionally carries a qualifier and only
-/// matters for where a task's own state nests under the build directory.
-#[allow(clippy::too_many_arguments)]
+/// Build a task's [`TaskLayout`], compute its current run record, and compare it against what was
+/// persisted to decide clean or dirty — the "resolve, then check dirtiness" half of a task's
+/// lifecycle. `module_path` names where the task's own state nests under the build directory,
+/// distinct from `module_directory`, the module's real source location. The building block both
+/// [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped to
+/// no module at all) resolve a task with.
+fn resolve_task_plan(
+    task: &Task,
+    module_directory: &RelativeDirectory,
+    module_path: &RelativeDirectory,
+    context: &BuildContext,
+    runtime: &impl Runtime,
+) -> MietteResult<TaskPlan> {
+    // No task declares a parameter yet, so every binding is the same empty one.
+    let binding_hash: BindingHash = ParameterBinding::empty().binding_hash();
+    let layout: TaskLayout = TaskLayout::new(context.build_directory(), module_path, task.name(), binding_hash);
+    let current_record: TaskRunRecord = TaskRunRecord::compute(
+        task,
+        module_directory,
+        context.managed_input_base(),
+        layout.output_directory(),
+        context.workspace_root(),
+        context.cache(),
+        runtime,
+    )?;
+    let persisted: Option<TaskRunRecord> = TaskRunRecord::load(layout.run_record_file(), runtime);
+    let status: Dirtiness = dirtiness(&current_record, persisted.as_ref());
+    Ok(TaskPlan {
+        task: task.clone(),
+        layout,
+        dirtiness: status,
+    })
+}
+
+/// Compute every node's [`TaskPlan`], deciding clean or dirty for each. Serial and in lifecycle
+/// order, so a source-mutating step's effects are on disk before the next step is hashed.
 fn plan_group(
     node_ids: &[TaskGraphNodeId],
     nodes: &[TaskGraphNode],
     module_directory: &RelativeDirectory,
-    workspace_root: &WorkspaceRoot,
-    build_directory: &AbsoluteDirectory,
     module_path: &ModulePath,
-    cache: &MetadataCache,
+    context: &BuildContext,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
-    let mut plans: Vec<TaskPlan> = Vec::with_capacity(node_ids.len());
-    for &node_id in node_ids {
-        let node: &TaskGraphNode = &nodes[node_id.value()];
-        let task: Task = node.task().clone();
-        // No task declares a parameter yet, so every binding is the same empty one.
-        let binding_hash: BindingHash = ParameterBinding::empty().binding_hash();
-        let layout: TaskLayout = TaskLayout::new(
-            build_directory,
-            module_path.as_relative_directory(),
-            task.name(),
-            binding_hash,
-        );
-        let current_record: TaskRunRecord = TaskRunRecord::compute(
-            &task,
-            module_directory,
-            layout.output_directory(),
-            workspace_root,
-            cache,
-            runtime,
-        )?;
-        let persisted: Option<TaskRunRecord> = TaskRunRecord::load(layout.run_record_file(), runtime);
-        let status: Dirtiness = dirtiness(&current_record, persisted.as_ref());
-        plans.push(TaskPlan {
-            task,
-            layout,
-            dirtiness: status,
-        });
+    node_ids
+        .iter()
+        .map(|&node_id: &TaskGraphNodeId| -> MietteResult<TaskPlan> {
+            resolve_task_plan(
+                nodes[node_id.value()].task(),
+                module_directory,
+                module_path.as_relative_directory(),
+                context,
+                runtime,
+            )
+        })
+        .collect()
+}
+
+/// Run a dirty task's resolved commands and, on success, persist its fresh run record — the "run,
+/// then persist" half of a task's lifecycle. The building block both [`run_misses`] (spawned per
+/// dirty task, one real OS thread each) and [`run_standalone_task`] (run synchronously, on the
+/// calling thread) run a task with.
+fn run_task_and_persist(
+    task: Task,
+    module_directory: &RelativeDirectory,
+    context: &BuildContext,
+    layout: &TaskLayout,
+    task_start: TaskStart,
+    fiber: Fiber,
+    runtime: &impl Runtime,
+) -> TaskOutcome {
+    let result: IoResult<CommandOutcome> =
+        run_one(&task, module_directory, context, layout.output_directory(), runtime);
+    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
+    if outcome.output().status().is_success() {
+        persist_outcome(outcome.task(), module_directory, context, layout, runtime);
     }
-    Ok(plans)
+    outcome
 }
 
 /// Run every dirty task in `plans` concurrently, one real OS thread each. A task's resolved script
 /// yields an ordered list of commands, run sequentially on that single thread — concurrency in this
-/// executor is across tasks, never within one task's own command sequence. On success, fresh state is
-/// recorded so the next build can skip it.
+/// executor is across tasks, never within one task's own command sequence.
 fn run_misses(
     plans: &[TaskPlan],
     module_directory: &RelativeDirectory,
-    workspace_root: &WorkspaceRoot,
-    cache: &MetadataCache,
+    context: &BuildContext,
     runtime: &impl Runtime,
 ) -> Vec<TaskOutcome> {
     let misses: Vec<&TaskPlan> = plans
@@ -316,25 +391,17 @@ fn run_misses(
             .map(|(index, &plan)| {
                 let fiber: Fiber = Fiber::new(index);
                 let task: Task = plan.task.clone();
-                let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
-                let run_record_file: AbsoluteFile = plan.layout.run_record_file().clone();
                 scope.spawn(move || -> TaskOutcome {
                     let task_start: TaskStart = TaskStart::new(runtime.now());
-                    let result: IoResult<CommandOutcome> =
-                        run_one(&task, module_directory, &output_directory, workspace_root, runtime);
-                    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
-                    if outcome.output().status().is_success() {
-                        persist_outcome(
-                            outcome.task(),
-                            module_directory,
-                            &output_directory,
-                            &run_record_file,
-                            workspace_root,
-                            cache,
-                            runtime,
-                        );
-                    }
-                    outcome
+                    run_task_and_persist(
+                        task,
+                        module_directory,
+                        context,
+                        &plan.layout,
+                        task_start,
+                        fiber,
+                        runtime,
+                    )
                 })
             })
             .collect();
@@ -352,8 +419,8 @@ fn run_misses(
 fn run_one(
     task: &Task,
     module_directory: &RelativeDirectory,
+    context: &BuildContext,
     output_directory: &AbsoluteDirectory,
-    workspace_root: &WorkspaceRoot,
     runtime: &impl Runtime,
 ) -> IoResult<CommandOutcome> {
     runtime.create_directories(output_directory.as_ref())?;
@@ -361,14 +428,16 @@ fn run_one(
         .resolve(
             &ParameterValues::default(),
             module_directory,
+            context.managed_input_base(),
             output_directory,
-            workspace_root,
+            context.workspace_root(),
             runtime,
         )
         .map_err(IoError::other)?;
     let mut output: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded);
     for command in &commands {
-        let working_directory: AbsoluteDirectory = workspace_root
+        let working_directory: AbsoluteDirectory = context
+            .workspace_root()
             .to_absolute_directory()
             .join_directory(command.working_directory());
         output = runtime.run_command(&to_process_command(command), working_directory.as_ref())?;
@@ -410,36 +479,45 @@ fn render_command(command: &ScriptCommand) -> String {
 fn persist_outcome(
     task: &Task,
     module_directory: &RelativeDirectory,
-    output_directory: &AbsoluteDirectory,
-    run_record_file: &AbsoluteFile,
-    workspace_root: &WorkspaceRoot,
-    cache: &MetadataCache,
+    context: &BuildContext,
+    layout: &TaskLayout,
     runtime: &impl Runtime,
 ) {
     // The task's own commands just ran and are the only thing that can have changed its output —
     // drop the metadata cache's memo for those files so the fresh record below reads them for real,
     // instead of reusing whatever a pre-run dirtiness check already cached as missing or stale.
-    let output_files: FileSet =
-        match resolve_file_set(task.output().pattern(), output_directory, workspace_root, runtime) {
-            Ok(files) => files,
-            Err(error) => {
-                let _ = runtime.log(&format!("could not resolve the output of `{}`: {error}", task.name()));
-                return;
-            }
-        };
-    cache.invalidate(&output_files);
-    let record: TaskRunRecord =
-        match TaskRunRecord::compute(task, module_directory, output_directory, workspace_root, cache, runtime) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = runtime.log(&format!(
-                    "could not compute a run record for `{}`: {error}",
-                    task.name()
-                ));
-                return;
-            }
-        };
-    if let Err(error) = record.persist(run_record_file, runtime) {
+    let output_files: FileSet = match resolve_file_set(
+        task.output().pattern(),
+        layout.output_directory(),
+        context.workspace_root(),
+        runtime,
+    ) {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = runtime.log(&format!("could not resolve the output of `{}`: {error}", task.name()));
+            return;
+        }
+    };
+    context.cache().invalidate(&output_files);
+    let record: TaskRunRecord = match TaskRunRecord::compute(
+        task,
+        module_directory,
+        context.managed_input_base(),
+        layout.output_directory(),
+        context.workspace_root(),
+        context.cache(),
+        runtime,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            let _ = runtime.log(&format!(
+                "could not compute a run record for `{}`: {error}",
+                task.name()
+            ));
+            return;
+        }
+    };
+    if let Err(error) = record.persist(layout.run_record_file(), runtime) {
         let _ = runtime.log(&format!(
             "could not persist a run record for `{}`: {error}",
             task.name()
@@ -447,7 +525,10 @@ fn persist_outcome(
     }
     // Settle the metadata cache's own per-file records too, so a later build can trust them via a
     // cheap stat check instead of reading their content again.
-    if let Err(error) = cache.persist(&output_files, workspace_root, runtime) {
+    if let Err(error) = context
+        .cache()
+        .persist(&output_files, context.workspace_root(), runtime)
+    {
         let _ = runtime.log(&format!(
             "could not persist metadata-cache records for `{}`: {error}",
             task.name()
@@ -458,15 +539,14 @@ fn persist_outcome(
 pub fn execute_graph(
     graph: &TaskGraph,
     location: &ModuleLocation,
-    workspace_root: &WorkspaceRoot,
-    build_directory: &AbsoluteDirectory,
+    context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
     config: &ExecutionConfig,
     runtime: &impl Runtime,
 ) -> MietteResult<(Vec<TaskOutcome>, ModuleRebuilt)> {
-    let module_directory: RelativeDirectory = workspace_root.relativize_directory(location.working_directory());
-    let cache_directory: AbsoluteDirectory = build_directory.join_directory(&RelativeDirectory::new(".metadata-cache"));
-    let cache: MetadataCache = MetadataCache::new(cache_directory);
+    let module_directory: RelativeDirectory = context
+        .workspace_root()
+        .relativize_directory(location.working_directory());
     let step_groups: Vec<Vec<TaskGraphNodeId>> = group_nodes_by_step(graph.nodes());
     let mut all_outcomes: Vec<TaskOutcome> = Vec::new();
     for group in &step_groups {
@@ -474,10 +554,8 @@ pub fn execute_graph(
             group,
             graph.nodes(),
             &module_directory,
-            workspace_root,
-            build_directory,
             location.module_path(),
-            &cache,
+            context,
             runtime,
         )?;
         if dependency_rebuilt.is_rebuilt() {
@@ -496,7 +574,7 @@ pub fn execute_graph(
             }
         }
         let mut miss_outcomes: std::vec::IntoIter<TaskOutcome> =
-            run_misses(&plans, &module_directory, workspace_root, &cache, runtime).into_iter();
+            run_misses(&plans, &module_directory, context, runtime).into_iter();
         let batch_start: usize = all_outcomes.len();
         for plan in &plans {
             let outcome: TaskOutcome = match plan.dirtiness {
@@ -534,6 +612,59 @@ pub fn execute_graph(
             .any(|outcome: &TaskOutcome| outcome.dirtiness() == Dirtiness::Dirty),
     );
     Ok((all_outcomes, rebuilt))
+}
+
+/// Resolve, check dirtiness, and — if dirty — run and persist a single task that is not scoped to any
+/// one module, printing its progress line and failing the build the same way a per-module task would.
+/// Currently used for exactly one task: `GoPlugin`'s `generate-go-work`, run once before the
+/// per-module loop so its output (`go.work`) exists before any module's `go-compile`/`go-test` needs
+/// it as a managed input. `module_directory` doubles as both the location the task's declared input
+/// resolves against and the location its own state nests under the build directory — for
+/// `generate-go-work` these coincide at the workspace root, so there is no need for the module-loop's
+/// separate `module_path` concept here. It has no managed input of its own, so `context`'s
+/// `managed_input_base` is never consulted — the caller passes a harmless placeholder (its real value
+/// isn't known until this task has run: it's this task's own output directory). Returns the task's
+/// outcome alongside its output directory, so the caller can thread the latter through as the managed
+/// input base for every module's own tasks.
+pub fn run_standalone_task(
+    task: &Task,
+    module_directory: &RelativeDirectory,
+    context: &BuildContext,
+    config: &ExecutionConfig,
+    runtime: &impl Runtime,
+) -> MietteResult<(TaskOutcome, AbsoluteDirectory)> {
+    let plan: TaskPlan = resolve_task_plan(task, module_directory, module_directory, context, runtime)?;
+    let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
+    let outcome: TaskOutcome = match plan.dirtiness {
+        Dirtiness::Clean => TaskOutcome::cached(plan.task, TaskStart::new(runtime.now()), Fiber::new(0)),
+        Dirtiness::Dirty => {
+            if config.verbosity != Verbosity::Quiet {
+                writeln!(runtime.output(), "  \u{2192} {}", plan.task.name()).into_diagnostic()?;
+            }
+            run_task_and_persist(
+                plan.task,
+                module_directory,
+                context,
+                &plan.layout,
+                TaskStart::new(runtime.now()),
+                Fiber::new(0),
+                runtime,
+            )
+        }
+    };
+    report_outcome(&outcome, config, runtime)?;
+    if !outcome.output().status().is_success() {
+        return Err(SindriError::TaskFailed {
+            task_name: outcome.task().name().clone(),
+            command: outcome.failed_command().map_or_else(
+                || "no command ran (the task failed before one could)".to_string(),
+                render_command,
+            ),
+            output: outcome.output().combined_output(),
+        }
+        .into());
+    }
+    Ok((outcome, output_directory))
 }
 
 /// Print a task's completion line. Clean tasks stay silent unless `--verbose`; dirty tasks always show
@@ -629,6 +760,15 @@ mod tests {
         AbsoluteDirectory::new(PathBuf::from("/workspace"))
     }
 
+    /// No test in this module exercises a managed input, so any distinct absolute directory works.
+    fn managed_input_base(working_directory: &AbsoluteDirectory) -> AbsoluteDirectory {
+        working_directory.join_directory(&RelativeDirectory::new(".target/generate-go-work"))
+    }
+
+    fn metadata_cache(build_directory: &AbsoluteDirectory) -> MetadataCache {
+        MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new(".metadata-cache")))
+    }
+
     /// Run a graph against a stub runtime, deriving the incremental state directories from the given
     /// working directory. The stub records writes rather than touching disk, so the paths are fake.
     fn run(
@@ -641,16 +781,11 @@ mod tests {
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
         let location: ModuleLocation =
             ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
-        execute_graph(
-            graph,
-            &location,
-            &workspace_root,
-            &build_directory,
-            ModuleRebuilt::new(false),
-            config,
-            runtime,
-        )
-        .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
+        let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
+        let cache: MetadataCache = metadata_cache(&build_directory);
+        let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
+        execute_graph(graph, &location, &context, ModuleRebuilt::new(false), config, runtime)
+            .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
     }
 
     /// Run a graph with real process spawning, isolating its persisted state in a fresh temporary
@@ -662,11 +797,13 @@ mod tests {
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
         let location: ModuleLocation =
             ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let managed_input_base: AbsoluteDirectory = managed_input_base(&working_directory);
+        let cache: MetadataCache = metadata_cache(&build_directory);
+        let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
         execute_graph(
             graph,
             &location,
-            &workspace_root,
-            &build_directory,
+            &context,
             ModuleRebuilt::new(false),
             config,
             &system_runtime(),
@@ -688,11 +825,13 @@ mod tests {
         let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
         let location: ModuleLocation =
             ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
+        let cache: MetadataCache = metadata_cache(&build_directory);
+        let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
         execute_graph(
             graph,
             &location,
-            &workspace_root,
-            &build_directory,
+            &context,
             dependency_rebuilt,
             &default_config(),
             runtime,

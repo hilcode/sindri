@@ -159,13 +159,17 @@ impl Task {
     }
 
     /// Resolve this task for a concrete build: bind `parameter_values` against the task's declared
-    /// parameters, match its declared and managed input patterns against the workspace — their union
-    /// is the task's effective input — and apply the script to the bound parameters and effective
-    /// input to yield the ordered commands to run.
+    /// parameters, match its declared input against the module directory and its managed input
+    /// against `managed_input_base` — their union is the task's effective input — and apply the
+    /// script to the bound parameters and effective input to yield the ordered commands to run.
+    /// `managed_input_base` is distinct from `module_directory` because a managed input need not live
+    /// in the module at all: `go-compile`'s managed `go.work`, for instance, lives in the
+    /// `generate-go-work` task's own output directory, shared workspace-wide.
     pub fn resolve(
         &self,
         parameter_values: &ParameterValues,
         module_directory: &RelativeDirectory,
+        managed_input_base: &AbsoluteDirectory,
         output_directory: &AbsoluteDirectory,
         workspace_root: &WorkspaceRoot,
         file_system: &impl FileSystem,
@@ -181,7 +185,7 @@ impl Task {
         )?;
         let managed_files: FileSet = resolve_file_set(
             self.managed_input.pattern(),
-            &module_directory_absolute,
+            managed_input_base,
             workspace_root,
             file_system,
         )?;
@@ -190,6 +194,7 @@ impl Task {
             &binding,
             &effective_input,
             output_directory,
+            managed_input_base,
             workspace_root,
             module_directory,
         );
@@ -322,6 +327,10 @@ mod tests {
         AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"))
     }
 
+    fn managed_input_base() -> AbsoluteDirectory {
+        AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"))
+    }
+
     #[test]
     fn a_task_exposes_its_name_script_inputs_output_and_declared_parameters() {
         let declared_input: DeclaredTaskInput = DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"]));
@@ -365,6 +374,7 @@ mod tests {
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterValues::default(),
             &module_directory(),
+            &managed_input_base(),
             &output_directory(),
             &workspace_root(),
             &runtime,
@@ -386,6 +396,7 @@ mod tests {
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterValues::default(),
             &module_directory(),
+            &managed_input_base(),
             &output_directory(),
             &workspace_root(),
             &runtime,
@@ -395,9 +406,18 @@ mod tests {
 
     #[test]
     fn a_file_matched_only_by_the_managed_pattern_is_in_the_effective_input() {
+        // The managed file lives under `managed_input_base()`, not the module directory — proving
+        // the managed pattern resolves against its own base, distinct from the declared input's.
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(format!("{WORKSPACE}/{MODULE}/main.go"), "")
-            .file(format!("{WORKSPACE}/{MODULE}/go.work"), "")
+            .file(
+                managed_input_base()
+                    .as_ref()
+                    .join("go.work")
+                    .to_string_lossy()
+                    .into_owned(),
+                "",
+            )
             .build();
         let task: Task = Task::new(
             TaskName::new("go-compile"),
@@ -411,6 +431,7 @@ mod tests {
             .resolve(
                 &ParameterValues::default(),
                 &module_directory(),
+                &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
                 &runtime,
@@ -418,7 +439,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             commands[0].arguments(),
-            &[SmolStr::new("libs/common/go.work"), SmolStr::new("libs/common/main.go")]
+            &[
+                SmolStr::new(".target/generate-go-work/binding/go.work"),
+                SmolStr::new("libs/common/main.go"),
+            ]
         );
     }
 
@@ -448,6 +472,7 @@ mod tests {
             .resolve(
                 &values,
                 &module_directory(),
+                &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
                 &runtime,
@@ -479,6 +504,7 @@ mod tests {
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterValues::default(),
             &module_directory(),
+            &managed_input_base(),
             &output_directory(),
             &workspace_root(),
             &runtime,
@@ -523,6 +549,7 @@ mod tests {
             .resolve(
                 &values,
                 &module_directory(),
+                &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
                 &runtime,
@@ -609,6 +636,7 @@ mod tests {
                 .resolve(
                     &values,
                     &module_directory(),
+                    &managed_input_base(),
                     &output_directory(),
                     &workspace_root(),
                     &runtime,

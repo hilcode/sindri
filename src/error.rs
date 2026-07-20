@@ -90,13 +90,6 @@ pub enum SindriError {
     )]
     ScriptEvaluation { nickel_message: String },
 
-    #[error("could not determine the Go toolchain version")]
-    #[diagnostic(
-        help("ensure the `go` command is available (it is provided by the Devenv shell)"),
-        code(sindri::go::toolchain_version_unknown)
-    )]
-    GoToolchainVersionUnknown,
-
     #[error("missing a value for parameter `{plugin}.{parameter}`")]
     #[diagnostic(
         help("supply a value for `{plugin}.{parameter}` in the module or build configuration"),
@@ -179,7 +172,6 @@ mod tests {
         assert_has_help_and_code(&SindriError::ScriptEvaluation {
             nickel_message: "missing definition for `program`".into(),
         });
-        assert_has_help_and_code(&SindriError::GoToolchainVersionUnknown);
         assert_has_help_and_code(&SindriError::ParameterMissing {
             plugin: PluginName::new("plugin"),
             parameter: ParameterName::new("mode"),
