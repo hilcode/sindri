@@ -1,4 +1,11 @@
+use sindri::parameter::Parameter;
 use sindri::parameter::ParameterBinding;
+use sindri::parameter::ParameterDeclarations;
+use sindri::parameter::ParameterName;
+use sindri::parameter::ParameterState;
+use sindri::parameter::ParameterType;
+use sindri::parameter::ParameterValue;
+use sindri::parameter::PluginName;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,10 +21,29 @@ fn expected_version_output() -> String {
     format!("sindri {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// The binding hash every task in these tests resolves to: none of them declare a parameter yet, so
-/// every task shares the same empty binding, and therefore the same binding-hash path segment.
+/// The binding hash a parameter-less task (`generate-go-work`) resolves to.
 fn empty_binding_hash() -> String {
     ParameterBinding::empty().binding_hash().to_hex()
+}
+
+/// The binding hash `go-compile` resolves to for a given `sindri-go.mode` value. Every Go module
+/// below binds `mode = "debug"` unless it's specifically exercising a second, coexisting binding, so
+/// `mode_binding_hash("debug")` is the binding-hash path segment shared by most fixtures here.
+fn mode_binding_hash(mode: &str) -> String {
+    let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+        PluginName::new("sindri-go"),
+        ParameterName::new("mode"),
+        ParameterType::new("String"),
+    )]);
+    let values: ParameterState = ParameterState::new([(
+        PluginName::new("sindri-go"),
+        ParameterName::new("mode"),
+        ParameterValue::new(format!("\"{mode}\"")),
+    )]);
+    ParameterBinding::resolve(&declared, &values)
+        .unwrap()
+        .binding_hash()
+        .to_hex()
 }
 
 fn workspace_dir() -> TempDir {
@@ -34,7 +60,8 @@ fn module_dir() -> TempDir {
     let directory: TempDir = workspace_dir();
     fs::write(
         directory.path().join("sindri.build"),
-        r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+        r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     directory
@@ -68,7 +95,8 @@ fn multi_module_dir() -> TempDir {
     fs::write(
         directory.path().join("sindri.build"),
         r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
-             dependencies = { compile = [ { module = "//lib/greeting" } ] } }"#,
+             dependencies = { compile = [ { module = "//lib/greeting" } ] },
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     fs::write(directory.path().join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
@@ -81,7 +109,8 @@ fn multi_module_dir() -> TempDir {
     fs::create_dir_all(&greeting).unwrap();
     fs::write(
         greeting.join("sindri.build"),
-        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0" }"#,
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     fs::write(greeting.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
@@ -104,7 +133,8 @@ fn isolated_multi_module_dir() -> TempDir {
     fs::write(
         app.join("sindri.build"),
         r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
-             dependencies = { compile = [ { module = "//lib" } ] } }"#,
+             dependencies = { compile = [ { module = "//lib" } ] },
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     fs::write(app.join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
@@ -117,7 +147,8 @@ fn isolated_multi_module_dir() -> TempDir {
     fs::create_dir_all(&lib).unwrap();
     fs::write(
         lib.join("sindri.build"),
-        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0" }"#,
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     fs::write(lib.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
@@ -140,7 +171,7 @@ fn app_binary(workspace: &Path) -> Vec<u8> {
         .join(".target")
         .join("app")
         .join("go-compile")
-        .join(empty_binding_hash());
+        .join(mode_binding_hash("debug"));
     let entry: fs::DirEntry = fs::read_dir(&output_directory)
         .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
         .next()
@@ -407,7 +438,10 @@ fn compile_quiet_with_failure_still_shows_error() {
 fn go_compile_output_directory(workspace: &Path) -> PathBuf {
     // A plain `sindri.build` module has no qualifier, so its state lives directly under `.target`
     // (no module-path segment): `.target/<task-name>/<binding-hash>/`.
-    workspace.join(".target").join("go-compile").join(empty_binding_hash())
+    workspace
+        .join(".target")
+        .join("go-compile")
+        .join(mode_binding_hash("debug"))
 }
 
 #[test]
@@ -468,6 +502,47 @@ fn deleting_the_output_binary_triggers_a_rebuild() {
     assert!(
         String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
         "deleting the output binary should re-run go-compile (self-healing)"
+    );
+}
+
+#[test]
+fn two_parameter_bindings_of_one_module_coexist_without_overwriting_each_other() {
+    let directory: TempDir = go_module_dir();
+    let debug_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        debug_build.status.success(),
+        "debug-mode compile failed; stderr: {}",
+        String::from_utf8_lossy(&debug_build.stderr)
+    );
+    let debug_output_directory: PathBuf = go_compile_output_directory(directory.path());
+    assert!(
+        fs::read_dir(&debug_output_directory).unwrap().next().is_some(),
+        "the debug binding should leave a binary in {debug_output_directory:?}"
+    );
+
+    // Switch the same module to release mode and rebuild. This must add a new binding-hash
+    // directory alongside the debug one, not overwrite it.
+    let build_file: PathBuf = directory.path().join("sindri.build");
+    let source: String = fs::read_to_string(&build_file).unwrap();
+    fs::write(&build_file, source.replace(r#"mode = "debug""#, r#"mode = "release""#)).unwrap();
+    let release_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        release_build.status.success(),
+        "release-mode compile failed; stderr: {}",
+        String::from_utf8_lossy(&release_build.stderr)
+    );
+    let release_output_directory: PathBuf = directory
+        .path()
+        .join(".target")
+        .join("go-compile")
+        .join(mode_binding_hash("release"));
+    assert!(
+        fs::read_dir(&release_output_directory).unwrap().next().is_some(),
+        "the release binding should leave a binary in {release_output_directory:?}"
+    );
+    assert!(
+        fs::read_dir(&debug_output_directory).unwrap().next().is_some(),
+        "the debug binding's output should still exist after building the release binding"
     );
 }
 

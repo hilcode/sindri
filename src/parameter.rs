@@ -32,7 +32,8 @@ impl Display for PluginName {
 }
 
 /// The name of a [`Parameter`], unique within its owning plugin rather than globally.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(transparent)]
 pub struct ParameterName(SmolStr);
 
 impl ParameterName {
@@ -149,13 +150,13 @@ impl ParameterValue {
 /// have a value here, and this may carry values for parameters no declared set names —
 /// [`ParameterBinding::resolve`] is what checks both against a [`ParameterDeclarations`].
 #[derive(Clone, Debug, Default)]
-pub struct ParameterValues {
+pub struct ParameterState {
     values: BTreeMap<(PluginName, ParameterName), ParameterValue>,
 }
 
-impl ParameterValues {
-    pub fn new(values: impl IntoIterator<Item = (PluginName, ParameterName, ParameterValue)>) -> ParameterValues {
-        ParameterValues {
+impl ParameterState {
+    pub fn new(values: impl IntoIterator<Item = (PluginName, ParameterName, ParameterValue)>) -> ParameterState {
+        ParameterState {
             values: values
                 .into_iter()
                 .map(|(plugin, name, value): (PluginName, ParameterName, ParameterValue)| -> ((PluginName, ParameterName), ParameterValue) {
@@ -167,6 +168,29 @@ impl ParameterValues {
 
     fn get(&self, plugin: &PluginName, name: &ParameterName) -> Option<&ParameterValue> {
         self.values.get(&(plugin.clone(), name.clone()))
+    }
+}
+
+impl<'deserialize> Deserialize<'deserialize> for ParameterState {
+    /// Read the nested `{ plugin = { parameter = "value" } }` shape a build file's `parameters` field
+    /// is authored in. Each value arrives as a plain Rust `String` and is re-encoded as a Nickel string
+    /// literal, since [`ParameterValue`] holds the literal source text a `Script` reads its parameters
+    /// from.
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let raw: BTreeMap<PluginName, BTreeMap<ParameterName, String>> = BTreeMap::deserialize(deserializer)?;
+        Ok(ParameterState::new(raw.into_iter().flat_map(
+            |(plugin, values): (PluginName, BTreeMap<ParameterName, String>)| {
+                values.into_iter().map(move |(name, value): (ParameterName, String)| {
+                    (
+                        plugin.clone(),
+                        name,
+                        ParameterValue::new(Nickel::string_literal(&value)),
+                    )
+                })
+            },
+        )))
     }
 }
 
@@ -196,7 +220,7 @@ impl ParameterBinding {
     /// have a value, and that value must satisfy the parameter's own `ParameterType` contract. Both
     /// checks run here, before a `Script` is ever evaluated, so a failure names the offending
     /// parameter directly rather than surfacing as a Nickel error deep inside the script.
-    pub fn resolve(declared: &ParameterDeclarations, values: &ParameterValues) -> SindriResult<ParameterBinding> {
+    pub fn resolve(declared: &ParameterDeclarations, values: &ParameterState) -> SindriResult<ParameterBinding> {
         let mut bound: BTreeMap<(PluginName, ParameterName), ParameterValue> = BTreeMap::new();
         for ((plugin, name), parameter_type) in &declared.parameters {
             let value: &ParameterValue = values.get(plugin, name).ok_or_else(|| -> SindriError {
@@ -284,8 +308,8 @@ mod tests {
         )])
     }
 
-    fn values(value: &str) -> ParameterValues {
-        ParameterValues::new([(plugin(), ParameterName::new("mode"), ParameterValue::new(value))])
+    fn values(value: &str) -> ParameterState {
+        ParameterState::new([(plugin(), ParameterName::new("mode"), ParameterValue::new(value))])
     }
 
     #[test]
@@ -305,7 +329,7 @@ mod tests {
     #[test]
     fn a_missing_value_errors_before_the_script_runs_naming_the_parameter() {
         let result: SindriResult<ParameterBinding> =
-            ParameterBinding::resolve(&declared("String"), &ParameterValues::default());
+            ParameterBinding::resolve(&declared("String"), &ParameterState::default());
         let error: SindriError = result.unwrap_err();
         assert!(matches!(error, SindriError::ParameterMissing { .. }));
         assert!(error.to_string().contains("mode"), "message was: {error}");
@@ -360,7 +384,7 @@ mod tests {
                 ParameterType::new("String"),
             ),
         ]);
-        let values: ParameterValues = ParameterValues::new([
+        let values: ParameterState = ParameterState::new([
             (
                 PluginName::new("plugin-a"),
                 ParameterName::new("mode"),

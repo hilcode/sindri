@@ -3,4 +3,5 @@
 ,   type = "executable"
 ,   version = "0.1.0"
 ,   dependencies = { compile = [ { module = "//lib/greeting" } ] }
+,   parameters = { "sindri-go" = { mode = "debug" } }
 }

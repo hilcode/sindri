@@ -174,8 +174,15 @@ impl Lifecycle {
                     .iter()
                     .any(|&index: &usize| module_rebuilt[index].is_rebuilt()),
             );
-            let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) =
-                execute_graph(&graph, &location, &context, dependency_rebuilt, config, runtime)?;
+            let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) = execute_graph(
+                &graph,
+                &location,
+                node.module().parameters(),
+                &context,
+                dependency_rebuilt,
+                config,
+                runtime,
+            )?;
             module_rebuilt.push(rebuilt);
             outcomes.extend(module_outcomes);
         }
@@ -270,7 +277,8 @@ mod tests {
             )
             .file(
                 "/workspace/sindri.build",
-                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .command("rm -f go.work", succeeded())
             .command("go work init", succeeded())
@@ -371,7 +379,8 @@ mod tests {
             )
             .file(
                 "/workspace/sindri.build",
-                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+                r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .command("rm -f go.work", succeeded())
             .command("go work init", succeeded())
@@ -397,11 +406,13 @@ mod tests {
             .file(
                 "/workspace/sindri.build",
                 r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
-                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+                     dependencies = { compile = [ { module = "//lib" } ] },
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .file(
                 "/workspace/lib/sindri.build",
-                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .command("rm -f go.work", succeeded())
             .command("go work init", succeeded())
@@ -460,12 +471,14 @@ mod tests {
             .file(
                 "/workspace/app/sindri.build",
                 r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
-                     dependencies = { compile = [ { module = "//lib" } ] } }"#,
+                     dependencies = { compile = [ { module = "//lib" } ] },
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .file("/workspace/app/main.go", "package main\n\nfunc main() {}\n")
             .file(
                 "/workspace/lib/sindri.build",
-                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0" }"#,
+                r#"{ name = "lib", language = "go", type = "library", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
             )
             .file("/workspace/lib/lib.go", "package lib\n")
             .command("rm -f go.work", succeeded())

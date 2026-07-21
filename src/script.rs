@@ -208,9 +208,9 @@ mod tests {
     use crate::parameter::Parameter;
     use crate::parameter::ParameterDeclarations;
     use crate::parameter::ParameterName;
+    use crate::parameter::ParameterState;
     use crate::parameter::ParameterType;
     use crate::parameter::ParameterValue;
-    use crate::parameter::ParameterValues;
     use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use std::path::PathBuf;
@@ -372,7 +372,7 @@ mod tests {
             ParameterName::new("mode"),
             ParameterType::new("String"),
         )]);
-        let values: ParameterValues = ParameterValues::new([(
+        let values: ParameterState = ParameterState::new([(
             PluginName::new("plugin"),
             ParameterName::new("mode"),
             ParameterValue::new("\"debug\""),
@@ -407,7 +407,7 @@ mod tests {
             ParameterName::new("mode"),
             ParameterType::new("String"),
         )]);
-        let values: ParameterValues = ParameterValues::new([(
+        let values: ParameterState = ParameterState::new([(
             PluginName::new("plugin"),
             ParameterName::new("mode"),
             ParameterValue::new("\"debug\""),
@@ -435,15 +435,31 @@ mod tests {
         assert!(matches!(result, Err(SindriError::ScriptEvaluation { .. })));
     }
 
+    /// A resolved `mode` binding, the same shape `go-compile`'s declared parameter now requires before
+    /// its script will evaluate — `go-format`/`go-test` still take [`ParameterBinding::empty`], since
+    /// they declare no parameters at all.
+    fn mode_binding(mode: &str) -> ParameterBinding {
+        let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterType::new("String"),
+        )]);
+        let values: ParameterState = ParameterState::new([(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterValue::new(format!("\"{mode}\"")),
+        )]);
+        ParameterBinding::resolve(&declared, &values).unwrap()
+    }
+
     #[test]
     fn the_go_scripts_yield_their_toolchain_commands() {
-        for (script, program, first_argument) in [
-            (Script::go_format(), "gofmt", "-l"),
-            (Script::go_compile(), "go", "build"),
-            (Script::go_compile_executable(), "go", "build"),
-            (Script::go_test(), "go", "test"),
+        for (script, program, first_argument, parameters) in [
+            (Script::go_format(), "gofmt", "-l", ParameterBinding::empty()),
+            (Script::go_compile(), "go", "build", mode_binding("debug")),
+            (Script::go_compile_executable(), "go", "build", mode_binding("debug")),
+            (Script::go_test(), "go", "test", ParameterBinding::empty()),
         ] {
-            let parameters: ParameterBinding = ParameterBinding::empty();
             let input_files: FileSet = file_set(&[]);
             let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
             let managed_input_base: AbsoluteDirectory =
@@ -468,7 +484,7 @@ mod tests {
 
     #[test]
     fn go_compile_executable_writes_its_binary_to_the_output_directory() {
-        let parameters: ParameterBinding = ParameterBinding::empty();
+        let parameters: ParameterBinding = mode_binding("debug");
         let input_files: FileSet = file_set(&[]);
         let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
         let managed_input_base: AbsoluteDirectory =

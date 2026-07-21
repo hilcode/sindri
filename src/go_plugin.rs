@@ -2,7 +2,11 @@ use crate::file_set::FileSetPattern;
 use crate::module::ArtifactType;
 use crate::module_graph::ModuleGraph;
 use crate::module_graph::ModuleNode;
+use crate::parameter::Parameter;
 use crate::parameter::ParameterDeclarations;
+use crate::parameter::ParameterName;
+use crate::parameter::ParameterType;
+use crate::parameter::PluginName;
 use crate::script::Script;
 use crate::task::DeclaredTaskInput;
 use crate::task::ManagedTaskInput;
@@ -25,10 +29,23 @@ fn go_source_superset() -> FileSetPattern {
 }
 
 /// The built-in Go plugin's tasks, contributed as shipped Nickel `Script`s rather than a hand-built
-/// `Command`. No declared parameters yet (a `mode` binding is a later phase).
+/// `Command`.
 pub struct GoPlugin;
 
 impl GoPlugin {
+    /// `go-compile`'s declared parameters: `mode` selects between a debug build (the Go toolchain's
+    /// own defaults, kept while iterating) and a release build (`-trimpath -ldflags "-s -w"`, stripping
+    /// symbols and embedded build paths for a distributable binary). Every module built with `go-compile`
+    /// must bind it — there is no implicit default — so a build file that never sets it fails with a
+    /// named `ParameterMissing` error rather than silently picking one mode over the other.
+    fn compile_parameters() -> ParameterDeclarations {
+        ParameterDeclarations::new([Parameter::new(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterType::new(r#"std.contract.from_predicate (fun value => value == "debug" || value == "release")"#),
+        )])
+    }
+
     /// The `go-format` / `go-compile` / `go-test` tasks, each paired with the lifecycle step it is
     /// bound to. `go-compile`'s script depends on `artifact_type`: an executable links a runnable
     /// binary into the tracked output directory, so its build is `go build -o <output-directory>/
@@ -62,7 +79,7 @@ impl GoPlugin {
                     DeclaredTaskInput::new(go_source_superset()),
                     ManagedTaskInput::new(FileSetPattern::new(["go.work"])),
                     TaskOutput::new(FileSetPattern::new(["**/*"])),
-                    ParameterDeclarations::default(),
+                    GoPlugin::compile_parameters(),
                 ),
                 Step::new("compile"),
             ),
@@ -120,7 +137,10 @@ impl GoPlugin {
 mod tests {
     use super::*;
     use crate::module_graph::ModuleGraph;
-    use crate::parameter::ParameterValues;
+    use crate::parameter::ParameterName;
+    use crate::parameter::ParameterState;
+    use crate::parameter::ParameterValue;
+    use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use crate::script::Command;
     use crate::types::AbsoluteDirectory;
@@ -159,11 +179,22 @@ mod tests {
         assert_eq!(step_named(&tasks, "go-test"), &Step::new("test"));
     }
 
-    fn resolve(task: &Task) -> Vec<Command> {
+    /// `mode` bound to `mode`, as `sindri-go`'s `go-compile` task now declares it — `go-test`
+    /// harmlessly ignores it (its declared parameter set is empty), so this one binding fits every
+    /// task [`resolve`] is called with.
+    fn mode(mode: &str) -> ParameterState {
+        ParameterState::new([(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterValue::new(format!("\"{mode}\"")),
+        )])
+    }
+
+    fn resolve_with(task: &Task, parameter_state: &ParameterState) -> Vec<Command> {
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
         task.resolve(
-            &ParameterValues::default(),
+            parameter_state,
             &RelativeDirectory::new(""),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out")),
@@ -171,6 +202,10 @@ mod tests {
             &runtime,
         )
         .unwrap()
+    }
+
+    fn resolve(task: &Task) -> Vec<Command> {
+        resolve_with(task, &mode("debug"))
     }
 
     #[test]
@@ -196,10 +231,40 @@ mod tests {
     }
 
     #[test]
+    fn release_mode_strips_symbols_and_trims_paths() {
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Library);
+        let commands: Vec<Command> = resolve_with(task_named(&tasks, "go-compile"), &mode("release"));
+        assert_eq!(
+            commands[0].arguments(),
+            &[
+                SmolStr::new("build"),
+                SmolStr::new("-trimpath"),
+                SmolStr::new("-ldflags"),
+                SmolStr::new("-s -w"),
+                SmolStr::new("./..."),
+            ]
+        );
+    }
+
+    #[test]
     fn go_format_and_go_test_declare_no_parameters() {
         let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
         assert!(task_named(&tasks, "go-format").declared_parameters().is_empty());
         assert!(task_named(&tasks, "go-test").declared_parameters().is_empty());
+    }
+
+    #[test]
+    fn go_compile_declares_the_mode_parameter() {
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
+        let declared: Vec<(PluginName, ParameterName)> = task_named(&tasks, "go-compile")
+            .declared_parameters()
+            .iter()
+            .map(|(plugin, name, _)| (plugin.clone(), name.clone()))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![(PluginName::new("sindri-go"), ParameterName::new("mode"))]
+        );
     }
 
     #[test]
@@ -282,7 +347,7 @@ mod tests {
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let commands: Vec<Command> = task
             .resolve(
-                &ParameterValues::default(),
+                &ParameterState::default(),
                 &RelativeDirectory::new(""),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),

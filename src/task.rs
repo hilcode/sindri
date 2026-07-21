@@ -6,7 +6,7 @@ use crate::nickel_import::TransitiveSource;
 use crate::nickel_import::resolve_transitive_source;
 use crate::parameter::ParameterBinding;
 use crate::parameter::ParameterDeclarations;
-use crate::parameter::ParameterValues;
+use crate::parameter::ParameterState;
 use crate::runtime::FileSystem;
 use crate::script::Command;
 use crate::script::Script;
@@ -158,7 +158,7 @@ impl Task {
         &self.declared_parameters
     }
 
-    /// Resolve this task for a concrete build: bind `parameter_values` against the task's declared
+    /// Resolve this task for a concrete build: bind `parameter_state` against the task's declared
     /// parameters, match its declared input against the module directory and its managed input
     /// against `managed_input_base` — their union is the task's effective input — and apply the
     /// script to the bound parameters and effective input to yield the ordered commands to run.
@@ -167,14 +167,14 @@ impl Task {
     /// `generate-go-work` task's own output directory, shared workspace-wide.
     pub fn resolve(
         &self,
-        parameter_values: &ParameterValues,
+        parameter_state: &ParameterState,
         module_directory: &RelativeDirectory,
         managed_input_base: &AbsoluteDirectory,
         output_directory: &AbsoluteDirectory,
         workspace_root: &WorkspaceRoot,
         file_system: &impl FileSystem,
     ) -> SindriResult<Vec<Command>> {
-        let binding: ParameterBinding = ParameterBinding::resolve(&self.declared_parameters, parameter_values)?;
+        let binding: ParameterBinding = ParameterBinding::resolve(&self.declared_parameters, parameter_state)?;
         let module_directory_absolute: AbsoluteDirectory =
             workspace_root.to_absolute_directory().join_directory(module_directory);
         let declared_files: FileSet = resolve_file_set(
@@ -372,7 +372,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let result: SindriResult<Vec<Command>> = task.resolve(
-            &ParameterValues::default(),
+            &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
@@ -394,7 +394,7 @@ mod tests {
             ParameterDeclarations::default(),
         );
         let result: SindriResult<Vec<Command>> = task.resolve(
-            &ParameterValues::default(),
+            &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
@@ -429,7 +429,7 @@ mod tests {
         );
         let commands: Vec<Command> = task
             .resolve(
-                &ParameterValues::default(),
+                &ParameterState::default(),
                 &module_directory(),
                 &managed_input_base(),
                 &output_directory(),
@@ -463,7 +463,7 @@ mod tests {
                 ParameterType::new("String"),
             )]),
         );
-        let values: ParameterValues = ParameterValues::new([(
+        let values: ParameterState = ParameterState::new([(
             PluginName::new("sindri-go"),
             ParameterName::new("mode"),
             ParameterValue::new("\"release\""),
@@ -502,7 +502,7 @@ mod tests {
             )]),
         );
         let result: SindriResult<Vec<Command>> = task.resolve(
-            &ParameterValues::default(),
+            &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
@@ -540,7 +540,7 @@ mod tests {
     fn resolution_supports_a_script_that_imports_a_workspace_local_helper() {
         let task: Task = go_compile_task();
         let runtime: DummyRuntime = runtime_with_helper("go");
-        let values: ParameterValues = ParameterValues::new([(
+        let values: ParameterState = ParameterState::new([(
             PluginName::new("sindri-go"),
             ParameterName::new("mode"),
             ParameterValue::new("\"release\""),
@@ -627,7 +627,7 @@ mod tests {
             .definition_hash(&module_directory(), &workspace_root(), &runtime)
             .unwrap();
         for mode in ["debug", "release"] {
-            let values: ParameterValues = ParameterValues::new([(
+            let values: ParameterState = ParameterState::new([(
                 PluginName::new("sindri-go"),
                 ParameterName::new("mode"),
                 ParameterValue::new(format!("\"{mode}\"")),

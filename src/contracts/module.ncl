@@ -21,4 +21,8 @@ let Dependency = std.contract.any_of [
       "test-runtime" | Array Dependency | optional,
     }
     | optional,
+  # Parameter values, keyed by owning plugin then parameter name — e.g. `{ sindri-go = { mode =
+  # "release" } }`. A task's declared parameters (owned by the plugin that defines the task) are
+  # validated against these before its script ever runs.
+  parameters | { _ : { _ : String } } | optional,
 }

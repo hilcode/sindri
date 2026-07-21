@@ -2,4 +2,5 @@
 ,   language = "go"
 ,   type = "library"
 ,   version = "0.1.0"
+,   parameters = { "sindri-go" = { mode = "debug" } }
 }

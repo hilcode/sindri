@@ -169,9 +169,9 @@ mod tests {
     use crate::parameter::ParameterBinding;
     use crate::parameter::ParameterDeclarations;
     use crate::parameter::ParameterName;
+    use crate::parameter::ParameterState;
     use crate::parameter::ParameterType;
     use crate::parameter::ParameterValue;
-    use crate::parameter::ParameterValues;
     use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use crate::runtime::DummyRuntimeBuilder;
@@ -223,7 +223,7 @@ mod tests {
             ParameterName::new("mode"),
             ParameterType::new("String"),
         )]);
-        let values: ParameterValues = ParameterValues::new([(
+        let values: ParameterState = ParameterState::new([(
             PluginName::new("sindri-go"),
             ParameterName::new("mode"),
             ParameterValue::new(format!("\"{mode}\"")),

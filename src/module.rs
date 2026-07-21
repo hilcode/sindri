@@ -2,6 +2,7 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::nickel_eval::Contract;
 use crate::nickel_eval::Nickel;
+use crate::parameter::ParameterState;
 use crate::runtime::FileSystem;
 use crate::types::{
     AbsoluteDirectory, AbsoluteFile, BuildFile, ConfigFile, DirEntry, FileKind, Language, ModuleIdentity, ModuleName,
@@ -194,6 +195,8 @@ pub struct Module {
     version: Version,
     #[serde(default)]
     dependencies: DependencyGroup,
+    #[serde(default)]
+    parameters: ParameterState,
 }
 
 impl Module {
@@ -215,6 +218,10 @@ impl Module {
 
     pub fn dependencies(&self) -> &DependencyGroup {
         &self.dependencies
+    }
+
+    pub fn parameters(&self) -> &ParameterState {
+        &self.parameters
     }
 }
 
@@ -294,6 +301,12 @@ impl Module {
 mod tests {
     use super::*;
     use crate::error::SindriError;
+    use crate::parameter::Parameter;
+    use crate::parameter::ParameterBinding;
+    use crate::parameter::ParameterDeclarations;
+    use crate::parameter::ParameterName;
+    use crate::parameter::ParameterType;
+    use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use crate::runtime::DummyRuntimeBuilder;
     use crate::types::WorkingDirectory;
@@ -499,6 +512,38 @@ mod tests {
         assert_eq!(dependencies.test().len(), 1);
         assert!(dependencies.runtime().is_empty());
         assert!(dependencies.test_runtime().is_empty());
+    }
+
+    #[test]
+    fn load_module_parses_parameters() {
+        let source: &str = r#"{
+  name = "app", language = "go", type = "executable", version = "0.1.0",
+  parameters = { "sindri-go" = { mode = "release" } },
+}"#;
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterType::new("String"),
+        )]);
+        let binding: ParameterBinding = ParameterBinding::resolve(&declared, module.parameters()).unwrap();
+        assert_eq!(
+            binding.to_nickel_record(),
+            r#"{ "sindri-go" = { "mode" = "release" } }"#
+        );
+    }
+
+    #[test]
+    fn load_module_without_parameters_has_an_empty_set() {
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        let declared: ParameterDeclarations = ParameterDeclarations::default();
+        assert!(ParameterBinding::resolve(&declared, module.parameters()).is_ok());
     }
 
     #[test]

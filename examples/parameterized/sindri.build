@@ -1,4 +1,4 @@
-{   name = "greeter"
+{   name = "parameterized"
 ,   language = "go"
 ,   type = "executable"
 ,   version = "0.1.0"

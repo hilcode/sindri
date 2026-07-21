@@ -23,7 +23,7 @@ clean example:
     rm -rf {{example}}/.target
 
 # Compile every example
-compile-all: (compile "hello") (compile "greeter") (compile "multi-module")
+compile-all: (compile "hello") (compile "greeter") (compile "multi-module") (compile "parameterized")
 
 # Remove the build output from every example
-clean-all: (clean "hello") (clean "greeter") (clean "multi-module")
+clean-all: (clean "hello") (clean "greeter") (clean "multi-module") (clean "parameterized")

@@ -6,11 +6,12 @@ described by `sindri.build` files alongside their own sources.
 
 ## The examples
 
-| Directory       | What it shows                                                         |
-| --------------- | -------------------------------------------------------------------- |
-| `hello/`        | The smallest possible Go executable module — one `main.go`.          |
-| `greeter/`      | A Go executable split across a `main` package and a `greeting/` subpackage, so incremental rebuilds after editing a single file are observable. |
-| `multi-module/` | An executable module that declares a `{ module = … }` dependency on a local Go library module in a `lib/greeting/` subdirectory — two modules built in dependency-first order. |
+| Directory         | What it shows                                                         |
+| ----------------- | -------------------------------------------------------------------- |
+| `hello/`          | The smallest possible Go executable module — one `main.go`.          |
+| `greeter/`        | A Go executable split across a `main` package and a `greeting/` subpackage, so incremental rebuilds after editing a single file are observable. |
+| `multi-module/`   | An executable module that declares a `{ module = … }` dependency on a local Go library module in a `lib/greeting/` subdirectory — two modules built in dependency-first order. |
+| `parameterized/`  | A Go executable whose `sindri.build` binds `sindri-go.mode`, showing how two parameter bindings of the same module coexist in the build directory. |
 
 ## Running them
 
@@ -31,8 +32,8 @@ the tool — including its embedded `*.ncl` contracts.
 `compile` runs the `format` step (`gofmt`) and then the `compile` step
 (`go build`). The built binary lands under
 `.target/go-compile/<binding-hash>/` — the hash names this particular build's
-parameter binding, so different bindings of the same task can one day coexist
-side by side without overwriting each other.
+parameter binding, so different bindings of the same task coexist side by side
+without overwriting each other (see "Parameter bindings" below).
 
 ### Incremental correctness
 
@@ -66,13 +67,35 @@ runs. The file lives inside the build directory, so it is a pure build artifact 
 never touches the source tree:
 
 ```
-just compile multi-module           # builds lib/greeting, then app
-cat multi-module/.target/go.work    # generated: a `use` entry per module
+just compile multi-module                              # builds lib/greeting, then app
+cat multi-module/.target/generate-go-work/*/go.work     # generated: a `use` entry per module
 ```
 
-> **Known gap:** `go.work` is generated, but nothing points `go` at it via `GOWORK`
-> yet, so `just compile multi-module` currently fails to resolve the sibling import.
-> Wiring the generated file back into the build as a tracked input is in progress.
+### Parameter bindings
+
+`parameterized/`'s `sindri.build` binds a value for `go-compile`'s `mode` parameter:
+
+```nickel
+parameters = { "sindri-go" = { mode = "debug" } }
+```
+
+`mode` selects between a debug build (the Go toolchain's own defaults) and a release
+build (`-trimpath -ldflags "-s -w"`, stripping symbols and embedded paths). Every
+module built with `go-compile` must set it — there is no implicit default.
+
+Edit the value and rebuild to see the two bindings coexist rather than overwrite one
+another:
+
+```sh
+just compile parameterized                          # builds with mode = "debug"
+sed -i 's/mode = "debug"/mode = "release"/' parameterized/sindri.build
+just compile parameterized                          # builds again with mode = "release"
+ls parameterized/.target/go-compile/                 # two binding-hash directories, side by side
+```
+
+The debug binary is larger and unstripped; the release binary is smaller and stripped
+(`file parameterized/.target/go-compile/*/parameterized` shows the difference). Both
+directories persist until `just clean parameterized` removes the whole `.target/`.
 
 `just clean-all` removes every example's build output (`just clean <example>` for
 one). The `.target/` build directory each run produces — including the generated

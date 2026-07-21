@@ -7,9 +7,8 @@ use crate::file_set::FileSet;
 use crate::lifecycle::TaskGraph;
 use crate::lifecycle::TaskGraphNode;
 use crate::metadata_cache::MetadataCache;
-use crate::parameter::BindingHash;
 use crate::parameter::ParameterBinding;
-use crate::parameter::ParameterValues;
+use crate::parameter::ParameterState;
 use crate::runtime::Runtime;
 use crate::script::Command as ScriptCommand;
 use crate::task::Task;
@@ -282,6 +281,28 @@ fn group_nodes_by_step(nodes: &[TaskGraphNode]) -> Vec<Vec<TaskGraphNodeId>> {
     groups
 }
 
+/// A task's module-scoped resolution context: the module directory its declared input and script
+/// resolve against, and the parameter values available to bind against its declared parameters.
+/// Distinct from [`BuildContext`], which stays constant for the whole build — this varies per module,
+/// and bundling the two keeps the resolve/run call chain below from growing an unbundled parameter per
+/// module-scoped value.
+struct ModuleContext<'context> {
+    module_directory: &'context RelativeDirectory,
+    parameter_state: &'context ParameterState,
+}
+
+impl<'context> ModuleContext<'context> {
+    fn new(
+        module_directory: &'context RelativeDirectory,
+        parameter_state: &'context ParameterState,
+    ) -> ModuleContext<'context> {
+        ModuleContext {
+            module_directory,
+            parameter_state,
+        }
+    }
+}
+
 /// A task paired with the decision of whether it must run. Built in a serial pre-pass so the
 /// executor knows, before spawning anything, which tasks are clean (and stay silent) and which are
 /// dirty (and run).
@@ -294,22 +315,26 @@ struct TaskPlan {
 /// Build a task's [`TaskLayout`], compute its current run record, and compare it against what was
 /// persisted to decide clean or dirty — the "resolve, then check dirtiness" half of a task's
 /// lifecycle. `module_path` names where the task's own state nests under the build directory,
-/// distinct from `module_directory`, the module's real source location. The building block both
-/// [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped to
-/// no module at all) resolve a task with.
+/// distinct from `module.module_directory`, the module's real source location. The building block
+/// both [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped
+/// to no module at all) resolve a task with.
 fn resolve_task_plan(
     task: &Task,
-    module_directory: &RelativeDirectory,
+    module: &ModuleContext,
     module_path: &RelativeDirectory,
     context: &BuildContext,
     runtime: &impl Runtime,
 ) -> MietteResult<TaskPlan> {
-    // No task declares a parameter yet, so every binding is the same empty one.
-    let binding_hash: BindingHash = ParameterBinding::empty().binding_hash();
-    let layout: TaskLayout = TaskLayout::new(context.build_directory(), module_path, task.name(), binding_hash);
+    let binding: ParameterBinding = ParameterBinding::resolve(task.declared_parameters(), module.parameter_state)?;
+    let layout: TaskLayout = TaskLayout::new(
+        context.build_directory(),
+        module_path,
+        task.name(),
+        binding.binding_hash(),
+    );
     let current_record: TaskRunRecord = TaskRunRecord::compute(
         task,
-        module_directory,
+        module.module_directory,
         context.managed_input_base(),
         layout.output_directory(),
         context.workspace_root(),
@@ -330,7 +355,7 @@ fn resolve_task_plan(
 fn plan_group(
     node_ids: &[TaskGraphNodeId],
     nodes: &[TaskGraphNode],
-    module_directory: &RelativeDirectory,
+    module: &ModuleContext,
     module_path: &ModulePath,
     context: &BuildContext,
     runtime: &impl Runtime,
@@ -340,7 +365,7 @@ fn plan_group(
         .map(|&node_id: &TaskGraphNodeId| -> MietteResult<TaskPlan> {
             resolve_task_plan(
                 nodes[node_id.value()].task(),
-                module_directory,
+                module,
                 module_path.as_relative_directory(),
                 context,
                 runtime,
@@ -355,18 +380,17 @@ fn plan_group(
 /// calling thread) run a task with.
 fn run_task_and_persist(
     task: Task,
-    module_directory: &RelativeDirectory,
+    module: &ModuleContext,
     context: &BuildContext,
     layout: &TaskLayout,
     task_start: TaskStart,
     fiber: Fiber,
     runtime: &impl Runtime,
 ) -> TaskOutcome {
-    let result: IoResult<CommandOutcome> =
-        run_one(&task, module_directory, context, layout.output_directory(), runtime);
+    let result: IoResult<CommandOutcome> = run_one(&task, module, context, layout.output_directory(), runtime);
     let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
     if outcome.output().status().is_success() {
-        persist_outcome(outcome.task(), module_directory, context, layout, runtime);
+        persist_outcome(outcome.task(), module.module_directory, context, layout, runtime);
     }
     outcome
 }
@@ -376,7 +400,7 @@ fn run_task_and_persist(
 /// executor is across tasks, never within one task's own command sequence.
 fn run_misses(
     plans: &[TaskPlan],
-    module_directory: &RelativeDirectory,
+    module: &ModuleContext,
     context: &BuildContext,
     runtime: &impl Runtime,
 ) -> Vec<TaskOutcome> {
@@ -393,15 +417,7 @@ fn run_misses(
                 let task: Task = plan.task.clone();
                 scope.spawn(move || -> TaskOutcome {
                     let task_start: TaskStart = TaskStart::new(runtime.now());
-                    run_task_and_persist(
-                        task,
-                        module_directory,
-                        context,
-                        &plan.layout,
-                        task_start,
-                        fiber,
-                        runtime,
-                    )
+                    run_task_and_persist(task, module, context, &plan.layout, task_start, fiber, runtime)
                 })
             })
             .collect();
@@ -418,7 +434,7 @@ fn run_misses(
 /// parameter error) surfaces the same way a real command failure does: as the task's own failure.
 fn run_one(
     task: &Task,
-    module_directory: &RelativeDirectory,
+    module: &ModuleContext,
     context: &BuildContext,
     output_directory: &AbsoluteDirectory,
     runtime: &impl Runtime,
@@ -426,8 +442,8 @@ fn run_one(
     runtime.create_directories(output_directory.as_ref())?;
     let commands: Vec<ScriptCommand> = task
         .resolve(
-            &ParameterValues::default(),
-            module_directory,
+            module.parameter_state,
+            module.module_directory,
             context.managed_input_base(),
             output_directory,
             context.workspace_root(),
@@ -539,6 +555,7 @@ fn persist_outcome(
 pub fn execute_graph(
     graph: &TaskGraph,
     location: &ModuleLocation,
+    parameter_state: &ParameterState,
     context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
     config: &ExecutionConfig,
@@ -547,17 +564,12 @@ pub fn execute_graph(
     let module_directory: RelativeDirectory = context
         .workspace_root()
         .relativize_directory(location.working_directory());
+    let module: ModuleContext = ModuleContext::new(&module_directory, parameter_state);
     let step_groups: Vec<Vec<TaskGraphNodeId>> = group_nodes_by_step(graph.nodes());
     let mut all_outcomes: Vec<TaskOutcome> = Vec::new();
     for group in &step_groups {
-        let mut plans: Vec<TaskPlan> = plan_group(
-            group,
-            graph.nodes(),
-            &module_directory,
-            location.module_path(),
-            context,
-            runtime,
-        )?;
+        let mut plans: Vec<TaskPlan> =
+            plan_group(group, graph.nodes(), &module, location.module_path(), context, runtime)?;
         if dependency_rebuilt.is_rebuilt() {
             // A rebuilt dependency invalidates this module wholesale: its outputs were produced against
             // the dependency's previous sources, which are not part of this module's tracked inputs, so
@@ -574,7 +586,7 @@ pub fn execute_graph(
             }
         }
         let mut miss_outcomes: std::vec::IntoIter<TaskOutcome> =
-            run_misses(&plans, &module_directory, context, runtime).into_iter();
+            run_misses(&plans, &module, context, runtime).into_iter();
         let batch_start: usize = all_outcomes.len();
         for plan in &plans {
             let outcome: TaskOutcome = match plan.dirtiness {
@@ -633,7 +645,10 @@ pub fn run_standalone_task(
     config: &ExecutionConfig,
     runtime: &impl Runtime,
 ) -> MietteResult<(TaskOutcome, AbsoluteDirectory)> {
-    let plan: TaskPlan = resolve_task_plan(task, module_directory, module_directory, context, runtime)?;
+    // `generate-go-work` is the only task run this way, and it declares no parameters.
+    let no_parameters: ParameterState = ParameterState::default();
+    let module: ModuleContext = ModuleContext::new(module_directory, &no_parameters);
+    let plan: TaskPlan = resolve_task_plan(task, &module, module_directory, context, runtime)?;
     let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
     let outcome: TaskOutcome = match plan.dirtiness {
         Dirtiness::Clean => TaskOutcome::cached(plan.task, TaskStart::new(runtime.now()), Fiber::new(0)),
@@ -643,7 +658,7 @@ pub fn run_standalone_task(
             }
             run_task_and_persist(
                 plan.task,
-                module_directory,
+                &module,
                 context,
                 &plan.layout,
                 TaskStart::new(runtime.now()),
@@ -784,8 +799,16 @@ mod tests {
         let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
-        execute_graph(graph, &location, &context, ModuleRebuilt::new(false), config, runtime)
-            .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
+        execute_graph(
+            graph,
+            &location,
+            &ParameterState::default(),
+            &context,
+            ModuleRebuilt::new(false),
+            config,
+            runtime,
+        )
+        .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
     }
 
     /// Run a graph with real process spawning, isolating its persisted state in a fresh temporary
@@ -803,6 +826,7 @@ mod tests {
         execute_graph(
             graph,
             &location,
+            &ParameterState::default(),
             &context,
             ModuleRebuilt::new(false),
             config,
@@ -831,6 +855,7 @@ mod tests {
         execute_graph(
             graph,
             &location,
+            &ParameterState::default(),
             &context,
             dependency_rebuilt,
             &default_config(),

@@ -120,7 +120,8 @@ mod tests {
     fn go_workspace() -> DummyRuntimeBuilder {
         workspace().file(
             "/workspace/sindri.build",
-            r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+            r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0",
+                 parameters = { "sindri-go" = { mode = "debug" } } }"#,
         )
     }
 
