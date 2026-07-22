@@ -10,12 +10,11 @@ use crate::metadata_cache::MetadataCache;
 use crate::parameter::ParameterBinding;
 use crate::parameter::ParameterState;
 use crate::runtime::Runtime;
-use crate::script::Command as ScriptCommand;
+use crate::script::Command;
 use crate::task::Task;
 use crate::task::resolve_file_set;
 use crate::types::AbsoluteDirectory;
 use crate::types::BuildStart;
-use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::Fiber;
 use crate::types::ModulePath;
@@ -150,17 +149,14 @@ impl ModuleRebuilt {
 /// reported precisely rather than just as "something failed".
 enum CommandOutcome {
     Succeeded(CommandOutput),
-    Failed {
-        output: CommandOutput,
-        command: ScriptCommand,
-    },
+    Failed { output: CommandOutput, command: Command },
 }
 
 #[derive(Debug)]
 pub struct TaskOutcome {
     task: Task,
     output: CommandOutput,
-    failed_command: Option<ScriptCommand>,
+    failed_command: Option<Command>,
     task_duration: Duration,
     task_start: TaskStart,
     fiber: Fiber,
@@ -175,7 +171,7 @@ impl TaskOutcome {
         fiber: Fiber,
         dirtiness: Dirtiness,
     ) -> TaskOutcome {
-        let (output, failed_command): (CommandOutput, Option<ScriptCommand>) = match result {
+        let (output, failed_command): (CommandOutput, Option<Command>) = match result {
             Ok(CommandOutcome::Succeeded(output)) => (output, None),
             Ok(CommandOutcome::Failed { output, command }) => (output, Some(command)),
             Err(error) => (
@@ -243,7 +239,7 @@ impl TaskOutcome {
     /// The specific command that failed, if the task failed because one of its resolved commands
     /// exited unsuccessfully — `None` if the task succeeded, or if it failed before any command ran
     /// (e.g. its script failed to resolve).
-    pub fn failed_command(&self) -> Option<&ScriptCommand> {
+    pub fn failed_command(&self) -> Option<&Command> {
         self.failed_command.as_ref()
     }
 
@@ -440,7 +436,7 @@ fn run_one(
     runtime: &impl Runtime,
 ) -> IoResult<CommandOutcome> {
     runtime.create_directories(output_directory.as_ref())?;
-    let commands: Vec<ScriptCommand> = task
+    let commands: Vec<Command> = task
         .resolve(
             module.parameter_state,
             module.module_directory,
@@ -452,11 +448,7 @@ fn run_one(
         .map_err(IoError::other)?;
     let mut output: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded);
     for command in &commands {
-        let working_directory: AbsoluteDirectory = context
-            .workspace_root()
-            .to_absolute_directory()
-            .join_directory(command.working_directory());
-        output = runtime.run_command(&to_process_command(command), working_directory.as_ref())?;
+        output = runtime.run_command(command, context.workspace_root())?;
         if !output.status().is_success() {
             return Ok(CommandOutcome::Failed {
                 output,
@@ -465,28 +457,6 @@ fn run_one(
         }
     }
     Ok(CommandOutcome::Succeeded(output))
-}
-
-/// Adapt a script-resolved [`ScriptCommand`] to the [`Command`] shape [`Runtime::run_command`]
-/// spawns. The working directory is not carried here — it is resolved to an absolute path and passed
-/// to `run_command` separately.
-fn to_process_command(command: &ScriptCommand) -> Command {
-    let mut process_command: Command = Command::new(command.program(), command.arguments().iter().cloned());
-    for (name, value) in command.environment() {
-        process_command = process_command.with_environment_variable(name.clone(), value.clone());
-    }
-    process_command
-}
-
-/// Render a script-resolved command as a single space-joined line for diagnostics, the same
-/// convention [`Command`]'s own `Display` uses for a process-ready command.
-fn render_command(command: &ScriptCommand) -> String {
-    let mut rendered: String = command.program().to_string();
-    for argument in command.arguments() {
-        rendered.push(' ');
-        rendered.push_str(argument);
-    }
-    rendered
 }
 
 /// Record a successful task's fresh run record. Best effort: a failure here only means the task is
@@ -611,7 +581,7 @@ pub fn execute_graph(
                 task_name: failed.task.name().clone(),
                 command: failed.failed_command().map_or_else(
                     || "no command ran (the task failed before one could)".to_string(),
-                    render_command,
+                    Command::to_string,
                 ),
                 output: failed.output.combined_output(),
             }
@@ -673,7 +643,7 @@ pub fn run_standalone_task(
             task_name: outcome.task().name().clone(),
             command: outcome.failed_command().map_or_else(
                 || "no command ran (the task failed before one could)".to_string(),
-                render_command,
+                Command::to_string,
             ),
             output: outcome.output().combined_output(),
         }

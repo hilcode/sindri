@@ -14,6 +14,9 @@ use nickel_lang_core::eval::value::NickelValue;
 use serde::Deserialize;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 
 /// The Nickel contract every command a script yields is checked against. Applied by Sindri, it makes
 /// `program` required, fills the `arguments`/`environment` defaults, and defaults `working-directory`
@@ -53,6 +56,32 @@ impl Command {
 
     pub fn working_directory(&self) -> &RelativeDirectory {
         &self.working_directory
+    }
+
+    /// Build a command directly from its parts, bypassing script evaluation and contract
+    /// validation. Test-only: production code only ever obtains a `Command` by evaluating a
+    /// [`Script`] against the [`COMMAND_CONTRACT`].
+    #[cfg(test)]
+    pub fn new(program: impl Into<SmolStr>, arguments: impl IntoIterator<Item = impl Into<SmolStr>>) -> Command {
+        Command {
+            program: program.into(),
+            arguments: arguments.into_iter().map(Into::into).collect(),
+            environment: BTreeMap::new(),
+            working_directory: RelativeDirectory::new_unchecked(""),
+        }
+    }
+}
+
+/// Renders the command as a single space-joined line for diagnostics and logs. This is a display
+/// convenience only — execution always uses the structured program and arguments, so an argument
+/// containing spaces is never re-split.
+impl Display for Command {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str(&self.program)?;
+        for argument in &self.arguments {
+            write!(formatter, " {argument}")?;
+        }
+        Ok(())
     }
 }
 
