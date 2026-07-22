@@ -11,9 +11,13 @@ use nickel_lang_core::cache::ResolvedTerm;
 use nickel_lang_core::cache::SourcePath;
 use nickel_lang_core::cache::TermEntry;
 use nickel_lang_core::cache::normalize_path;
+use nickel_lang_core::error::Error as NickelError;
 use nickel_lang_core::error::ImportError;
 use nickel_lang_core::error::ImportErrorKind;
 use nickel_lang_core::error::NullReporter;
+use nickel_lang_core::error::ParseErrors;
+use nickel_lang_core::error::report::ColorOpt;
+use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::VirtualMachine;
 use nickel_lang_core::eval::VmContext;
 use nickel_lang_core::eval::cache::CacheImpl;
@@ -26,6 +30,7 @@ use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::Import;
 use nickel_lang_core::transform::import_resolution::strict::ResolveResult;
 use nickel_lang_core::transform::import_resolution::strict::resolve_imports;
+use nickel_lang_core::typ::UnboundTypeVariableError;
 use std::ffi::OsStr;
 use std::io::sink;
 use std::path::Path;
@@ -66,13 +71,7 @@ pub fn resolve_transitive_source(
         .iter()
         .filter_map(
             |(file_id, source_path): (&FileId, &SourcePath)| -> Option<(RelativeFile, String)> {
-                match source_path {
-                    SourcePath::Path(path, _) => Some((
-                        workspace_root.relativize_file(&AbsoluteFile::new(path.clone())),
-                        hub.sources.source(*file_id).to_string(),
-                    )),
-                    _ => None,
-                }
+                transitive_source_entry(*file_id, source_path, &hub, workspace_root)
             },
         )
         .collect();
@@ -80,6 +79,28 @@ pub fn resolve_transitive_source(
         first.0.as_ref().cmp(second.0.as_ref())
     });
     Ok(TransitiveSource { files })
+}
+
+/// The `(path, source text)` pair `file_id`/`source_path` contributes to a [`TransitiveSource`], or
+/// `None` if `source_path` isn't a real file. Every other [`SourcePath`] variant — the stdlib, a REPL
+/// snippet, a CLI field assignment, ... — has no file to report and is excluded deliberately, not
+/// merely unhandled; `resolve_hermetically`'s own resolution never produces one of these for a task
+/// script, but the match stays exhaustive over every variant `SourcePath` could ever be. The path is
+/// reported relative to `workspace_root` so a definition hash built from it doesn't depend on where
+/// the workspace itself is checked out.
+fn transitive_source_entry(
+    file_id: FileId,
+    source_path: &SourcePath,
+    hub: &CacheHub,
+    workspace_root: &WorkspaceRoot,
+) -> Option<(RelativeFile, String)> {
+    match source_path {
+        SourcePath::Path(path, _) => Some((
+            workspace_root.relativize_file(&AbsoluteFile::new(path.clone())),
+            hub.sources.source(file_id).to_string(),
+        )),
+        _ => None,
+    }
 }
 
 /// Fully evaluate `source` hermetically: resolve its transitive imports (see
@@ -97,16 +118,27 @@ pub fn evaluate_hermetically(
         resolve_hermetically(source, source_path, workspace_root, file_system)?;
     let mut pos_table: PosTable = PosTable::new();
     hub.prepare_stdlib(&mut pos_table)
-        .map_err(|error| -> SindriError { import_resolution_error(format!("{error:?}")) })?;
+        .map_err(|error: NickelError| -> SindriError { import_resolution_error(&mut hub.sources.files, error) })?;
     let main_value: NickelValue = hub
         .terms
         .get_owned(main_file_id)
         .expect("main_file_id was resolved by resolve_hermetically");
+    // `eval_full` evaluates whatever `pending_contracts` a term already carries rather than deriving
+    // them itself; this is the transform (`gen_pending_contracts`) that `nickel_lang::Context::eval_deep`
+    // runs internally via `prepare_eval`. Skipping it here would turn every field contract into a no-op.
+    let main_value: NickelValue = nickel_lang_core::transform::transform(&mut pos_table, main_value, None)
+        .map_err(|error| -> SindriError { transform_error(&mut hub.sources.files, error) })?;
     let mut vm_context: VmContext<CacheHub, CacheImpl> =
         VmContext::new_with_pos_table(hub, pos_table, sink(), NullReporter {});
     let mut vm: VirtualMachine<'_, CacheHub, CacheImpl> = VirtualMachine::new(&mut vm_context);
-    vm.eval_full(main_value)
-        .map_err(|error| -> SindriError { import_resolution_error(format!("{error:?}")) })
+    let result: Result<NickelValue, nickel_lang_core::error::EvalError> = vm.eval_full(main_value);
+    // `VirtualMachine` implements `Drop`, which extends its mutable borrow of `vm_context` to the end
+    // of scope regardless of last use — dropping it explicitly frees `vm_context` up for the error
+    // path below to read `import_resolver.sources.files` back out.
+    drop(vm);
+    result.map_err(|error| -> SindriError {
+        import_resolution_error(&mut vm_context.import_resolver.sources.files, error)
+    })
 }
 
 /// Hermetically resolve `source`'s entire transitive import closure into a fresh [`CacheHub`],
@@ -125,19 +157,38 @@ fn resolve_hermetically(
     let main_file_id: FileId = cache_hub.sources.add_string(main_source_path, source.to_string());
     cache_hub
         .parse_to_term(&mut pos_table, main_file_id, InputFormat::Nickel)
-        .map_err(|parse_errors| -> SindriError { import_resolution_error(format!("{parse_errors:?}")) })?;
+        .map_err(|parse_errors: ParseErrors| -> SindriError {
+            import_resolution_error(&mut cache_hub.sources.files, parse_errors)
+        })?;
     let mut resolver: WorkspaceImportResolver<'_, _> = WorkspaceImportResolver {
         hub: cache_hub,
         workspace_root,
         file_system,
     };
-    resolve_transitively(&mut pos_table, &mut resolver, main_file_id)
-        .map_err(|import_error: ImportError| -> SindriError { import_resolution_error(format!("{import_error:?}")) })?;
+    resolve_transitively(&mut pos_table, &mut resolver, main_file_id).map_err(
+        |import_error: ImportError| -> SindriError {
+            import_resolution_error(&mut resolver.hub.sources.files, import_error)
+        },
+    )?;
     Ok((resolver.hub, main_file_id))
 }
 
-fn import_resolution_error(nickel_message: String) -> SindriError {
-    SindriError::ScriptEvaluation { nickel_message }
+/// Render `error` through nickel-lang-core's own diagnostic reporter — the same span-aware, snippet-
+/// printing machinery `nickel export` uses — rather than its `Debug` output, so a build-definition
+/// error points at the offending span in the script's own source instead of dumping the error's
+/// internal representation.
+fn import_resolution_error(files: &mut Files, error: impl Into<NickelError>) -> SindriError {
+    SindriError::ScriptEvaluation {
+        nickel_message: report_as_str(files, error.into(), ColorOpt::Never),
+    }
+}
+
+/// The one failure [`nickel_lang_core::transform::transform`] can produce: a type annotation
+/// referencing a variable no `forall` bound. Reported through the same diagnostics path as every
+/// other error here, via the conversion `nickel_lang_core::cache`'s own `prepare_impl` uses for this
+/// exact error.
+fn transform_error(files: &mut Files, error: UnboundTypeVariableError) -> SindriError {
+    import_resolution_error(files, NickelError::ParseErrors(ParseErrors::from(error)))
 }
 
 /// Resolve `file_id`'s direct imports through `resolver`, persist the transformed term — its
@@ -206,11 +257,7 @@ impl<FS: FileSystem> ImportResolver for WorkspaceImportResolver<'_, FS> {
         parent_directory.pop();
         let joined: PathBuf = parent_directory.join(Path::new(path));
         let normalized: PathBuf = normalize_path(&joined).map_err(|io_error: std::io::Error| -> ImportError {
-            Box::new(ImportErrorKind::IOError(
-                path.to_string_lossy().into_owned(),
-                io_error.to_string(),
-                position,
-            ))
+            import_io_error(path.to_string_lossy().into_owned(), position, io_error)
         })?;
         if !normalized.starts_with(self.workspace_root.as_ref()) {
             return Err(Box::new(ImportErrorKind::IOError(
@@ -229,11 +276,7 @@ impl<FS: FileSystem> ImportResolver for WorkspaceImportResolver<'_, FS> {
             None => {
                 let content: String = self.file_system.read_to_string(&normalized).map_err(
                     |io_error: std::io::Error| -> ImportError {
-                        Box::new(ImportErrorKind::IOError(
-                            path.to_string_lossy().into_owned(),
-                            io_error.to_string(),
-                            position,
-                        ))
+                        import_io_error(path.to_string_lossy().into_owned(), position, io_error)
                     },
                 )?;
                 let file_id: FileId = self.hub.sources.add_string(source_path, content);
@@ -261,15 +304,23 @@ impl<FS: FileSystem> ImportResolver for WorkspaceImportResolver<'_, FS> {
     }
 }
 
+/// Wrap an I/O failure encountered while resolving `path` — normalizing it or reading its
+/// content — as the [`ImportError`] shape `WorkspaceImportResolver::resolve` reports for both.
+fn import_io_error(path: String, position: TermPos, io_error: std::io::Error) -> ImportError {
+    Box::new(ImportErrorKind::IOError(path, io_error.to_string(), position))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::DummyRuntime;
     use crate::runtime::SystemFileSystem;
     use crate::types::AbsoluteDirectory;
+    use nickel_lang_core::identifier::LocIdent;
     use serde::Deserialize;
     use std::fs::create_dir_all;
     use std::fs::write;
+    use std::io::Error as IoError;
     use tempfile::TempDir;
 
     fn workspace_root() -> WorkspaceRoot {
@@ -278,6 +329,47 @@ mod tests {
 
     fn source_path() -> AbsoluteFile {
         AbsoluteFile::new(PathBuf::from("/workspace/main.ncl"))
+    }
+
+    #[test]
+    fn transitive_source_entry_reports_a_real_file() {
+        let mut hub: CacheHub = CacheHub::new();
+        let source_path: SourcePath = SourcePath::Path(PathBuf::from("/workspace/main.ncl"), InputFormat::Nickel);
+        let file_id: FileId = hub.sources.add_string(source_path.clone(), "{}".to_string());
+        let (file, contents): (RelativeFile, String) =
+            transitive_source_entry(file_id, &source_path, &hub, &workspace_root())
+                .expect("a `Path` source is a real file");
+        assert_eq!(file.as_ref(), Path::new("main.ncl"));
+        assert_eq!(contents, "{}");
+    }
+
+    #[test]
+    fn transitive_source_entry_ignores_a_source_with_no_file() {
+        let mut hub: CacheHub = CacheHub::new();
+        let file_id: FileId = hub.sources.add_string(SourcePath::Query, "{}".to_string());
+        assert!(transitive_source_entry(file_id, &SourcePath::Query, &hub, &workspace_root()).is_none());
+    }
+
+    #[test]
+    fn transform_error_reports_the_unbound_identifier() {
+        let mut files: Files = Files::empty();
+        let error: SindriError = transform_error(&mut files, UnboundTypeVariableError(LocIdent::from("a")));
+        assert!(matches!(error, SindriError::ScriptEvaluation { .. }));
+        assert!(error.to_string().contains("unbound"), "message was: {error}");
+        assert!(error.to_string().contains('a'), "message was: {error}");
+    }
+
+    #[test]
+    fn import_io_error_carries_the_offending_path_and_the_io_message() {
+        let error: ImportError = import_io_error("some/path".to_string(), TermPos::None, IoError::other("boom"));
+        match *error {
+            ImportErrorKind::IOError(path, message, position) => {
+                assert_eq!(path, "some/path");
+                assert!(message.contains("boom"), "message was: {message}");
+                assert_eq!(position, TermPos::None);
+            }
+            other => panic!("expected ImportErrorKind::IOError, got {other:?}"),
+        }
     }
 
     #[test]
