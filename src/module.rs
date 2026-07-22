@@ -230,7 +230,8 @@ impl BuildFile {
         let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let mut current: AbsoluteDirectory = workspace.absolute_working_directory();
         let root_directory: AbsoluteDirectory = workspace_root.to_absolute_directory();
-        let default_build_file_name: RelativeFile = RelativeFile::new("sindri.build");
+        let default_build_file_name: RelativeFile =
+            RelativeFile::new("sindri.build").expect("a literal file name is always well-formed");
         loop {
             let default_build_file: AbsoluteFile = current.join_file(&default_build_file_name);
             let relative_build_file: RelativeFile = workspace_root.relativize_file(&default_build_file);
@@ -416,7 +417,7 @@ mod tests {
     fn load_valid_module() {
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
         assert_eq!(module.name().as_ref(), "my-app");
         assert!(matches!(module.language(), Language::Go));
@@ -430,7 +431,7 @@ mod tests {
             .file("/workspace/sindri.build", r#"{ name = "test", language = }"#)
             .build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
         assert!(matches!(error, SindriError::NickelEval { .. }));
     }
@@ -441,7 +442,7 @@ mod tests {
             .file("/workspace/sindri.build", r#"{ name = "test", language = "go" }"#)
             .build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
         assert!(matches!(error, SindriError::NickelEval { .. }));
     }
@@ -455,7 +456,7 @@ mod tests {
             )
             .build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
         assert!(matches!(error, SindriError::NickelEval { .. }));
     }
@@ -464,7 +465,7 @@ mod tests {
     fn load_module_passes_contract() {
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         Module::load(&build_file, &workspace, &runtime).unwrap();
     }
 
@@ -490,14 +491,14 @@ mod tests {
 }"#;
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
         let dependencies: &DependencyGroup = module.dependencies();
         // The non-exported compile entries: the module and the artifact.
         assert_eq!(dependencies.compile().len(), 2);
         assert_eq!(
             dependencies.compile()[0].module_identity().map(ToString::to_string),
-            Some("//libs/common".to_string())
+            Some("//libs/common/".to_string())
         );
         match &dependencies.compile()[1] {
             Dependency::Artifact(identity) => assert_eq!(identity.as_ref(), "example-org:some-lib"),
@@ -507,7 +508,7 @@ mod tests {
         assert_eq!(dependencies.exported().len(), 1);
         assert_eq!(
             dependencies.exported()[0].module_identity().map(ToString::to_string),
-            Some("//libs/api".to_string())
+            Some("//libs/api/".to_string())
         );
         assert_eq!(dependencies.test().len(), 1);
         assert!(dependencies.runtime().is_empty());
@@ -522,7 +523,7 @@ mod tests {
 }"#;
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
         let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
             PluginName::new("sindri-go"),
@@ -540,7 +541,7 @@ mod tests {
     fn load_module_without_parameters_has_an_empty_set() {
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
         let declared: ParameterDeclarations = ParameterDeclarations::default();
         assert!(ParameterBinding::resolve(&declared, module.parameters()).is_ok());
@@ -550,7 +551,7 @@ mod tests {
     fn load_module_without_dependencies_has_empty_scopes() {
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
         let dependencies: &DependencyGroup = module.dependencies();
         assert!(dependencies.compile().is_empty());
@@ -571,7 +572,7 @@ mod tests {
 }"#;
         let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
         let workspace: Workspace = make_workspace(&runtime, "");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
         assert!(
             matches!(error, SindriError::NickelEval { .. }),

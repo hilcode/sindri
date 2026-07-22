@@ -6,5 +6,5 @@ fun default_working_directory => {
   program | String,
   arguments | Array String | default = [],
   environment | { _ : String } | default = {},
-  "working-directory" | String | default = default_working_directory,
+  "working-directory" | RelativeDirectory | default = default_working_directory,
 }

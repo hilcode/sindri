@@ -13,8 +13,14 @@ use nickel_lang::Expr;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// `stdlib.ncl` is a `let ... in` fragment, so it must precede the record it scopes over rather than
+/// be concatenated after it; `concat!` splices the two files at compile time into one contract source,
+/// the same way [`crate::script::Script::evaluate`] splices it in front of the command contract.
 const WORKSPACE_CONTRACT: Contract = Contract::new(
-    include_str!("contracts/workspace.ncl"),
+    concat!(
+        include_str!("contracts/stdlib.ncl"),
+        include_str!("contracts/workspace.ncl")
+    ),
     r#"{
   name = "my-project",
   sindri_version = "0.1.0",
@@ -56,7 +62,10 @@ impl WorkspaceConfig {
     }
 
     pub fn load(workspace_root: &WorkspaceRoot, file_system: &impl FileSystem) -> SindriResult<WorkspaceConfig> {
-        let config_file: ConfigFile = ConfigFile::resolve(RelativeFile::new("sindri.workspace"), workspace_root);
+        let config_file: ConfigFile = ConfigFile::resolve(
+            RelativeFile::new("sindri.workspace").expect("a literal file name is always well-formed"),
+            workspace_root,
+        );
         let expression: Expr = Nickel::evaluate_with_contract(&config_file, &WORKSPACE_CONTRACT, file_system)?;
         expression
             .to_serde::<WorkspaceConfig>()
@@ -68,7 +77,7 @@ impl WorkspaceConfig {
 }
 
 fn default_build_directory() -> BuildDirectory {
-    BuildDirectory::new(RelativeDirectory::new(".target"))
+    BuildDirectory::new(RelativeDirectory::new(".target/").expect("a literal directory name is always well-formed"))
 }
 
 pub struct Workspace {
@@ -140,7 +149,8 @@ impl Workspace {
 
 impl WorkspaceRoot {
     pub fn find(start: &AbsoluteDirectory, file_system: &impl FileSystem) -> SindriResult<WorkspaceRoot> {
-        let workspace_file_name: RelativeFile = RelativeFile::new("sindri.workspace");
+        let workspace_file_name: RelativeFile =
+            RelativeFile::new("sindri.workspace").expect("a literal file name is always well-formed");
         let mut current: AbsoluteDirectory = start.clone();
         loop {
             let workspace_file: AbsoluteFile = current.join_file(&workspace_file_name);
@@ -245,15 +255,26 @@ mod tests {
         let config: WorkspaceConfig = load(MINIMAL).unwrap();
         assert_eq!(config.name().as_ref(), "test-project");
         assert_eq!(config.sindri_version().as_ref(), "0.1.0");
-        assert_eq!(config.build_directory().as_ref(), Path::new(".target"));
+        assert_eq!(config.build_directory().as_ref(), Path::new(".target/"));
         assert!(config.plugins().is_empty());
     }
 
     #[test]
     fn load_workspace_config_with_custom_build_directory() {
         let config: WorkspaceConfig =
-            load(r#"{ name = "test", sindri_version = "0.1.0", build_directory = "build" }"#).unwrap();
-        assert_eq!(config.build_directory().as_ref(), Path::new("build"));
+            load(r#"{ name = "test", sindri_version = "0.1.0", build_directory = "build/" }"#).unwrap();
+        assert_eq!(config.build_directory().as_ref(), Path::new("build/"));
+    }
+
+    #[test]
+    fn load_workspace_config_rejects_an_absolute_build_directory() {
+        let error: SindriError =
+            load(r#"{ name = "test", sindri_version = "0.1.0", build_directory = "/etc" }"#).unwrap_err();
+        assert!(matches!(error, SindriError::NickelEval { .. }));
+        assert!(
+            error.to_string().contains("must not start with"),
+            "message was: {error}"
+        );
     }
 
     #[test]
@@ -307,10 +328,10 @@ mod tests {
         let config: WorkspaceConfig = WorkspaceConfig::load(&workspace_root(), &runtime).unwrap();
         let workspace: Workspace = Workspace::new(
             workspace_root(),
-            WorkingDirectory::new(RelativeDirectory::new(PathBuf::new())),
+            WorkingDirectory::new(RelativeDirectory::new_unchecked(PathBuf::new())),
             config,
         );
         workspace.log_loaded(&runtime).unwrap();
-        assert_eq!(runtime.logged(), vec!["Workspace loaded: /workspace".to_string()]);
+        assert_eq!(runtime.logged(), vec!["Workspace loaded: /workspace/".to_string()]);
     }
 }

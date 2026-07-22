@@ -37,13 +37,17 @@ impl TaskLayout {
         task_name: &TaskName,
         binding_hash: BindingHash,
     ) -> TaskLayout {
-        let task_directory: AbsoluteDirectory = build_directory
-            .join_directory(module_directory)
-            .join_directory(&RelativeDirectory::new(task_name.to_string()));
+        let task_directory: AbsoluteDirectory = build_directory.join_directory(module_directory).join_directory(
+            &RelativeDirectory::new(format!("{task_name}/")).expect("a task name is always well-formed"),
+        );
         let hexadecimal: String = binding_hash.to_hex();
         TaskLayout {
-            output_directory: task_directory.join_directory(&RelativeDirectory::new(hexadecimal.clone())),
-            run_record_file: task_directory.join_file(&RelativeFile::new(format!("{hexadecimal}.bin"))),
+            output_directory: task_directory.join_directory(
+                &RelativeDirectory::new(format!("{hexadecimal}/")).expect("a hex digest is always well-formed"),
+            ),
+            run_record_file: task_directory.join_file(
+                &RelativeFile::new(format!("{hexadecimal}.bin")).expect("a hex digest is always well-formed"),
+            ),
         }
     }
 
@@ -185,7 +189,7 @@ mod tests {
     const MODULE: &str = "libs/common";
 
     fn module_directory() -> RelativeDirectory {
-        RelativeDirectory::new(MODULE)
+        RelativeDirectory::new_unchecked(MODULE)
     }
 
     fn workspace_root() -> WorkspaceRoot {

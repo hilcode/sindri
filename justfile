@@ -89,4 +89,25 @@ format:
 # Run clippy lints
 [group('quality')]
 lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo clippy --lib --tests -- -D warnings
+    # Catches `.as_ref().display()`/`.as_ref().to_string_lossy()`, including when rustfmt wraps the
+    # chain across lines — a plain single-line grep would miss the wrapped form.
+    matches=$(awk '
+        FNR == 1 { prev = "" }
+        {
+            trimmed = $0
+            sub(/^[[:space:]]+/, "", trimmed)
+            if ($0 ~ /\.as_ref\(\)\.(display|to_string_lossy)\(\)/ ||
+                (prev ~ /\.as_ref\(\)[[:space:]]*$/ && trimmed ~ /^\.(display|to_string_lossy)\(\)/)) {
+                print FILENAME ":" FNR ": " $0
+            }
+            prev = $0
+        }
+    ' $(find src -name '*.rs'))
+    if [[ -n "$matches" ]]; then
+        echo "$matches" >&2
+        echo 'error: found .as_ref().display()/.to_string_lossy() above — route through the type'"'"'s own Display/to_string() instead of AsRef<Path>' >&2
+        exit 1
+    fi

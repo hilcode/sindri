@@ -159,7 +159,7 @@ mod tests {
     fn config_file() -> ConfigFile {
         ConfigFile::new(
             AbsoluteFile::new(PathBuf::from("/file.ncl")),
-            RelativeFile::new("file.ncl"),
+            RelativeFile::new_unchecked("file.ncl"),
         )
     }
 

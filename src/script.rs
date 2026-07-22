@@ -20,6 +20,11 @@ use std::collections::BTreeMap;
 /// to the module directory Sindri supplies.
 const COMMAND_CONTRACT: &str = include_str!("contracts/command.ncl");
 
+/// Shared Nickel contract definitions (currently just `RelativeDirectory`) available to
+/// [`COMMAND_CONTRACT`]. A `let ... in` fragment, not a standalone expression, so it splices
+/// directly in front of the contract text it scopes over — see [`Script::evaluate`].
+const STDLIB: &str = include_str!("contracts/stdlib.ncl");
+
 /// A single runnable process invocation produced by a [`Script`]: a program, its argument vector, its
 /// complete environment, and the directory it runs in (relative to the workspace root). Deserialized
 /// from a Nickel command record after the [`COMMAND_CONTRACT`] has validated it and applied defaults,
@@ -100,10 +105,10 @@ impl<'inputs> ScriptInputs<'inputs> {
              \"workspace-root\" = {workspace_root} }}",
             parameters = self.parameters.to_nickel_record(),
             files = files.join(", "),
-            output_directory = Nickel::string_literal(&self.output_directory.as_ref().to_string_lossy()),
-            relative_output_directory = Nickel::string_literal(&relative_output_directory.as_ref().to_string_lossy()),
-            managed_input_base = Nickel::string_literal(&self.managed_input_base.as_ref().to_string_lossy()),
-            workspace_root = Nickel::string_literal(&self.workspace_root.as_ref().to_string_lossy()),
+            output_directory = Nickel::string_literal(&self.output_directory.to_string()),
+            relative_output_directory = Nickel::string_literal(&relative_output_directory.to_string()),
+            managed_input_base = Nickel::string_literal(&self.managed_input_base.to_string()),
+            workspace_root = Nickel::string_literal(&self.workspace_root.to_string()),
         )
     }
 }
@@ -147,12 +152,10 @@ impl Script {
     /// changing is exactly a change to the script's own source, and hence to its definition hash.
     /// `go work init` refuses to run if a `go.work` already exists, so a stale one from a previous
     /// build (in the same output directory, since this task's binding never changes) is removed first.
-    pub fn go_work(module_directories: &[AbsoluteDirectory]) -> Script {
+    pub fn go_work(module_directories: &[String]) -> Script {
         let directories: String = module_directories
             .iter()
-            .map(|directory: &AbsoluteDirectory| -> String {
-                Nickel::string_literal(&directory.as_ref().to_string_lossy())
-            })
+            .map(|directory: &String| -> String { Nickel::string_literal(directory) })
             .collect::<Vec<String>>()
             .join(", ");
         Script::new(format!(
@@ -184,11 +187,13 @@ impl Script {
         file_system: &impl FileSystem,
     ) -> SindriResult<Vec<Command>> {
         let source: String = format!(
-            "let Command = ({command_contract}) {module_directory} in\n\
+            "{stdlib}\n\
+             let Command = ({command_contract}) {module_directory} in\n\
              let script = ({script}) in\n\
              std.array.map (fun command => command | Command) (script {inputs})",
+            stdlib = STDLIB,
             command_contract = COMMAND_CONTRACT,
-            module_directory = Nickel::string_literal(&inputs.module_directory.as_ref().to_string_lossy()),
+            module_directory = Nickel::string_literal(&inputs.module_directory.to_string()),
             script = self.source,
             inputs = inputs.to_nickel_record(),
         );
@@ -245,7 +250,7 @@ mod tests {
         let managed_input_base: AbsoluteDirectory =
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -307,6 +312,22 @@ mod tests {
     }
 
     #[test]
+    fn a_script_yielding_an_absolute_working_directory_is_a_contract_error() {
+        let result: SindriResult<Vec<Command>> = evaluate(
+            "fun inputs => [ { program = \"go\", \"working-directory\" = \"/etc\" } ]",
+            &[],
+        );
+        let error: SindriError = result.unwrap_err();
+        assert!(matches!(error, SindriError::ScriptEvaluation { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("must be a relative directory (must not start with `/`)"),
+            "message was: {error}"
+        );
+    }
+
+    #[test]
     fn a_script_can_read_the_supplied_input_files() {
         let commands: Vec<Command> = evaluate(
             "fun inputs => [ { program = \"echo\", arguments = inputs.files } ]",
@@ -323,7 +344,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(commands[0].arguments(), &[SmolStr::new(".target/out")]);
+        assert_eq!(commands[0].arguments(), &[SmolStr::new(".target/out/")]);
     }
 
     #[test]
@@ -335,7 +356,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             commands[0].arguments(),
-            &[SmolStr::new("/workspace/.target/generate-go-work/binding")]
+            &[SmolStr::new("/workspace/.target/generate-go-work/binding/")]
         );
     }
 
@@ -347,7 +368,7 @@ mod tests {
         let managed_input_base: AbsoluteDirectory =
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -383,7 +404,7 @@ mod tests {
         let managed_input_base: AbsoluteDirectory =
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -418,7 +439,7 @@ mod tests {
         let managed_input_base: AbsoluteDirectory =
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -465,7 +486,7 @@ mod tests {
             let managed_input_base: AbsoluteDirectory =
                 AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
             let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-            let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+            let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
             let inputs: ScriptInputs = ScriptInputs::new(
                 &parameters,
                 &input_files,
@@ -490,7 +511,7 @@ mod tests {
         let managed_input_base: AbsoluteDirectory =
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
-        let module_directory: RelativeDirectory = RelativeDirectory::new(MODULE);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,

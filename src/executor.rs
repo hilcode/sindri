@@ -777,11 +777,11 @@ mod tests {
 
     /// No test in this module exercises a managed input, so any distinct absolute directory works.
     fn managed_input_base(working_directory: &AbsoluteDirectory) -> AbsoluteDirectory {
-        working_directory.join_directory(&RelativeDirectory::new(".target/generate-go-work"))
+        working_directory.join_directory(&RelativeDirectory::new_unchecked(".target/generate-go-work"))
     }
 
     fn metadata_cache(build_directory: &AbsoluteDirectory) -> MetadataCache {
-        MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new(".metadata-cache")))
+        MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new_unchecked(".metadata-cache")))
     }
 
     /// Run a graph against a stub runtime, deriving the incremental state directories from the given
@@ -793,9 +793,12 @@ mod tests {
         runtime: &impl Runtime,
     ) -> MietteResult<Vec<TaskOutcome>> {
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
@@ -817,9 +820,12 @@ mod tests {
         let scratch: tempfile::TempDir = tempfile::TempDir::new().unwrap();
         let working_directory: AbsoluteDirectory = AbsoluteDirectory::new(scratch.path().to_path_buf());
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(&working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
@@ -846,9 +852,12 @@ mod tests {
         runtime: &impl Runtime,
     ) -> (Vec<TaskOutcome>, ModuleRebuilt) {
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);

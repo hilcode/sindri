@@ -160,7 +160,7 @@ mod tests {
     }
 
     fn entry(relative: &str) -> BuildFile {
-        BuildFile::new(RelativeFile::new(relative))
+        BuildFile::new(RelativeFile::new_unchecked(relative))
     }
 
     fn loaded_names(graph: &ModuleGraph) -> Vec<&str> {
@@ -391,7 +391,7 @@ mod tests {
         match error {
             SindriError::DependencyCycle { ref cycle } => {
                 // The path closes on itself: the entry `//a`, then `//b`, then back to `//a`.
-                assert_eq!(cycle.to_string(), "//a → //b → //a");
+                assert_eq!(cycle.to_string(), "//a/ → //b/ → //a/");
             }
             other => panic!("expected a dependency-cycle error, got {other:?}"),
         }

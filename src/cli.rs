@@ -61,7 +61,7 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
         Some(
             workspace
                 .absolute_build_directory()
-                .join_file(&RelativeFile::new("sindri.log")),
+                .join_file(&RelativeFile::new("sindri.log").expect("a literal file name is always well-formed")),
         )
     } else {
         None

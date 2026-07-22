@@ -207,7 +207,8 @@ impl Task {
     /// embedded Nickel source rather than a real file on disk. Shared by [`Task::resolve`] and
     /// [`Task::definition_hash`] so both anchor the same script's imports identically.
     fn script_path(&self, module_directory_absolute: &AbsoluteDirectory) -> AbsoluteFile {
-        module_directory_absolute.join_file(&RelativeFile::new(format!("{}.ncl", self.name)))
+        module_directory_absolute
+            .join_file(&RelativeFile::new(format!("{}.ncl", self.name)).expect("a task name is always well-formed"))
     }
 
     /// This task's definition hash (see [`DefinitionHash`]), computed against the version of Sindri
@@ -250,7 +251,7 @@ impl Task {
         let mut hasher: Hasher = Hasher::new();
         update_field(&mut hasher, &self.name.to_string());
         for (path, content) in transitive_source.files() {
-            update_field(&mut hasher, &path.as_ref().to_string_lossy());
+            update_field(&mut hasher, &path.to_string());
             update_field(&mut hasher, content);
         }
         for pattern_hash in [
@@ -316,7 +317,7 @@ mod tests {
     const MODULE: &str = "libs/common";
 
     fn module_directory() -> RelativeDirectory {
-        RelativeDirectory::new(MODULE)
+        RelativeDirectory::new_unchecked(MODULE)
     }
 
     fn workspace_root() -> WorkspaceRoot {

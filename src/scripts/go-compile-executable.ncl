@@ -5,6 +5,6 @@
 # over the Go toolchain's own debug-build defaults.
 fun inputs =>
   let output_directory = inputs."output-directory" in
-  let go_work = "%{inputs."managed-input-directory"}/go.work" in
+  let go_work = "%{inputs."managed-input-directory"}go.work" in
   let mode_arguments = if inputs.params."sindri-go".mode == "release" then [ "-trimpath", "-ldflags", "-s -w" ] else [] in
-  [ { program = "go", arguments = [ "build" ] @ mode_arguments @ [ "-o", "%{output_directory}/", "./..." ], environment = { GOWORK = go_work } } ]
+  [ { program = "go", arguments = [ "build" ] @ mode_arguments @ [ "-o", "%{output_directory}", "./..." ], environment = { GOWORK = go_work } } ]

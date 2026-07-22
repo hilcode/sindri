@@ -128,8 +128,9 @@ impl Lifecycle {
         // its own, so the context supplied here is a placeholder — its real value (this task's own
         // output directory) is not known until it has run.
         let generate_go_work: Task = GoPlugin::generate_go_work_task(&module_graph, workspace_root);
-        let cache_directory: AbsoluteDirectory =
-            absolute_build_directory.join_directory(&RelativeDirectory::new(".metadata-cache"));
+        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
+            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
+        );
         let cache: MetadataCache = MetadataCache::new(cache_directory);
         let bootstrap_context: BuildContext = BuildContext::new(
             workspace_root,
@@ -139,7 +140,7 @@ impl Lifecycle {
         );
         let (go_work_outcome, go_work_output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
             &generate_go_work,
-            &RelativeDirectory::new(""),
+            &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
             &bootstrap_context,
             config,
             runtime,
