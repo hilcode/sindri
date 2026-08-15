@@ -22,12 +22,16 @@ cd examples
 just compile-all        # compile every example
 just compile hello      # compile just one
 just lifecycle hello    # print its resolved lifecycle steps and tasks
+just verify-all         # build every example and check it actually does what it claims to
+just verify multi-module
 ```
 
 Each recipe first rebuilds and reinstalls `sindri` if the sources changed (the
 `install` dependency defers to `cargo`, so it is a no-op when nothing changed), then
 calls `sindri` from your `PATH`. You never have to remember to reinstall after editing
 the tool — including its embedded `*.ncl` contracts.
+
+`verify` runs an example's own `verify.sh` (see that file for what it checks).
 
 `compile` runs the `format` step (`gofmt`) and then the `compile` step
 (`go build`). The built binary lands under

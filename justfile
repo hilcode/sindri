@@ -1,3 +1,5 @@
+import 'scripts/help.just'
+
 # Directory the `install` recipe copies the `sindri` binary into
 install_directory := env_var_or_default("SINDRI_INSTALL_DIR", env_var("HOME") / ".local/bin")
 

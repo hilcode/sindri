@@ -1,14 +1,20 @@
+import '../scripts/help.just'
+
+# Every example directory — anything directly under here with its own `sindri.workspace`
+example_dirs := `for d in */; do d=${d%/}; [ -f "$d/sindri.workspace" ] && echo "$d"; done`
+
 # List available recipes
 default:
     @just --list
 
-# Rebuild and reinstall `sindri` if anything changed, so the examples never run a stale binary.
 # Defers to the repo's `install` recipe, which defers to `cargo` — `cargo` decides staleness across
 # every input (sources, `Cargo.lock`, and the embedded `*.ncl` contracts, tracked through
 # `include_str!`), so this is a fast no-op when nothing changed and a full rebuild + reinstall when
 # it did.
+#
+# Rebuild and reinstall `sindri` if anything changed, so the examples never run a stale binary.
 install:
-    cd .. && just install
+    cd .. && just install release
 
 # Compile one example (rebuilds and reinstalls `sindri` first if the sources changed)
 compile example: install
@@ -22,8 +28,34 @@ lifecycle example: install
 clean example:
     rm -rf {{example}}/.target
 
+# Builds an example from clean, checks the compiled binary's output, confirms a second compile is
+# silent, and exercises whatever incremental-correctness behaviour it demonstrates — see the
+# example's own verify.sh and scripts/verify-common.sh.
+#
+# Verify one example
+verify example: install
+    cd {{example}} && ./verify.sh
+
 # Compile every example
-compile-all: (compile "hello") (compile "greeter") (compile "multi-module") (compile "parameterized")
+compile-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    while IFS= read -r dir; do
+        just compile "$dir"
+    done <<< "{{ example_dirs }}"
 
 # Remove the build output from every example
-clean-all: (clean "hello") (clean "greeter") (clean "multi-module") (clean "parameterized")
+clean-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    while IFS= read -r dir; do
+        just clean "$dir"
+    done <<< "{{ example_dirs }}"
+
+# Verify every example
+verify-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    while IFS= read -r dir; do
+        just verify "$dir"
+    done <<< "{{ example_dirs }}"
