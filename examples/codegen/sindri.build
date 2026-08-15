@@ -1,0 +1,7 @@
+{   name = "app"
+,   language = "go"
+,   type = "executable"
+,   version = "0.1.0"
+,   module_tools = [ "//tools/codegen:codegen" ]
+,   parameters = { "sindri-go" = { mode = "debug" } }
+}

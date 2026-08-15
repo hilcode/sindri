@@ -7,6 +7,7 @@ use crate::file_set::FileSet;
 use crate::lifecycle::TaskGraph;
 use crate::lifecycle::TaskGraphNode;
 use crate::metadata_cache::MetadataCache;
+use crate::module_tool::ModuleToolBinaries;
 pub use crate::nickel_import::ScriptResolutionState;
 use crate::parameter::ParameterBinding;
 use crate::parameter::ParameterState;
@@ -162,15 +163,21 @@ pub struct TaskOutcome {
     task_start: TaskStart,
     fiber: Fiber,
     dirtiness: Dirtiness,
+    output_directory: AbsoluteDirectory,
 }
 
 impl TaskOutcome {
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     fn from(
         task: Task,
         result: IoResult<CommandOutcome>,
         task_start: TaskStart,
         fiber: Fiber,
         dirtiness: Dirtiness,
+        output_directory: AbsoluteDirectory,
     ) -> TaskOutcome {
         let (output, failed_command): (CommandOutput, Option<Command>) = match result {
             Ok(CommandOutcome::Succeeded(output)) => (output, None),
@@ -192,12 +199,13 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness,
+            output_directory,
         }
     }
 
     /// A skipped (clean) task: no command ran, so it is recorded as an instant success that still
     /// emits a telemetry event marked as a hit.
-    fn cached(task: Task, task_start: TaskStart, fiber: Fiber) -> TaskOutcome {
+    fn cached(task: Task, task_start: TaskStart, fiber: Fiber, output_directory: AbsoluteDirectory) -> TaskOutcome {
         TaskOutcome {
             task,
             output: CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded),
@@ -206,9 +214,14 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness: Dirtiness::Clean,
+            output_directory,
         }
     }
 
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub fn new(
         task: Task,
@@ -217,6 +230,7 @@ impl TaskOutcome {
         task_start: TaskStart,
         fiber: Fiber,
         dirtiness: Dirtiness,
+        output_directory: AbsoluteDirectory,
     ) -> TaskOutcome {
         TaskOutcome {
             task,
@@ -226,11 +240,16 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness,
+            output_directory,
         }
     }
 
     pub fn task(&self) -> &Task {
         &self.task
+    }
+
+    pub fn output_directory(&self) -> &AbsoluteDirectory {
+        &self.output_directory
     }
 
     pub fn output(&self) -> &CommandOutput {
@@ -327,12 +346,17 @@ struct TaskPlan {
 /// `module.module_directory`, the module's real source location. The building block both
 /// [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped to
 /// no module at all) resolve a task with.
+// Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+// swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+// not apply.
+#[allow(clippy::too_many_arguments)]
 fn resolve_task_plan(
     task: &Task,
     module: &ModuleContext,
     module_path: &RelativeDirectory,
     context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
     resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<TaskPlan> {
@@ -366,6 +390,7 @@ fn resolve_task_plan(
             context.managed_input_base(),
             layout.output_directory(),
             context.workspace_root(),
+            module_tool_binaries,
             resolution_state,
             runtime,
         )?),
@@ -393,6 +418,7 @@ fn plan_group(
     module_path: &ModulePath,
     context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
     resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
@@ -405,6 +431,7 @@ fn plan_group(
                 module_path.as_relative_directory(),
                 context,
                 dependency_rebuilt,
+                module_tool_binaries,
                 resolution_state,
                 runtime,
             )
@@ -434,7 +461,14 @@ fn run_task_and_persist(
     runtime: &impl Runtime,
 ) -> TaskOutcome {
     let result: IoResult<CommandOutcome> = run_one(commands, layout.output_directory(), context, runtime);
-    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
+    let outcome: TaskOutcome = TaskOutcome::from(
+        task,
+        result,
+        task_start,
+        fiber,
+        Dirtiness::Dirty,
+        layout.output_directory().clone(),
+    );
     if outcome.output().status().is_success() {
         persist_outcome(
             outcome.task(),
@@ -599,6 +633,7 @@ pub fn execute_graph(
     parameter_state: &ParameterState,
     context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
     config: &ExecutionConfig,
     resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
@@ -617,6 +652,7 @@ pub fn execute_graph(
             location.module_path(),
             context,
             dependency_rebuilt,
+            module_tool_binaries,
             resolution_state,
             runtime,
         )?;
@@ -632,9 +668,12 @@ pub fn execute_graph(
         let batch_start: usize = all_outcomes.len();
         for plan in &plans {
             let outcome: TaskOutcome = match plan.dirtiness {
-                Dirtiness::Clean => {
-                    TaskOutcome::cached(plan.task.clone(), TaskStart::new(runtime.now()), Fiber::new(0))
-                }
+                Dirtiness::Clean => TaskOutcome::cached(
+                    plan.task.clone(),
+                    TaskStart::new(runtime.now()),
+                    Fiber::new(0),
+                    plan.layout.output_directory().clone(),
+                ),
                 Dirtiness::Dirty => miss_outcomes.next().expect("one outcome per dirty task"),
             };
             all_outcomes.push(outcome);
@@ -691,19 +730,26 @@ pub fn run_standalone_task(
     // `generate-go-work` is the only task run this way, and it declares no parameters.
     let no_parameters: ParameterState = ParameterState::default();
     let module: ModuleContext = ModuleContext::new(module_directory, &no_parameters);
-    // A standalone task has no module dependencies to propagate a rebuilt signal from.
+    // A standalone task has no module dependencies to propagate a rebuilt signal from, and (today)
+    // never carries `module_tools` of its own.
     let plan: TaskPlan = resolve_task_plan(
         task,
         &module,
         module_directory,
         context,
         ModuleRebuilt::new(false),
+        &ModuleToolBinaries::new(),
         resolution_state,
         runtime,
     )?;
     let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
     let outcome: TaskOutcome = match plan.dirtiness {
-        Dirtiness::Clean => TaskOutcome::cached(plan.task, TaskStart::new(runtime.now()), Fiber::new(0)),
+        Dirtiness::Clean => TaskOutcome::cached(
+            plan.task,
+            TaskStart::new(runtime.now()),
+            Fiber::new(0),
+            output_directory.clone(),
+        ),
         Dirtiness::Dirty => {
             if config.verbosity != Verbosity::Quiet {
                 writeln!(runtime.output(), "  \u{2192} {}", plan.task.name()).into_diagnostic()?;
@@ -835,6 +881,11 @@ mod tests {
         working_directory.join_directory(&RelativeDirectory::new_unchecked(".target/generate-go-work"))
     }
 
+    /// No test in this module exercises `module_tools`, so an empty registry works everywhere.
+    fn module_tool_binaries() -> ModuleToolBinaries {
+        ModuleToolBinaries::new()
+    }
+
     fn metadata_cache(build_directory: &AbsoluteDirectory) -> MetadataCache {
         MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new_unchecked(".metadata-cache")))
     }
@@ -864,6 +915,7 @@ mod tests {
             &ParameterState::default(),
             &context,
             ModuleRebuilt::new(false),
+            &module_tool_binaries(),
             config,
             &mut resolution_state,
             runtime,
@@ -893,6 +945,7 @@ mod tests {
             &ParameterState::default(),
             &context,
             ModuleRebuilt::new(false),
+            &module_tool_binaries(),
             config,
             &mut resolution_state,
             &system_runtime(),
@@ -927,6 +980,7 @@ mod tests {
             &ParameterState::default(),
             &context,
             dependency_rebuilt,
+            &module_tool_binaries(),
             &default_config(),
             &mut resolution_state,
             runtime,
@@ -1303,6 +1357,7 @@ mod tests {
             &module_path,
             &context,
             ModuleRebuilt::new(false),
+            &module_tool_binaries(),
             &mut resolution_state,
             &runtime,
         )

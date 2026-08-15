@@ -1,6 +1,7 @@
 use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
+use crate::module::BinaryName;
 use crate::nickel_eval::Nickel;
 use crate::nickel_import::ScriptResolutionState;
 use crate::nickel_import::evaluate_hermetically;
@@ -88,9 +89,10 @@ impl Display for Command {
 
 /// The values Sindri supplies to a [`Script`] expression: the task's bound parameters, the resolved
 /// input files, the task's output directory, the base its managed input is resolved against, the
-/// workspace root, and the module directory each command's `working-directory` defaults to. Paths
-/// reach the script as strings — workspace-relative for `files`, absolute for the directories — since
-/// a script computes with them but never reads them.
+/// workspace root, the module directory each command's `working-directory` defaults to, and the
+/// resolved location of every `module_tools` binary this task references. Paths reach the script as
+/// strings — workspace-relative for `files`, absolute for the directories and the module-tools binary
+/// paths — since a script computes with them but never reads them.
 pub struct ScriptInputs<'inputs> {
     parameters: &'inputs ParameterBinding,
     input_files: &'inputs FileSet,
@@ -98,6 +100,7 @@ pub struct ScriptInputs<'inputs> {
     managed_input_base: &'inputs AbsoluteDirectory,
     workspace_root: &'inputs WorkspaceRoot,
     module_directory: &'inputs RelativeDirectory,
+    module_tools: &'inputs BTreeMap<BinaryName, AbsoluteFile>,
 }
 
 impl<'inputs> ScriptInputs<'inputs> {
@@ -108,6 +111,7 @@ impl<'inputs> ScriptInputs<'inputs> {
         managed_input_base: &'inputs AbsoluteDirectory,
         workspace_root: &'inputs WorkspaceRoot,
         module_directory: &'inputs RelativeDirectory,
+        module_tools: &'inputs BTreeMap<BinaryName, AbsoluteFile>,
     ) -> ScriptInputs<'inputs> {
         ScriptInputs {
             parameters,
@@ -116,6 +120,7 @@ impl<'inputs> ScriptInputs<'inputs> {
             managed_input_base,
             workspace_root,
             module_directory,
+            module_tools,
         }
     }
 
@@ -129,16 +134,24 @@ impl<'inputs> ScriptInputs<'inputs> {
             .collect();
         let relative_output_directory: RelativeDirectory =
             self.workspace_root.relativize_directory(self.output_directory);
+        let module_tools: Vec<String> = self
+            .module_tools
+            .iter()
+            .map(|(binary, file): (&BinaryName, &AbsoluteFile)| -> String {
+                format!("\"{binary}\" = {}", Nickel::string_literal(&file.to_string()))
+            })
+            .collect();
         format!(
             "{{ params = {parameters}, files = [ {files} ], \"output-directory\" = {output_directory}, \
              \"working-directory\" = {relative_output_directory}, \"managed-input-directory\" = {managed_input_base}, \
-             \"workspace-root\" = {workspace_root} }}",
+             \"workspace-root\" = {workspace_root}, \"module-tools\" = {{ {module_tools} }} }}",
             parameters = self.parameters.to_nickel_record(),
             files = files.join(", "),
             output_directory = Nickel::string_literal(&self.output_directory.to_string()),
             relative_output_directory = Nickel::string_literal(&relative_output_directory.to_string()),
             managed_input_base = Nickel::string_literal(&self.managed_input_base.to_string()),
             workspace_root = Nickel::string_literal(&self.workspace_root.to_string()),
+            module_tools = module_tools.join(", "),
         )
     }
 }
@@ -280,6 +293,10 @@ mod tests {
         AbsoluteFile::new(PathBuf::from(format!("{WORKSPACE}/{MODULE}/script.ncl")))
     }
 
+    fn no_module_tools() -> BTreeMap<BinaryName, AbsoluteFile> {
+        BTreeMap::new()
+    }
+
     fn evaluate(script_source: &str, files: &[&str]) -> SindriResult<Vec<Command>> {
         let parameters: ParameterBinding = ParameterBinding::empty();
         let input_files: FileSet = file_set(files);
@@ -288,6 +305,7 @@ mod tests {
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+        let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -295,6 +313,7 @@ mod tests {
             &managed_input_base,
             &workspace_root,
             &module_directory,
+            &module_tools,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
@@ -407,6 +426,7 @@ mod tests {
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+        let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -414,6 +434,7 @@ mod tests {
             &managed_input_base,
             &workspace_root,
             &module_directory,
+            &module_tools,
         );
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(format!("{WORKSPACE}/{MODULE}/helper.ncl"), "\"go\"")
@@ -444,6 +465,7 @@ mod tests {
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+        let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -451,6 +473,7 @@ mod tests {
             &managed_input_base,
             &workspace_root,
             &module_directory,
+            &module_tools,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
@@ -480,6 +503,7 @@ mod tests {
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+        let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -487,6 +511,7 @@ mod tests {
             &managed_input_base,
             &workspace_root,
             &module_directory,
+            &module_tools,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
@@ -528,6 +553,7 @@ mod tests {
                 AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
             let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
             let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+            let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
             let inputs: ScriptInputs = ScriptInputs::new(
                 &parameters,
                 &input_files,
@@ -535,6 +561,7 @@ mod tests {
                 &managed_input_base,
                 &workspace_root,
                 &module_directory,
+                &module_tools,
             );
             let runtime: DummyRuntime = DummyRuntime::builder().build();
             let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
@@ -556,6 +583,7 @@ mod tests {
             AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"));
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from(WORKSPACE)));
         let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked(MODULE);
+        let module_tools: BTreeMap<BinaryName, AbsoluteFile> = no_module_tools();
         let inputs: ScriptInputs = ScriptInputs::new(
             &parameters,
             &input_files,
@@ -563,6 +591,7 @@ mod tests {
             &managed_input_base,
             &workspace_root,
             &module_directory,
+            &module_tools,
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();

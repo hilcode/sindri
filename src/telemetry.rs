@@ -126,6 +126,7 @@ mod tests {
             task_start,
             fiber,
             dirtiness,
+            build_directory(),
         )
     }
 

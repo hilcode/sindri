@@ -16,12 +16,14 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct ModuleGraph {
     nodes: Vec<ModuleNode>,
+    index_by_identity: HashMap<ModuleIdentity, usize>,
 }
 
 impl ModuleGraph {
     /// Load the whole graph reachable from `entry`, validating as it goes: a dependency cycle aborts
-    /// with the modules in the loop named, and a dependency on a non-`library` module aborts naming both
-    /// ends of the offending edge.
+    /// with the modules in the loop named, a dependency on a non-`library` module aborts naming both
+    /// ends of the offending edge, and a `module_tools` entry naming a non-`executable` module aborts
+    /// the same way.
     pub fn load(entry: &BuildFile, workspace: &Workspace, file_system: &impl FileSystem) -> SindriResult<ModuleGraph> {
         let mut loader: GraphLoader<'_, _> = GraphLoader {
             workspace,
@@ -31,12 +33,21 @@ impl ModuleGraph {
         };
         let mut path: Vec<ModuleIdentity> = Vec::new();
         loader.visit(entry.identity(), None, &mut path)?;
-        Ok(ModuleGraph { nodes: loader.nodes })
+        Ok(ModuleGraph {
+            nodes: loader.nodes,
+            index_by_identity: loader.index_by_identity,
+        })
     }
 
     /// Every loaded module, in dependency-first order (the entry module is therefore last).
     pub fn nodes(&self) -> &[ModuleNode] {
         &self.nodes
+    }
+
+    /// The node index of a loaded module, or `None` if `identity` was never reached from the entry
+    /// module.
+    pub fn index_of(&self, identity: &ModuleIdentity) -> Option<usize> {
+        self.index_by_identity.get(identity).copied()
     }
 }
 
@@ -79,11 +90,20 @@ struct GraphLoader<'load, FileSystemType: FileSystem> {
     nodes: Vec<ModuleNode>,
 }
 
+/// Which relationship led to a module being visited — determines which artifact types are legal at
+/// the far end. Only `dependencies` edges feed [`ModuleNode::dependencies`] (and thus `ModuleRebuilt`
+/// propagation); a `module_tools` edge exists purely to fix load/build order.
+#[derive(Clone, Copy)]
+enum EdgeKind {
+    Dependency,
+    Tool,
+}
+
 impl<FileSystemType: FileSystem> GraphLoader<'_, FileSystemType> {
     fn visit(
         &mut self,
         identity: ModuleIdentity,
-        required_by: Option<&ModuleIdentity>,
+        required_by: Option<(&ModuleIdentity, EdgeKind)>,
         path: &mut Vec<ModuleIdentity>,
     ) -> SindriResult<()> {
         if self.index_by_identity.contains_key(&identity) {
@@ -99,24 +119,45 @@ impl<FileSystemType: FileSystem> GraphLoader<'_, FileSystemType> {
         let build_file: BuildFile = identity.to_build_file();
         let module: Module = Module::load(&build_file, self.workspace, self.file_system)?;
         // The entry module (`required_by` is `None`) may be any type; every module reached along a
-        // dependency edge must be a library.
-        if let Some(dependent) = required_by {
-            if !module.artifact_type().is_library() {
-                return Err(SindriError::NonLibraryDependency {
-                    dependent: dependent.clone(),
-                    dependency: identity.clone(),
-                    kind: module.artifact_type().name(),
+        // `dependencies` edge must be a library, and every module reached along a `module_tools` edge
+        // must be an executable.
+        if let Some((dependent, edge_kind)) = required_by {
+            let valid: bool = match edge_kind {
+                EdgeKind::Dependency => module.artifact_type().is_library(),
+                EdgeKind::Tool => module.artifact_type().is_executable(),
+            };
+            if !valid {
+                return Err(match edge_kind {
+                    EdgeKind::Dependency => SindriError::NonLibraryDependency {
+                        dependent: dependent.clone(),
+                        dependency: identity.clone(),
+                        kind: module.artifact_type().name(),
+                    },
+                    EdgeKind::Tool => SindriError::NonExecutableModuleTool {
+                        dependent: dependent.clone(),
+                        dependency: identity.clone(),
+                        kind: module.artifact_type().name(),
+                    },
                 });
             }
         }
         path.push(identity.clone());
         let dependency_identities: Vec<ModuleIdentity> = module.dependencies().module_dependencies().cloned().collect();
         for dependency in &dependency_identities {
-            self.visit(dependency.clone(), Some(&identity), path)?;
+            self.visit(dependency.clone(), Some((&identity, EdgeKind::Dependency)), path)?;
+        }
+        let tool_identities: Vec<ModuleIdentity> = module
+            .module_tools()
+            .iter()
+            .map(|reference| reference.module().clone())
+            .collect();
+        for tool in &tool_identities {
+            self.visit(tool.clone(), Some((&identity, EdgeKind::Tool)), path)?;
         }
         path.pop();
         // Every dependency is loaded now, so each resolves to a node index. Deduplicate: the same
-        // module may be named in more than one scope, but it is a single edge.
+        // module may be named in more than one scope, but it is a single edge. `module_tools` targets
+        // deliberately do not participate here — see the type's doc comment.
         let mut dependencies: Vec<usize> = Vec::new();
         for dependency in &dependency_identities {
             let index: usize = *self
@@ -417,5 +458,116 @@ mod tests {
             matches!(error, SindriError::NonLibraryDependency { .. }),
             "expected a non-library-dependency error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn loads_a_module_tools_target_even_when_not_also_a_dependency() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//tools/codegen:codegen" ] }"#,
+            )
+            .file(
+                "/workspace/tools/codegen/sindri.build",
+                r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let graph: ModuleGraph = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap();
+        let names: Vec<&str> = loaded_names(&graph);
+        assert!(names.contains(&"codegen"), "expected the tool module, got {names:?}");
+        // A tool module is always visited (and thus built) before the module that references it.
+        assert!(node_index(&graph, "codegen") < node_index(&graph, "app"));
+    }
+
+    #[test]
+    fn rejects_a_non_executable_module_tool() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//libs/common:codegen" ] }"#,
+            )
+            .file(
+                "/workspace/libs/common/sindri.build",
+                r#"{ name = "common", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let error: SindriError = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap_err();
+        assert!(
+            matches!(error, SindriError::NonExecutableModuleTool { .. }),
+            "expected a non-executable-module-tool error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_tools_edge_participates_in_cycle_detection() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/a/sindri.build",
+                r#"{ name = "a", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//b:codegen" ] }"#,
+            )
+            .file(
+                "/workspace/b/sindri.build",
+                r#"{ name = "b", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//a" } ] } }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let error: SindriError = ModuleGraph::load(&entry("a/sindri.build"), &workspace, &runtime).unwrap_err();
+        assert!(
+            matches!(error, SindriError::DependencyCycle { .. }),
+            "expected a dependency-cycle error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_tools_edge_does_not_appear_in_module_node_dependencies() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//tools/codegen:codegen" ] }"#,
+            )
+            .file(
+                "/workspace/tools/codegen/sindri.build",
+                r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let graph: ModuleGraph = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap();
+        let app_index: usize = node_index(&graph, "app");
+        assert!(
+            graph.nodes()[app_index].dependencies().is_empty(),
+            "a module_tools edge must not appear in ModuleNode::dependencies"
+        );
+    }
+
+    #[test]
+    fn index_of_resolves_a_loaded_module() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", WORKSPACE)
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     dependencies = { compile = [ { module = "//libs/common" } ] } }"#,
+            )
+            .file(
+                "/workspace/libs/common/sindri.build",
+                r#"{ name = "common", language = "go", type = "library", version = "0.1.0" }"#,
+            )
+            .build();
+        let workspace: Workspace = make_workspace(&runtime);
+        let graph: ModuleGraph = ModuleGraph::load(&entry("sindri.build"), &workspace, &runtime).unwrap();
+        let identity: ModuleIdentity = ModuleIdentity::parse("//libs/common").unwrap();
+        assert_eq!(graph.index_of(&identity), Some(node_index(&graph, "common")));
+        assert_eq!(graph.index_of(&ModuleIdentity::parse("//nowhere").unwrap()), None);
     }
 }

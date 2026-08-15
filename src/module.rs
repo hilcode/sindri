@@ -14,6 +14,9 @@ use serde::Deserialize;
 use serde::de::Error as DeserializeError;
 use smol_str::SmolStr;
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 
 const MODULE_CONTRACT: Contract = Contract::new(
     include_str!("contracts/module.ncl"),
@@ -38,6 +41,12 @@ impl ArtifactType {
     /// Executables, web archives, and container images may consume dependencies but never be one.
     pub fn is_library(&self) -> bool {
         matches!(self, ArtifactType::Library)
+    }
+
+    /// Whether this is an `executable` — the only type that may appear as a `module_tools` target,
+    /// since only an executable module produces a binary another task can run.
+    pub fn is_executable(&self) -> bool {
+        matches!(self, ArtifactType::Executable)
     }
 
     /// The type's on-the-wire name, for diagnostics that report a module's type back to the user.
@@ -67,6 +76,90 @@ impl<'deserialize> Deserialize<'deserialize> for ArtifactType {
         }
     }
 }
+
+/// The name of a binary a `module_tools` entry names, unique within the referenced module's
+/// package output.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BinaryName(SmolStr);
+
+impl Display for BinaryName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A reference to a binary produced by an `executable` module in the same workspace, named in a
+/// module's `module_tools` list. Parsed from the `//<module identity>:<binary>` label syntax — a
+/// module identity, a literal `:`, then the binary name — e.g. `//tools/codegen:codegen`. Neither a
+/// [`ModuleIdentity`] directory segment nor its qualifier can contain `:`, so splitting on the first
+/// `:` unambiguously separates the two parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleToolReference {
+    module: ModuleIdentity,
+    binary: BinaryName,
+}
+
+impl ModuleToolReference {
+    pub fn module(&self) -> &ModuleIdentity {
+        &self.module
+    }
+
+    pub fn binary(&self) -> &BinaryName {
+        &self.binary
+    }
+
+    pub fn parse(text: &str) -> Result<ModuleToolReference, ModuleToolReferenceParseError> {
+        let malformed = || -> ModuleToolReferenceParseError {
+            ModuleToolReferenceParseError {
+                text: SmolStr::new(text),
+            }
+        };
+        let (module_text, binary_text): (&str, &str) = text.split_once(':').ok_or_else(malformed)?;
+        let module: ModuleIdentity = ModuleIdentity::parse(module_text).map_err(|_| malformed())?;
+        if !Self::is_valid_binary_name(binary_text) {
+            return Err(malformed());
+        }
+        Ok(ModuleToolReference {
+            module,
+            binary: BinaryName(SmolStr::new(binary_text)),
+        })
+    }
+
+    fn is_valid_binary_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+}
+
+impl<'deserialize> Deserialize<'deserialize> for ModuleToolReference {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let text: SmolStr = SmolStr::deserialize(deserializer)?;
+        ModuleToolReference::parse(&text).map_err(DeserializeError::custom)
+    }
+}
+
+/// The reason a string could not be read as a [`ModuleToolReference`]. Carries the offending text so
+/// the message can point at exactly what was written.
+#[derive(Clone, Debug)]
+pub struct ModuleToolReferenceParseError {
+    text: SmolStr,
+}
+
+impl Display for ModuleToolReferenceParseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            formatter,
+            "invalid module_tools entry `{}`; expected `//path:binary` or `//path [qualifier]:binary`",
+            self.text
+        )
+    }
+}
+
+impl std::error::Error for ModuleToolReferenceParseError {}
 
 /// The identity of an external-artifact dependency (e.g. `example-org:some-lib`) — the artifact
 /// parallel of a [`ModuleIdentity`]. A thin newtype over the coordinate text; it names which artifact,
@@ -197,6 +290,8 @@ pub struct Module {
     dependencies: DependencyGroup,
     #[serde(default)]
     parameters: ParameterState,
+    #[serde(default)]
+    module_tools: Vec<ModuleToolReference>,
 }
 
 impl Module {
@@ -218,6 +313,10 @@ impl Module {
 
     pub fn dependencies(&self) -> &DependencyGroup {
         &self.dependencies
+    }
+
+    pub fn module_tools(&self) -> &[ModuleToolReference] {
+        &self.module_tools
     }
 
     pub fn parameters(&self) -> &ParameterState {
@@ -629,5 +728,87 @@ mod tests {
     fn artifact_dependency_has_no_module_identity() {
         let artifact: Dependency = Dependency::Artifact(ArtifactIdentity(SmolStr::new("example-org:some-lib")));
         assert_eq!(artifact.module_identity(), None);
+    }
+
+    #[test]
+    fn artifact_type_is_executable_true_only_for_executable() {
+        assert!(!ArtifactType::Library.is_executable());
+        assert!(ArtifactType::Executable.is_executable());
+        assert!(!ArtifactType::WebArchive.is_executable());
+        assert!(!ArtifactType::ContainerImage.is_executable());
+    }
+
+    #[test]
+    fn module_tool_reference_parses_a_label() {
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen:codegen").unwrap();
+        assert_eq!(reference.module().to_string(), "//tools/codegen/");
+        assert_eq!(reference.binary().to_string(), "codegen");
+    }
+
+    #[test]
+    fn module_tool_reference_parses_a_label_with_a_qualifier() {
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen [bin]:codegen").unwrap();
+        assert_eq!(reference.module().to_string(), "//tools/codegen/ [bin]");
+        assert_eq!(reference.binary().to_string(), "codegen");
+    }
+
+    #[test]
+    fn module_tool_reference_rejects_a_missing_colon() {
+        assert!(ModuleToolReference::parse("//tools/codegen").is_err());
+    }
+
+    #[test]
+    fn module_tool_reference_rejects_an_empty_binary_name() {
+        assert!(ModuleToolReference::parse("//tools/codegen:").is_err());
+    }
+
+    #[test]
+    fn module_tool_reference_rejects_a_malformed_module_part() {
+        assert!(ModuleToolReference::parse("tools/codegen:codegen").is_err());
+    }
+
+    #[test]
+    fn module_tool_reference_deserializes_from_a_string() {
+        let reference: ModuleToolReference = serde_json::from_str(r#""//tools/codegen:codegen""#).unwrap();
+        assert_eq!(reference.binary().to_string(), "codegen");
+    }
+
+    #[test]
+    fn load_module_parses_module_tools() {
+        let source: &str = r#"{
+  name = "app", language = "go", type = "executable", version = "0.1.0",
+  module_tools = [ "//tools/codegen:codegen" ],
+}"#;
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        assert_eq!(module.module_tools().len(), 1);
+        assert_eq!(module.module_tools()[0].binary().to_string(), "codegen");
+    }
+
+    #[test]
+    fn load_module_without_module_tools_has_an_empty_list() {
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", MINIMAL).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
+        let module: Module = Module::load(&build_file, &workspace, &runtime).unwrap();
+        assert!(module.module_tools().is_empty());
+    }
+
+    #[test]
+    fn load_module_rejects_a_malformed_module_tools_label() {
+        let source: &str = r#"{
+  name = "app", language = "go", type = "executable", version = "0.1.0",
+  module_tools = [ "not-a-label" ],
+}"#;
+        let runtime: DummyRuntime = workspace_runtime().file("/workspace/sindri.build", source).build();
+        let workspace: Workspace = make_workspace(&runtime, "");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
+        let error: SindriError = Module::load(&build_file, &workspace, &runtime).unwrap_err();
+        assert!(
+            matches!(error, SindriError::Schema { .. }),
+            "expected Schema, got {error:?}"
+        );
     }
 }

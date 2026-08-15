@@ -9,6 +9,7 @@ pub mod local_time_with_elapsed;
 pub mod metadata_cache;
 pub mod module;
 pub mod module_graph;
+pub mod module_tool;
 pub mod nickel_eval;
 pub mod nickel_import;
 pub mod parameter;

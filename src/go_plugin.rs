@@ -133,6 +133,7 @@ impl GoPlugin {
 mod tests {
     use super::*;
     use crate::module_graph::ModuleGraph;
+    use crate::module_tool::ModuleToolBinaries;
     use crate::nickel_import::ScriptResolutionState;
     use crate::parameter::ParameterName;
     use crate::parameter::ParameterState;
@@ -197,6 +198,7 @@ mod tests {
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out")),
             &workspace_root,
+            &ModuleToolBinaries::new(),
             &mut resolution_state,
             &runtime,
         )
@@ -352,6 +354,7 @@ mod tests {
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &workspace_root(),
+                &ModuleToolBinaries::new(),
                 &mut resolution_state,
                 &runtime,
             )

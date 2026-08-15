@@ -2,6 +2,9 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::file_set::FileSetPattern;
+use crate::module::BinaryName;
+use crate::module::ModuleToolReference;
+use crate::module_tool::ModuleToolBinaries;
 use crate::nickel_import::ScriptResolutionState;
 use crate::nickel_import::TransitiveSource;
 use crate::nickel_import::resolve_transitive_source;
@@ -21,6 +24,7 @@ use blake3::Hasher;
 use serde::Deserialize;
 use serde::Serialize;
 use smol_str::SmolStr;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
@@ -114,6 +118,7 @@ pub struct Task {
     managed_input: ManagedTaskInput,
     output: TaskOutput,
     declared_parameters: ParameterDeclarations,
+    module_tools: Vec<ModuleToolReference>,
 }
 
 impl Task {
@@ -132,11 +137,23 @@ impl Task {
             managed_input,
             output,
             declared_parameters,
+            module_tools: Vec::new(),
         }
+    }
+
+    /// Attach the workspace-built tools this task's script may reference via
+    /// `inputs."module-tools"` — see [`crate::module_tool::ModuleToolBinaries`].
+    pub fn with_module_tools(mut self, module_tools: impl IntoIterator<Item = ModuleToolReference>) -> Task {
+        self.module_tools = module_tools.into_iter().collect();
+        self
     }
 
     pub fn name(&self) -> &TaskName {
         &self.name
+    }
+
+    pub fn module_tools(&self) -> &[ModuleToolReference] {
+        &self.module_tools
     }
 
     pub fn script(&self) -> &Script {
@@ -161,11 +178,12 @@ impl Task {
 
     /// Resolve this task for a concrete build: bind `parameter_state` against the task's declared
     /// parameters, match its declared input against the module directory and its managed input
-    /// against `managed_input_base` — their union is the task's effective input — and apply the
-    /// script to the bound parameters and effective input to yield the ordered commands to run.
-    /// `managed_input_base` is distinct from `module_directory` because a managed input need not live
-    /// in the module at all: `go-compile`'s managed `go.work`, for instance, lives in the
-    /// `generate-go-work` task's own output directory, shared workspace-wide.
+    /// against `managed_input_base` — their union is the task's effective input — resolve this
+    /// task's own `module_tools` references against `module_tool_binaries`, and apply the script to
+    /// all of the above to yield the ordered commands to run. `managed_input_base` is distinct from
+    /// `module_directory` because a managed input need not live in the module at all: `go-compile`'s
+    /// managed `go.work`, for instance, lives in the `generate-go-work` task's own output directory,
+    /// shared workspace-wide.
     // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
     // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
     // not apply.
@@ -177,6 +195,7 @@ impl Task {
         managed_input_base: &AbsoluteDirectory,
         output_directory: &AbsoluteDirectory,
         workspace_root: &WorkspaceRoot,
+        module_tool_binaries: &ModuleToolBinaries,
         resolution_state: &mut ScriptResolutionState,
         file_system: &impl FileSystem,
     ) -> SindriResult<Vec<Command>> {
@@ -196,6 +215,16 @@ impl Task {
             file_system,
         )?;
         let effective_input: FileSet = declared_files.union(&managed_files);
+        let module_tool_bindings: BTreeMap<BinaryName, AbsoluteFile> = self
+            .module_tools
+            .iter()
+            .map(|reference: &ModuleToolReference| -> (BinaryName, AbsoluteFile) {
+                let file: &AbsoluteFile = module_tool_binaries
+                    .resolve(reference)
+                    .expect("a module_tools target is registered before any module that could reference it runs");
+                (reference.binary().clone(), file.clone())
+            })
+            .collect();
         let inputs: ScriptInputs = ScriptInputs::new(
             &binding,
             &effective_input,
@@ -203,6 +232,7 @@ impl Task {
             managed_input_base,
             workspace_root,
             module_directory,
+            &module_tool_bindings,
         );
         self.script.evaluate(
             &inputs,
@@ -350,6 +380,10 @@ mod tests {
         AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"))
     }
 
+    fn module_tool_binaries() -> ModuleToolBinaries {
+        ModuleToolBinaries::new()
+    }
+
     #[test]
     fn a_task_exposes_its_name_script_inputs_output_and_declared_parameters() {
         let declared_input: DeclaredTaskInput = DeclaredTaskInput::new(FileSetPattern::new(["**/*.go"]));
@@ -377,6 +411,22 @@ mod tests {
         assert_eq!(task.managed_input().pattern().globs(), managed_input.pattern().globs());
         assert_eq!(task.output().pattern().globs(), output.pattern().globs());
         assert!(!task.declared_parameters().is_empty());
+        assert!(task.module_tools().is_empty());
+    }
+
+    #[test]
+    fn with_module_tools_sets_and_exposes_the_list() {
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen:codegen").unwrap();
+        let task: Task = Task::new(
+            TaskName::new("module-tool-codegen"),
+            Script::new("fun inputs => [ { program = inputs.\"module-tools\".\"codegen\" } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        )
+        .with_module_tools([reference.clone()]);
+        assert_eq!(task.module_tools(), &[reference]);
     }
 
     #[test]
@@ -397,6 +447,7 @@ mod tests {
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
             &mut resolution_state,
             &runtime,
         );
@@ -421,6 +472,7 @@ mod tests {
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
             &mut resolution_state,
             &runtime,
         );
@@ -458,6 +510,7 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
                 &mut resolution_state,
                 &runtime,
             )
@@ -501,6 +554,7 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
                 &mut resolution_state,
                 &runtime,
             )
@@ -511,6 +565,43 @@ mod tests {
             commands[0].arguments(),
             &[SmolStr::new("build"), SmolStr::new("release")]
         );
+    }
+
+    #[test]
+    fn resolution_resolves_a_module_tools_reference_to_its_absolute_path() {
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen:codegen").unwrap();
+        let task: Task = Task::new(
+            TaskName::new("module-tool-codegen"),
+            Script::new("fun inputs => [ { program = inputs.\"module-tools\".\"codegen\" } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        )
+        .with_module_tools([reference.clone()]);
+        let binary_file: AbsoluteFile =
+            AbsoluteFile::new(PathBuf::from("/workspace/.target/tools/codegen/binding/codegen"));
+        let mut binaries: ModuleToolBinaries = ModuleToolBinaries::new();
+        binaries.insert(
+            reference.module().clone(),
+            reference.binary().clone(),
+            binary_file.clone(),
+        );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        let commands: Vec<Command> = task
+            .resolve(
+                &ParameterState::default(),
+                &module_directory(),
+                &managed_input_base(),
+                &output_directory(),
+                &workspace_root(),
+                &binaries,
+                &mut resolution_state,
+                &runtime,
+            )
+            .unwrap();
+        assert_eq!(commands[0].program(), binary_file.to_string());
     }
 
     #[test]
@@ -535,6 +626,7 @@ mod tests {
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
             &mut resolution_state,
             &runtime,
         );
@@ -582,6 +674,7 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
                 &mut resolution_state,
                 &runtime,
             )
@@ -716,6 +809,7 @@ mod tests {
                     &managed_input_base(),
                     &output_directory(),
                     &workspace_root(),
+                    &module_tool_binaries(),
                     &mut resolution_state,
                     &runtime,
                 )

@@ -1,3 +1,4 @@
+use crate::module::BinaryName;
 use crate::parameter::ParameterName;
 use crate::parameter::PluginName;
 use crate::task::TaskName;
@@ -74,6 +75,28 @@ pub enum SindriError {
         dependency: ModuleIdentity,
         kind: &'static str,
     },
+
+    #[error(
+        "module `{dependency}` is a {kind}, but only executable modules may be used as a module tool (required by `{dependent}`)"
+    )]
+    #[diagnostic(
+        help("make the referenced module an executable module, or remove the module_tools entry"),
+        code(sindri::module::non_executable_module_tool)
+    )]
+    NonExecutableModuleTool {
+        dependent: ModuleIdentity,
+        dependency: ModuleIdentity,
+        kind: &'static str,
+    },
+
+    #[error("module `{module}`'s package step did not produce a binary named `{binary}`")]
+    #[diagnostic(
+        help(
+            "check that the module's package step writes a file named {binary} into its output, or correct the binary name in module_tools"
+        ),
+        code(sindri::module_tool::binary_missing)
+    )]
+    ModuleToolBinaryMissing { module: ModuleIdentity, binary: BinaryName },
 
     #[error("task `{task_name}` failed\n\ncommand: {command}\n\noutput:\n{output}")]
     #[diagnostic(help("check the command output above for details"), code(sindri::task::failed))]
@@ -163,6 +186,18 @@ mod tests {
             dependent: ModuleIdentity::parse("//app").unwrap(),
             dependency: ModuleIdentity::parse("//tools/gen").unwrap(),
             kind: "executable",
+        });
+        assert_has_help_and_code(&SindriError::NonExecutableModuleTool {
+            dependent: ModuleIdentity::parse("//app").unwrap(),
+            dependency: ModuleIdentity::parse("//libs/common").unwrap(),
+            kind: "library",
+        });
+        assert_has_help_and_code(&SindriError::ModuleToolBinaryMissing {
+            module: ModuleIdentity::parse("//tools/codegen").unwrap(),
+            binary: crate::module::ModuleToolReference::parse("//tools/codegen:codegen")
+                .unwrap()
+                .binary()
+                .clone(),
         });
         assert_has_help_and_code(&SindriError::TaskFailed {
             task_name: TaskName::new("go-compile"),
