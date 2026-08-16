@@ -282,7 +282,8 @@ impl CommandOutput {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(transparent)]
 pub struct Step(SmolStr);
 
 impl Step {

@@ -82,7 +82,7 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
             source,
         })?;
     workspace.log_loaded(&runtime)?;
-    let lifecycle: Lifecycle = Lifecycle::new();
+    let lifecycle: Lifecycle = Lifecycle::default();
     let verbosity: Verbosity = if arguments.quiet {
         Verbosity::Quiet
     } else if arguments.verbose {
