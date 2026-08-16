@@ -18,32 +18,66 @@ use std::path::PathBuf;
 /// the same byte stream can never collide (e.g. `["a", "bc"]` versus `["ab", "c"]`).
 const FIELD_SEPARATOR: [u8; 1] = [0];
 
-/// An ordered list of include globs describing a set of files. It is a *description*, not a set of
-/// files: resolving it against a directory yields a [`FileSet`]. A file is a member iff it matches at
-/// least one glob, so an empty pattern selects nothing.
+/// A section delimiter folded into the pattern hash between the glob list and the excluded-directory
+/// list, distinct from [`FIELD_SEPARATOR`], so a hash cannot collide between e.g. `globs = ["a"],
+/// excluded = ["b"]` and `globs = ["a", "b"], excluded = []`.
+const SECTION_SEPARATOR: [u8; 1] = [1];
+
+/// An ordered list of include globs describing a set of files, plus a list of directories pruned
+/// entirely from the walk before any glob is even considered. It is a *description*, not a set of
+/// files: resolving it against a directory yields a [`FileSet`]. A file is a member iff it is not
+/// beneath an excluded directory and matches at least one glob, so an empty pattern selects nothing.
+///
+/// Excluded directories are a deliberately narrow escape hatch — a literal list of directory names,
+/// not a second, "exclude" class of glob — for the one shape of exclusion Sindri actually needs today
+/// (e.g. a task pruning its own state directory out of an otherwise all-encompassing sweep). A general
+/// include/exclude glob system remains future work.
 #[derive(Clone, Debug)]
 pub struct FileSetPattern {
     globs: Vec<SmolStr>,
+    excluded_directories: Vec<SmolStr>,
 }
 
 impl FileSetPattern {
     pub fn new(globs: impl IntoIterator<Item = impl Into<SmolStr>>) -> FileSetPattern {
         FileSetPattern {
             globs: globs.into_iter().map(|glob| glob.into()).collect(),
+            excluded_directories: Vec::new(),
         }
+    }
+
+    /// Prune these directories (given relative to the same base the pattern is resolved against, e.g.
+    /// `"clean"`) from the walk entirely — nothing beneath them is ever read or classified, regardless
+    /// of what the include globs say.
+    pub fn excluding_directories(
+        mut self,
+        directories: impl IntoIterator<Item = impl Into<SmolStr>>,
+    ) -> FileSetPattern {
+        self.excluded_directories = directories.into_iter().map(|directory| directory.into()).collect();
+        self
     }
 
     pub fn globs(&self) -> &[SmolStr] {
         &self.globs
     }
 
-    /// A digest over the glob strings, in list order. It changes whenever the pattern itself changes —
-    /// a glob edited, added, or removed — which is the signal that a resolved file set must be
-    /// recomputed, independently of whether the matched files changed.
+    pub fn excluded_directories(&self) -> &[SmolStr] {
+        &self.excluded_directories
+    }
+
+    /// A digest over the glob strings and the excluded-directory strings, each in list order. It
+    /// changes whenever the pattern itself changes — a glob or an exclusion edited, added, or removed
+    /// — which is the signal that a resolved file set must be recomputed, independently of whether the
+    /// matched files changed.
     pub fn pattern_hash(&self) -> PatternHash {
         let mut hasher: Hasher = Hasher::new();
         for glob in &self.globs {
             hasher.update(glob.as_bytes());
+            hasher.update(&FIELD_SEPARATOR);
+        }
+        hasher.update(&SECTION_SEPARATOR);
+        for directory in &self.excluded_directories {
+            hasher.update(directory.as_bytes());
             hasher.update(&FIELD_SEPARATOR);
         }
         PatternHash(*hasher.finalize().as_bytes())
@@ -360,5 +394,63 @@ mod tests {
         assert_eq!(baseline, FileSetPattern::new(["**/*.go", "go.mod"]).pattern_hash());
         assert_ne!(baseline, FileSetPattern::new(["**/*.rs", "go.mod"]).pattern_hash());
         assert_ne!(baseline, FileSetPattern::new(["**/*.go"]).pattern_hash());
+    }
+
+    #[test]
+    fn a_pattern_exposes_its_excluded_directories_in_order() {
+        let pattern: FileSetPattern = FileSetPattern::new(["**/*"]).excluding_directories(["clean", "nested/skip"]);
+        assert_eq!(
+            pattern.excluded_directories(),
+            &[SmolStr::new("clean"), SmolStr::new("nested/skip")]
+        );
+    }
+
+    #[test]
+    fn resolving_prunes_files_beneath_an_excluded_directory() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/go-compile/binary", "")
+            .file("/workspace/clean/state.bin", "")
+            .file("/workspace/clean/nested/more.bin", "")
+            .build();
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        let pattern: FileSetPattern = FileSetPattern::new(["**/*"]).excluding_directories(["clean"]);
+        let file_set: FileSet = FileSet::resolve(&pattern, &root.to_absolute_directory(), &root, &runtime).unwrap();
+        let matched: BTreeSet<String> = file_set
+            .files()
+            .iter()
+            .map(|file: &RelativeFile| -> String { file.to_string() })
+            .collect();
+        assert_eq!(matched, BTreeSet::from(["go-compile/binary".to_string()]));
+    }
+
+    #[test]
+    fn resolving_against_the_real_filesystem_prunes_an_excluded_directory() {
+        let temporary_directory: TempDir = TempDir::new().unwrap();
+        let root_path: PathBuf = temporary_directory.path().to_path_buf();
+        create_dir_all(root_path.join("go-compile")).unwrap();
+        create_dir_all(root_path.join("clean")).unwrap();
+        write(root_path.join("go-compile/binary"), "").unwrap();
+        write(root_path.join("clean/state.bin"), "").unwrap();
+        let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(root_path));
+        let pattern: FileSetPattern = FileSetPattern::new(["**/*"]).excluding_directories(["clean"]);
+        let file_set: FileSet =
+            FileSet::resolve(&pattern, &root.to_absolute_directory(), &root, &system_runtime()).unwrap();
+        let matched: BTreeSet<String> = file_set
+            .files()
+            .iter()
+            .map(|file: &RelativeFile| -> String { file.to_string() })
+            .collect();
+        assert_eq!(matched, BTreeSet::from(["go-compile/binary".to_string()]));
+    }
+
+    #[test]
+    fn the_pattern_hash_reflects_excluded_directories_and_does_not_collide_with_the_globs() {
+        let baseline: PatternHash = FileSetPattern::new(["**/*"]).pattern_hash();
+        let excluding: PatternHash = FileSetPattern::new(["**/*"])
+            .excluding_directories(["clean"])
+            .pattern_hash();
+        let glob_variant: PatternHash = FileSetPattern::new(["**/*", "clean"]).pattern_hash();
+        assert_ne!(baseline, excluding);
+        assert_ne!(excluding, glob_variant);
     }
 }

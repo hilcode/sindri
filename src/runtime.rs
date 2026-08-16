@@ -12,6 +12,7 @@ use crate::types::FileMetadata;
 use crate::types::WorkspaceRoot;
 use ignore::DirEntry as WalkEntry;
 use ignore::WalkBuilder;
+use smol_str::SmolStr;
 use std::env::current_dir;
 use std::fs::DirEntry as DirectoryEntry;
 use std::fs::File;
@@ -115,6 +116,16 @@ impl FileSystem for SystemFileSystem {
         let compiled: CompiledFileSetPattern = pattern.compile().map_err(IoError::other)?;
         let mut walker: WalkBuilder = WalkBuilder::new(base);
         walker.standard_filters(false).follow_links(false);
+        let excluded_directories: Vec<PathBuf> = pattern
+            .excluded_directories()
+            .iter()
+            .map(|directory: &SmolStr| -> PathBuf { base.join(directory.as_str()) })
+            .collect();
+        if !excluded_directories.is_empty() {
+            walker.filter_entry(move |entry: &WalkEntry| -> bool {
+                !excluded_directories.contains(&entry.path().to_path_buf())
+            });
+        }
         let mut files: Vec<PathBuf> = Vec::new();
         for entry in walker.build() {
             let entry: WalkEntry = entry.map_err(IoError::other)?;
@@ -264,8 +275,6 @@ impl Runtime for SystemRuntime {
 
 #[cfg(test)]
 use crate::types::Stdout;
-#[cfg(test)]
-use smol_str::SmolStr;
 #[cfg(test)]
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -492,9 +501,17 @@ impl FileSystem for DummyRuntime {
         // The dummy holds its files in a flat in-memory map with no on-disk directory tree, so there
         // is nothing to walk: iterate every registered file under `base` and classify it directly.
         let compiled: CompiledFileSetPattern = pattern.compile().map_err(IoError::other)?;
+        let excluded_directories: Vec<PathBuf> = pattern
+            .excluded_directories()
+            .iter()
+            .map(|directory: &SmolStr| -> PathBuf { base.join(directory.as_str()) })
+            .collect();
         let mut files: Vec<PathBuf> = Vec::new();
         for path in self.files.keys() {
             if let Ok(relative) = path.strip_prefix(base) {
+                if excluded_directories.iter().any(|excluded| path.starts_with(excluded)) {
+                    continue;
+                }
                 if compiled.classify_file(relative) {
                     files.push(path.clone());
                 }
