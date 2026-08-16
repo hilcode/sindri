@@ -371,7 +371,16 @@ impl Lifecycle {
 
     pub fn build_task_graph(&self, tasks: &[(Task, Step)], target: &Step) -> Option<TaskGraph> {
         let target_index: usize = self.steps.iter().position(|step: &Step| -> bool { step == target })?;
-        let steps_in_scope: &[Step] = &self.steps[..=target_index];
+        // A task bound to `end` only runs once the lifecycle's own last named step has actually run:
+        // targeting that step (the one immediately before `end`) extends the scope one step further
+        // to include it. Targeting an earlier step never reaches `end`.
+        let end_index: usize = self.steps.len() - 1;
+        let scope_end_index: usize = if target_index == end_index - 1 {
+            end_index
+        } else {
+            target_index
+        };
+        let steps_in_scope: &[Step] = &self.steps[..=scope_end_index];
 
         let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
         for step in steps_in_scope {
@@ -536,6 +545,63 @@ mod tests {
         // The executor derives step ordering positionally from this node order, so build_task_graph
         // must emit every compile-step task before every test-step task.
         assert_eq!(names, vec!["compile-task", "test-task"]);
+    }
+
+    #[test]
+    fn a_task_bound_to_end_runs_when_the_target_is_the_lifecycles_last_named_step() {
+        let tasks: Vec<(Task, Step)> = vec![
+            (make_task("compile-task"), Step::new("compile")),
+            (make_task("end-task"), Step::new("end")),
+        ];
+        let lifecycle: Lifecycle = Lifecycle::new(
+            LifecycleName::new("test"),
+            vec![Step::new("compile"), Step::new("test")],
+        );
+        let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("test")).unwrap();
+        let names: Vec<String> = graph
+            .nodes()
+            .iter()
+            .map(|node: &TaskGraphNode| -> String { node.task().name().to_string() })
+            .collect();
+        assert_eq!(names, vec!["compile-task", "end-task"]);
+    }
+
+    #[test]
+    fn a_task_bound_to_end_does_not_run_when_targeting_an_earlier_step() {
+        let tasks: Vec<(Task, Step)> = vec![
+            (make_task("compile-task"), Step::new("compile")),
+            (make_task("end-task"), Step::new("end")),
+        ];
+        let lifecycle: Lifecycle = Lifecycle::new(
+            LifecycleName::new("test"),
+            vec![Step::new("compile"), Step::new("test")],
+        );
+        let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("compile")).unwrap();
+        let names: Vec<String> = graph
+            .nodes()
+            .iter()
+            .map(|node: &TaskGraphNode| -> String { node.task().name().to_string() })
+            .collect();
+        assert_eq!(names, vec!["compile-task"]);
+    }
+
+    #[test]
+    fn a_task_bound_to_start_runs_regardless_of_target() {
+        let tasks: Vec<(Task, Step)> = vec![
+            (make_task("start-task"), Step::new("start")),
+            (make_task("compile-task"), Step::new("compile")),
+        ];
+        let lifecycle: Lifecycle = Lifecycle::new(
+            LifecycleName::new("test"),
+            vec![Step::new("compile"), Step::new("test")],
+        );
+        let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("compile")).unwrap();
+        let names: Vec<String> = graph
+            .nodes()
+            .iter()
+            .map(|node: &TaskGraphNode| -> String { node.task().name().to_string() })
+            .collect();
+        assert_eq!(names, vec!["start-task", "compile-task"]);
     }
 
     #[test]
