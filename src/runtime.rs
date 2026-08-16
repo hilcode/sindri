@@ -357,6 +357,7 @@ pub struct DummyRuntime {
     current_directory: PathBuf,
     current_directory_error: Option<ErrorKind>,
     errors: HashMap<PathBuf, ErrorKind>,
+    write_errors: HashMap<PathBuf, ErrorKind>,
     now: Instant,
     writes: Mutex<HashMap<PathBuf, Vec<u8>>>,
     created_directories: Mutex<HashSet<PathBuf>>,
@@ -541,6 +542,12 @@ impl FileSystem for DummyRuntime {
     }
 
     fn write(&self, path: &Path, contents: &[u8]) -> IoResult<()> {
+        if let Some(kind) = self.write_errors.get(path) {
+            return Err(IoError::new(
+                *kind,
+                format!("simulated failure writing {}", path.display()),
+            ));
+        }
         self.writes
             .lock()
             .unwrap()
@@ -549,6 +556,12 @@ impl FileSystem for DummyRuntime {
     }
 
     fn create_directories(&self, path: &Path) -> IoResult<()> {
+        if let Some(kind) = self.write_errors.get(path) {
+            return Err(IoError::new(
+                *kind,
+                format!("simulated failure creating directory {}", path.display()),
+            ));
+        }
         self.created_directories.lock().unwrap().insert(path.to_path_buf());
         Ok(())
     }
@@ -604,6 +617,7 @@ pub struct DummyRuntimeBuilder {
     current_directory: PathBuf,
     current_directory_error: Option<ErrorKind>,
     errors: HashMap<PathBuf, ErrorKind>,
+    write_errors: HashMap<PathBuf, ErrorKind>,
     now: Instant,
     /// The modification time the next plain [`file`](DummyRuntimeBuilder::file) call assigns,
     /// advanced by one second each time — so files registered in separate calls get distinct,
@@ -622,6 +636,7 @@ impl DummyRuntimeBuilder {
             current_directory: PathBuf::from("/"),
             current_directory_error: None,
             errors: HashMap::new(),
+            write_errors: HashMap::new(),
             now: Instant::now(),
             next_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         }
@@ -710,6 +725,13 @@ impl DummyRuntimeBuilder {
         self
     }
 
+    /// Make [`FileSystem::write`] and [`FileSystem::create_directories`] fail with `kind` when called
+    /// on `path`, instead of recording the write or directory creation.
+    pub fn write_error(mut self, path: impl AsRef<Path>, kind: ErrorKind) -> DummyRuntimeBuilder {
+        self.write_errors.insert(path.as_ref().to_path_buf(), kind);
+        self
+    }
+
     pub fn build(self) -> DummyRuntime {
         DummyRuntime {
             files: self.files,
@@ -719,6 +741,7 @@ impl DummyRuntimeBuilder {
             current_directory: self.current_directory,
             current_directory_error: self.current_directory_error,
             errors: self.errors,
+            write_errors: self.write_errors,
             now: self.now,
             writes: Mutex::new(HashMap::new()),
             created_directories: Mutex::new(HashSet::new()),

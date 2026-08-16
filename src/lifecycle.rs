@@ -109,6 +109,7 @@ impl Display for LifecycleName {
     }
 }
 
+#[derive(Debug)]
 pub struct Lifecycle {
     name: LifecycleName,
     steps: Vec<Step>,

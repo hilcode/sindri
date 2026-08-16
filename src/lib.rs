@@ -5,6 +5,7 @@ pub mod executor;
 pub mod file_set;
 pub mod go_plugin;
 pub mod lifecycle;
+pub mod lifecycles;
 pub mod local_time_with_elapsed;
 pub mod metadata_cache;
 pub mod module;

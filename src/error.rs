@@ -1,9 +1,11 @@
+use crate::lifecycle::LifecycleName;
 use crate::module::BinaryName;
 use crate::parameter::ParameterName;
 use crate::parameter::PluginName;
 use crate::task::TaskName;
 use crate::types::ModuleCycle;
 use crate::types::ModuleIdentity;
+use crate::types::Step;
 use miette::Diagnostic;
 use std::io::Error as IoError;
 use std::path::PathBuf;
@@ -133,6 +135,26 @@ pub enum SindriError {
         parameter: ParameterName,
         nickel_message: String,
     },
+
+    #[error("`{}` doesn't match what Sindri shipped", path.display())]
+    #[diagnostic(
+        help(
+            "editing lifecycle files isn't supported yet — delete it (or `.sindri/lifecycles/`) to regenerate the default"
+        ),
+        code(sindri::lifecycle::modified)
+    )]
+    LifecycleModified { path: PathBuf },
+
+    #[error("lifecycles `{first}` and `{second}` both bind the step `{step}`")]
+    #[diagnostic(
+        help("step names must be unique across every lifecycle Sindri loads"),
+        code(sindri::lifecycle::step_collision)
+    )]
+    LifecycleStepCollision {
+        step: Step,
+        first: LifecycleName,
+        second: LifecycleName,
+    },
 }
 
 #[cfg(test)]
@@ -215,6 +237,14 @@ mod tests {
             plugin: PluginName::new("plugin"),
             parameter: ParameterName::new("mode"),
             nickel_message: "value does not satisfy the contract".into(),
+        });
+        assert_has_help_and_code(&SindriError::LifecycleModified {
+            path: PathBuf::from(".sindri/lifecycles/default.json"),
+        });
+        assert_has_help_and_code(&SindriError::LifecycleStepCollision {
+            step: Step::new("compile"),
+            first: LifecycleName::new("default"),
+            second: LifecycleName::new("other"),
         });
     }
 }

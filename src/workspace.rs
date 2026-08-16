@@ -145,6 +145,15 @@ impl Workspace {
     pub fn absolute_build_directory(&self) -> AbsoluteDirectory {
         self.config.build_directory().absolute(&self.workspace_root)
     }
+
+    /// The `.sindri/` directory resolved against this workspace's root — where Sindri's own
+    /// bootstrapped data (lifecycles, and in future plugins) lives. Unlike the build directory, this
+    /// location is not configurable.
+    pub fn absolute_sindri_directory(&self) -> AbsoluteDirectory {
+        self.workspace_root.to_absolute_directory().join_directory(
+            &RelativeDirectory::new(".sindri/").expect("a literal directory name is always well-formed"),
+        )
+    }
 }
 
 impl WorkspaceRoot {
@@ -333,5 +342,22 @@ mod tests {
         );
         workspace.log_loaded(&runtime).unwrap();
         assert_eq!(runtime.logged(), vec!["Workspace loaded: /workspace/".to_string()]);
+    }
+
+    #[test]
+    fn absolute_sindri_directory_resolves_against_the_workspace_root() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/sindri.workspace", MINIMAL)
+            .build();
+        let config: WorkspaceConfig = WorkspaceConfig::load(&workspace_root(), &runtime).unwrap();
+        let workspace: Workspace = Workspace::new(
+            workspace_root(),
+            WorkingDirectory::new(RelativeDirectory::new_unchecked(PathBuf::new())),
+            config,
+        );
+        assert_eq!(
+            workspace.absolute_sindri_directory().as_ref(),
+            Path::new("/workspace/.sindri")
+        );
     }
 }
