@@ -7,7 +7,7 @@ source ../../scripts/verify-common.sh
 
 source_file=tools/codegen/main.go
 backup=$(backup_file "$source_file")
-trap 'cp "$backup" "$source_file"; rm -f "$backup"; rm -rf .target generated_greeting.go' EXIT
+trap 'cp "$backup" "$source_file"; rm -f "$backup" generated_greeting.go; sindri clean' EXIT
 
 verify_settles
 assert_binary_prints "Hello from codegen!"

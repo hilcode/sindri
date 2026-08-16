@@ -208,6 +208,17 @@ impl Script {
         ))
     }
 
+    /// The `clean` script: removes the build directory (and everything under it) via `rm -rf`. Not
+    /// bound to a module or a lifecycle step — it never reads `inputs` at all, since the path to
+    /// remove is embedded directly into the script's source the same way [`Script::go_work`] embeds
+    /// its module directories.
+    pub fn clean(build_directory: &AbsoluteDirectory) -> Script {
+        Script::new(format!(
+            "fun inputs => [ {{ program = \"rm\", arguments = [ \"-rf\", {} ] }} ]",
+            Nickel::string_literal(&build_directory.to_string())
+        ))
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -253,6 +264,38 @@ impl Script {
                 nickel_message: error.to_string(),
             }
         })
+    }
+
+    /// Evaluate a script that describes a workspace-level action rather than a module task (e.g.
+    /// [`Script::clean`]) — one that never reads `inputs`' module-scoped fields, so every one of
+    /// those is a harmless placeholder rooted at the workspace root. `name` only names the synthetic
+    /// location the script is addressed at, for import resolution and diagnostics — a workspace-level
+    /// script has no real file on disk and, so far, none imports anything.
+    pub fn evaluate_standalone(
+        &self,
+        name: &str,
+        workspace_root: &WorkspaceRoot,
+        resolution_state: &mut ScriptResolutionState,
+        file_system: &impl FileSystem,
+    ) -> SindriResult<Vec<Command>> {
+        let no_parameters: ParameterBinding = ParameterBinding::empty();
+        let no_files: FileSet = FileSet::empty();
+        let workspace_root_directory: AbsoluteDirectory = workspace_root.to_absolute_directory();
+        let no_module_tools: BTreeMap<BinaryName, AbsoluteFile> = BTreeMap::new();
+        let module_directory: RelativeDirectory =
+            RelativeDirectory::new("").expect("the empty directory is always well-formed");
+        let inputs: ScriptInputs = ScriptInputs::new(
+            &no_parameters,
+            &no_files,
+            &workspace_root_directory,
+            &workspace_root_directory,
+            workspace_root,
+            &module_directory,
+            &no_module_tools,
+        );
+        let script_path: AbsoluteFile = workspace_root_directory
+            .join_file(&RelativeFile::new(format!("{name}.ncl")).expect("a literal file name is always well-formed"));
+        self.evaluate(&inputs, &script_path, resolution_state, file_system)
     }
 }
 

@@ -341,6 +341,32 @@ fn compile_in_valid_go_module_exits_zero() {
 }
 
 #[test]
+fn clean_removes_the_build_directory() {
+    let directory: TempDir = go_module_dir();
+    let compile: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(compile.status.success(), "expected compile to succeed first");
+    assert!(
+        directory.path().join(".target").is_dir(),
+        "expected .target to exist after compile"
+    );
+
+    let clean: Output = sindri().arg("clean").current_dir(directory.path()).output().unwrap();
+    assert!(
+        clean.status.success(),
+        "expected exit 0; stderr: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(
+        !directory.path().join(".target").exists(),
+        "expected .target to be removed by clean"
+    );
+
+    // Cleaning an already-clean workspace is not an error.
+    let second_clean: Output = sindri().arg("clean").current_dir(directory.path()).output().unwrap();
+    assert!(second_clean.status.success(), "expected a second clean to also exit 0");
+}
+
+#[test]
 fn compile_module_with_local_go_library_dependency_builds() {
     let directory: TempDir = multi_module_dir();
     let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();

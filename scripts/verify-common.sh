@@ -40,7 +40,7 @@ assert_binary_prints() {
 # Build from clean and confirm a second compile is a silent no-op — the one guarantee every example
 # must satisfy, regardless of what else it demonstrates.
 verify_settles() {
-    rm -rf .target
+    sindri clean
     echo "==> compiling from clean"
     sindri compile
     echo "==> compiling again, unchanged (expecting silence)"
@@ -49,7 +49,7 @@ verify_settles() {
 
 # Copy $1 aside and echo the backup path, so the caller can register its own restore trap:
 #   backup=$(backup_file "$source_file")
-#   trap 'cp "$backup" "$source_file"; rm -f "$backup"; rm -rf .target' EXIT
+#   trap 'cp "$backup" "$source_file"; rm -f "$backup"; sindri clean' EXIT
 backup_file() {
     local backup
     backup=$(mktemp)

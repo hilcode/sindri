@@ -2,9 +2,16 @@ use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
 use crate::executor::Verbosity;
 use crate::lifecycle::Lifecycle;
+use crate::nickel_import::ScriptResolutionState;
 use crate::runtime::Bootstrap;
+use crate::runtime::Runtime;
+use crate::script::Command;
+use crate::script::Script;
+use crate::task::TaskName;
+use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
+use crate::types::CommandOutput;
 use crate::types::RelativeFile;
 use crate::workspace::Workspace;
 use clap::Parser;
@@ -32,7 +39,7 @@ Design principles:
     long_about = LONG_ABOUT
 )]
 pub struct Arguments {
-    #[arg(long, help = "Write trace output to <build_directory>/sindri.log")]
+    #[arg(long, help = "Write trace output to <build_directory>/sindri.log.")]
     log: bool,
     #[command(subcommand)]
     action: Action,
@@ -42,17 +49,22 @@ pub struct Arguments {
 enum Action {
     /// Print the resolved lifecycle steps and the tasks bound to each.
     /// By default only steps with tasks are shown; use --all to see every step.
+    #[command(verbatim_doc_comment)]
     Lifecycle {
-        #[arg(short, long, help = "Show all steps, including those with no tasks")]
+        #[arg(short, long, help = "Show all steps, including those with no tasks.")]
         all: bool,
     },
     /// Run all tasks up to and including the compile step.
+    #[command(verbatim_doc_comment)]
     Compile {
-        #[arg(short, long, help = "Suppress progress output; only errors are shown")]
+        #[arg(short, long, help = "Suppress progress output; only errors are shown.")]
         quiet: bool,
-        #[arg(short, long, help = "Show task stdout/stderr even on success")]
+        #[arg(short, long, help = "Show task stdout/stderr even on success.")]
         verbose: bool,
     },
+    /// Remove the build directory.
+    #[command(verbatim_doc_comment)]
+    Clean,
 }
 
 pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap) -> MietteResult<()> {
@@ -86,6 +98,33 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
             };
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
             lifecycle.run_compile(&workspace, &config, &runtime)?
+        }
+        Action::Clean => {
+            let build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+            let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+            let commands: Vec<Command> = Script::clean(&build_directory).evaluate_standalone(
+                "clean",
+                workspace.workspace_root(),
+                &mut resolution_state,
+                &runtime,
+            )?;
+            for command in &commands {
+                let output: CommandOutput =
+                    runtime
+                        .run_command(command, workspace.workspace_root())
+                        .map_err(|source| SindriError::Io {
+                            path: workspace.config().build_directory().as_ref().to_path_buf(),
+                            source,
+                        })?;
+                if !output.status().is_success() {
+                    return Err(SindriError::TaskFailed {
+                        task_name: TaskName::new("clean"),
+                        command: command.to_string(),
+                        output: output.combined_output(),
+                    }
+                    .into());
+                }
+            }
         }
     }
     Ok(())
@@ -161,6 +200,43 @@ mod tests {
             },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+    }
+
+    #[test]
+    fn run_clean_action_removes_the_build_directory() {
+        let runtime: DummyRuntime = workspace().command("rm -rf", succeeded()).build();
+        let arguments: Arguments = Arguments {
+            log: false,
+            action: Action::Clean,
+        };
+        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+    }
+
+    #[test]
+    fn run_clean_action_fails_when_the_command_fails() {
+        let failed: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Failed);
+        let runtime: DummyRuntime = workspace().command("rm -rf", failed).build();
+        let arguments: Arguments = Arguments {
+            log: false,
+            action: Action::Clean,
+        };
+        assert!(run(BuildStart::now(), arguments, runtime).is_err());
+    }
+
+    #[test]
+    fn run_clean_action_fails_when_the_command_cannot_be_run() {
+        // No "rm -rf" stub registered, so `run_command` itself returns an IO error (distinct from the
+        // command running and exiting non-zero) — proving that failure is surfaced too.
+        let runtime: DummyRuntime = workspace().build();
+        let arguments: Arguments = Arguments {
+            log: false,
+            action: Action::Clean,
+        };
+        let error: miette::Report = run(BuildStart::now(), arguments, runtime).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<SindriError>(), Some(SindriError::Io { .. })),
+            "expected SindriError::Io, got {error:?}"
+        );
     }
 
     #[test]

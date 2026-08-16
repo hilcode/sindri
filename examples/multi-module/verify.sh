@@ -8,7 +8,7 @@ source ../../scripts/verify-common.sh
 
 source_file=lib/greeting/greeting.go
 backup=$(backup_file "$source_file")
-trap 'cp "$backup" "$source_file"; rm -f "$backup"; rm -rf .target' EXIT
+trap 'cp "$backup" "$source_file"; rm -f "$backup"; sindri clean' EXIT
 
 verify_settles
 assert_binary_prints "Hello, Sindri!"

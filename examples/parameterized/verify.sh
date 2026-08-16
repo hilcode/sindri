@@ -7,7 +7,7 @@ source ../../scripts/verify-common.sh
 
 build_file=sindri.build
 backup=$(backup_file "$build_file")
-trap 'cp "$backup" "$build_file"; rm -f "$backup"; rm -rf .target' EXIT
+trap 'cp "$backup" "$build_file"; rm -f "$backup"; sindri clean' EXIT
 
 verify_settles
 assert_binary_prints "Hello from a parameterized Sindri build!"

@@ -97,6 +97,12 @@ pub struct FileSet {
 }
 
 impl FileSet {
+    /// A file set with no members — for a script evaluated outside any task, which has no input
+    /// files to offer.
+    pub fn empty() -> FileSet {
+        FileSet { files: Vec::new() }
+    }
+
     /// Resolve `pattern` against `base` — the directory the pattern's globs are anchored in and the
     /// root of the walk — expressing each selected file relative to the workspace `root`. The walk
     /// runs through `file_system`, so it is hermetic under a test runtime.
