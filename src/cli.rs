@@ -2,16 +2,9 @@ use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
 use crate::executor::Verbosity;
 use crate::lifecycle::Lifecycle;
-use crate::nickel_import::ScriptResolutionState;
 use crate::runtime::Bootstrap;
-use crate::runtime::Runtime;
-use crate::script::Command;
-use crate::script::Script;
-use crate::task::TaskName;
-use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
-use crate::types::CommandOutput;
 use crate::types::RelativeFile;
 use crate::workspace::Workspace;
 use clap::Parser;
@@ -41,6 +34,15 @@ Design principles:
 pub struct Arguments {
     #[arg(long, help = "Write trace output to <build_directory>/sindri.log.")]
     log: bool,
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Suppress progress output; only errors are shown."
+    )]
+    quiet: bool,
+    #[arg(short, long, global = true, help = "Show more detail in progress output.")]
+    verbose: bool,
     #[command(subcommand)]
     action: Action,
 }
@@ -56,12 +58,7 @@ enum Action {
     },
     /// Run all tasks up to and including the compile step.
     #[command(verbatim_doc_comment)]
-    Compile {
-        #[arg(short, long, help = "Suppress progress output; only errors are shown.")]
-        quiet: bool,
-        #[arg(short, long, help = "Show task stdout/stderr even on success.")]
-        verbose: bool,
-    },
+    Compile,
     /// Remove the build directory.
     #[command(verbatim_doc_comment)]
     Clean,
@@ -86,45 +83,22 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
         })?;
     workspace.log_loaded(&runtime)?;
     let lifecycle: Lifecycle = Lifecycle::new();
+    let verbosity: Verbosity = if arguments.quiet {
+        Verbosity::Quiet
+    } else if arguments.verbose {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Normal
+    };
     match arguments.action {
         Action::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
-        Action::Compile { quiet, verbose } => {
-            let verbosity: Verbosity = if quiet {
-                Verbosity::Quiet
-            } else if verbose {
-                Verbosity::Verbose
-            } else {
-                Verbosity::Normal
-            };
+        Action::Compile => {
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
             lifecycle.run_compile(&workspace, &config, &runtime)?
         }
         Action::Clean => {
-            let build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
-            let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
-            let commands: Vec<Command> = Script::clean(&build_directory).evaluate_standalone(
-                "clean",
-                workspace.workspace_root(),
-                &mut resolution_state,
-                &runtime,
-            )?;
-            for command in &commands {
-                let output: CommandOutput =
-                    runtime
-                        .run_command(command, workspace.workspace_root())
-                        .map_err(|source| SindriError::Io {
-                            path: workspace.config().build_directory().as_ref().to_path_buf(),
-                            source,
-                        })?;
-                if !output.status().is_success() {
-                    return Err(SindriError::TaskFailed {
-                        task_name: TaskName::new("clean"),
-                        command: command.to_string(),
-                        output: output.combined_output(),
-                    }
-                    .into());
-                }
-            }
+            let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
+            lifecycle.run_clean(&workspace, &config, &runtime)?
         }
     }
     Ok(())
@@ -169,6 +143,8 @@ mod tests {
         let runtime: DummyRuntime = workspace().build();
         let arguments: Arguments = Arguments {
             log: false,
+            quiet: false,
+            verbose: false,
             action: Action::Lifecycle { all: true },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
@@ -179,6 +155,8 @@ mod tests {
         let runtime: DummyRuntime = workspace().build();
         let arguments: Arguments = Arguments {
             log: true,
+            quiet: false,
+            verbose: false,
             action: Action::Lifecycle { all: false },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
@@ -194,19 +172,23 @@ mod tests {
             .build();
         let arguments: Arguments = Arguments {
             log: false,
-            action: Action::Compile {
-                quiet: true,
-                verbose: false,
-            },
+            quiet: true,
+            verbose: false,
+            action: Action::Compile,
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
     }
 
     #[test]
-    fn run_clean_action_removes_the_build_directory() {
-        let runtime: DummyRuntime = workspace().command("rm -rf", succeeded()).build();
+    fn run_clean_action_removes_everything_under_the_build_directory() {
+        let runtime: DummyRuntime = workspace()
+            .file("/workspace/.target/go-compile/binding/app", "")
+            .command("rm -rf go-compile", succeeded())
+            .build();
         let arguments: Arguments = Arguments {
             log: false,
+            quiet: true,
+            verbose: false,
             action: Action::Clean,
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_ok());
@@ -215,9 +197,14 @@ mod tests {
     #[test]
     fn run_clean_action_fails_when_the_command_fails() {
         let failed: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Failed);
-        let runtime: DummyRuntime = workspace().command("rm -rf", failed).build();
+        let runtime: DummyRuntime = workspace()
+            .file("/workspace/.target/go-compile/binding/app", "")
+            .command("rm -rf go-compile", failed)
+            .build();
         let arguments: Arguments = Arguments {
             log: false,
+            quiet: true,
+            verbose: false,
             action: Action::Clean,
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_err());
@@ -225,18 +212,41 @@ mod tests {
 
     #[test]
     fn run_clean_action_fails_when_the_command_cannot_be_run() {
-        // No "rm -rf" stub registered, so `run_command` itself returns an IO error (distinct from the
-        // command running and exiting non-zero) — proving that failure is surfaced too.
-        let runtime: DummyRuntime = workspace().build();
+        // No "rm -rf go-compile" stub registered, so `run_command` itself returns an IO error,
+        // which the task pipeline folds into a failed outcome — proving that failure is surfaced
+        // too, not silently swallowed.
+        let runtime: DummyRuntime = workspace()
+            .file("/workspace/.target/go-compile/binding/app", "")
+            .build();
         let arguments: Arguments = Arguments {
             log: false,
+            quiet: true,
+            verbose: false,
             action: Action::Clean,
         };
         let error: miette::Report = run(BuildStart::now(), arguments, runtime).unwrap_err();
         assert!(
-            matches!(error.downcast_ref::<SindriError>(), Some(SindriError::Io { .. })),
-            "expected SindriError::Io, got {error:?}"
+            matches!(
+                error.downcast_ref::<SindriError>(),
+                Some(SindriError::TaskFailed { .. })
+            ),
+            "expected SindriError::TaskFailed, got {error:?}"
         );
+    }
+
+    #[test]
+    fn run_clean_action_on_an_empty_build_directory_runs_a_harmless_no_op() {
+        // Nothing under the build directory besides `clean`'s own state, so the derived directory
+        // list is empty and the script's single `rm -rf` command carries no path arguments — a
+        // no-op removal, not zero commands.
+        let runtime: DummyRuntime = workspace().command("rm -rf", succeeded()).build();
+        let arguments: Arguments = Arguments {
+            log: false,
+            quiet: false,
+            verbose: true,
+            action: Action::Clean,
+        };
+        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
     }
 
     #[test]
@@ -244,6 +254,8 @@ mod tests {
         let runtime: DummyRuntime = DummyRuntime::builder().current_directory("/nowhere").build();
         let arguments: Arguments = Arguments {
             log: false,
+            quiet: false,
+            verbose: false,
             action: Action::Lifecycle { all: false },
         };
         assert!(run(BuildStart::now(), arguments, runtime).is_err());

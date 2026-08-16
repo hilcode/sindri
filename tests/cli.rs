@@ -341,13 +341,13 @@ fn compile_in_valid_go_module_exits_zero() {
 }
 
 #[test]
-fn clean_removes_the_build_directory() {
+fn clean_removes_everything_except_its_own_state() {
     let directory: TempDir = go_module_dir();
     let compile: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
     assert!(compile.status.success(), "expected compile to succeed first");
     assert!(
-        directory.path().join(".target").is_dir(),
-        "expected .target to exist after compile"
+        directory.path().join(".target/go-compile").is_dir(),
+        "expected .target/go-compile to exist after compile"
     );
 
     let clean: Output = sindri().arg("clean").current_dir(directory.path()).output().unwrap();
@@ -357,8 +357,12 @@ fn clean_removes_the_build_directory() {
         String::from_utf8_lossy(&clean.stderr)
     );
     assert!(
-        !directory.path().join(".target").exists(),
-        "expected .target to be removed by clean"
+        !directory.path().join(".target/go-compile").exists(),
+        "expected .target/go-compile to be removed by clean"
+    );
+    assert!(
+        directory.path().join(".target/clean").is_dir(),
+        "expected clean's own state under .target/clean to survive its own run"
     );
 
     // Cleaning an already-clean workspace is not an error.

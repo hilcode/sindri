@@ -7,6 +7,7 @@ use crate::executor::ScriptResolutionState;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
 use crate::executor::run_standalone_task;
+use crate::file_set::FileSetPattern;
 use crate::go_plugin::GoPlugin;
 use crate::metadata_cache::MetadataCache;
 use crate::module::ArtifactType;
@@ -15,9 +16,14 @@ use crate::module_graph::ModuleGraph;
 use crate::module_graph::ModuleNode;
 use crate::module_tool;
 use crate::module_tool::ModuleToolBinaries;
+use crate::parameter::ParameterDeclarations;
 use crate::runtime::Runtime;
+use crate::script::Script;
+use crate::task::DeclaredTaskInput;
+use crate::task::ManagedTaskInput;
 use crate::task::Task;
 use crate::task::TaskName;
+use crate::task::TaskOutput;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
@@ -271,6 +277,49 @@ impl Lifecycle {
             outcomes.extend(module_outcomes);
         }
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
+        Ok(())
+    }
+
+    /// Remove everything under the build directory except the `clean` task's own state (its run
+    /// record and output directory, both under `.target/clean/`), so a build always starts from a
+    /// clean slate without also destroying the bookkeeping this very run needs to persist. Goes
+    /// through the normal dirtiness/run/persist pipeline like any other task — a build directory
+    /// with nothing left to remove is a cache hit, silent except in `Verbose` mode.
+    pub fn run_clean(
+        &self,
+        workspace: &Workspace,
+        config: &ExecutionConfig,
+        runtime: &impl Runtime,
+    ) -> MietteResult<()> {
+        let workspace_root: &WorkspaceRoot = workspace.workspace_root();
+        let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
+            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
+        );
+        let cache: MetadataCache = MetadataCache::new(cache_directory);
+        let context: BuildContext = BuildContext::new(
+            workspace_root,
+            &absolute_build_directory,
+            &absolute_build_directory,
+            &cache,
+        );
+        let clean_task: Task = Task::new(
+            TaskName::new("clean"),
+            Script::clean(),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(["**/*"]).excluding_directories(["clean"])),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        run_standalone_task(
+            &clean_task,
+            &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
+            &context,
+            config,
+            &mut resolution_state,
+            runtime,
+        )?;
         Ok(())
     }
 
@@ -856,6 +905,70 @@ mod tests {
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let result: MietteResult<()> = Lifecycle::new().run_compile(&workspace, &config, &runtime);
         assert!(result.is_err(), "compile should fail when no build file can be found");
+    }
+
+    #[test]
+    fn run_clean_removes_everything_under_the_build_directory_except_its_own_state() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file("/workspace/.target/go-compile/binding/app", "")
+            .command("rm -rf go-compile", succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        assert!(Lifecycle::new().run_clean(&workspace, &config, &runtime).is_ok());
+    }
+
+    #[test]
+    fn a_second_run_clean_over_an_unchanged_build_directory_is_a_silent_cache_hit() {
+        // Nothing under the build directory besides `clean`'s own state on either run — the first run
+        // is still dirty (no run record yet) and issues a harmless no-path `rm -rf`; the second sees
+        // the identical (empty) managed input and is a cache hit.
+        fn build_directory() -> DummyRuntimeBuilder {
+            DummyRuntime::builder()
+                .file(
+                    "/workspace/sindri.workspace",
+                    r#"{ name = "test", sindri_version = "0.1.0" }"#,
+                )
+                .command("rm -rf", succeeded())
+                .current_directory("/workspace")
+        }
+
+        let seed: DummyRuntime = build_directory().build();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
+        Lifecycle::new()
+            .run_clean(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .unwrap();
+
+        let replay: DummyRuntime = replay_with_state(build_directory(), &seed).build();
+        Lifecycle::new()
+            .run_clean(&Workspace::locate(&replay).unwrap(), &config, &replay)
+            .unwrap();
+        assert!(
+            replay.captured_output().is_empty(),
+            "a cache-hit clean should print nothing; got: {:?}",
+            replay.captured_output().as_str()
+        );
+    }
+
+    #[test]
+    fn run_clean_fails_when_the_command_fails() {
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file("/workspace/.target/go-compile/binding/app", "")
+            .command("rm -rf go-compile", failed())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        assert!(Lifecycle::new().run_clean(&workspace, &config, &runtime).is_err());
     }
 
     #[test]
