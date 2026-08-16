@@ -136,8 +136,12 @@ impl Lifecycle {
         self.write(&tasks, show_all, &mut runtime.output())
     }
 
-    pub fn run_compile(
+    /// Run every task bound to `target` or an earlier step of this lifecycle. `target` may be any
+    /// step this lifecycle carries — `Lifecycle::build_task_graph` resolves it generically, so this
+    /// is not specific to `compile`.
+    pub fn run_step(
         self,
+        target: &Step,
         workspace: &Workspace,
         config: &ExecutionConfig,
         runtime: &impl Runtime,
@@ -149,7 +153,6 @@ impl Lifecycle {
                 .log(&format!("Module loaded: {}", node.module().name().as_ref()))
                 .map_err(|source| SindriError::Log { source })?;
         }
-        let compile_step: Step = Step::new("compile");
         let package_step: Step = Step::new("package");
         // Node indices targeted by any module's `module_tools` — these build one step deeper
         // (`package` instead of `compile`), and their produced binaries are registered for every
@@ -221,11 +224,11 @@ impl Lifecycle {
             let target_step: &Step = if tool_target_indices.contains(&index) {
                 &package_step
             } else {
-                &compile_step
+                target
             };
             let graph: TaskGraph = self
                 .build_task_graph(&tasks, target_step)
-                .expect("compile and package are both built-in lifecycle steps");
+                .expect("every step reachable from the CLI is a built-in lifecycle step");
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
                 .join_directory(node.identity().directory());
@@ -646,7 +649,9 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        Lifecycle::default().run_compile(&workspace, &config, &runtime).unwrap();
+        Lifecycle::default()
+            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .unwrap();
         assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
     }
 
@@ -678,7 +683,9 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        Lifecycle::default().run_compile(&workspace, &config, &runtime).unwrap();
+        Lifecycle::default()
+            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .unwrap();
         // The dependency is loaded and built before the entry.
         assert_eq!(
             runtime.logged(),
@@ -750,7 +757,12 @@ mod tests {
         let seed: DummyRuntime = multi_module_workspace().build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&seed).unwrap(),
+                &config,
+                &seed,
+            )
             .unwrap();
         // Replay with every module's state seeded — so an unchanged module is a cache hit — but the
         // dependency's source edited, so `lib` rebuilds and, through the edge, must force `app`.
@@ -758,7 +770,12 @@ mod tests {
             .file("/workspace/lib/lib.go", "package lib\n\nvar Changed = true\n")
             .build();
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&rebuild).unwrap(), &config, &rebuild)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&rebuild).unwrap(),
+                &config,
+                &rebuild,
+            )
             .unwrap();
         assert!(
             rebuild
@@ -784,7 +801,12 @@ mod tests {
             .build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&seed).unwrap(),
+                &config,
+                &seed,
+            )
             .unwrap();
         // Replay with the module's run record seeded and nothing changed: no task re-runs, so none
         // re-persists a record, and a build that ran no tasks prints nothing.
@@ -796,7 +818,12 @@ mod tests {
         )
         .build();
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&replay).unwrap(), &config, &replay)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&replay).unwrap(),
+                &config,
+                &replay,
+            )
             .unwrap();
         assert!(
             replay.captured_output().is_empty(),
@@ -821,7 +848,12 @@ mod tests {
             .build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&seed).unwrap(), &config, &seed)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&seed).unwrap(),
+                &config,
+                &seed,
+            )
             .unwrap();
         assert_eq!(
             generate_go_work_run_records(&seed),
@@ -840,7 +872,12 @@ mod tests {
         )
         .build();
         Lifecycle::default()
-            .run_compile(&Workspace::locate(&replay).unwrap(), &config, &replay)
+            .run_step(
+                &Step::new("compile"),
+                &Workspace::locate(&replay).unwrap(),
+                &config,
+                &replay,
+            )
             .unwrap();
         assert_eq!(
             generate_go_work_run_records(&replay),
@@ -862,7 +899,9 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        Lifecycle::default().run_compile(&workspace, &config, &runtime).unwrap();
+        Lifecycle::default()
+            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .unwrap();
         assert!(runtime.created_directory("/workspace/.target"));
         assert!(
             runtime.written_file("/workspace/.target/telemetry.json").is_some(),
@@ -878,7 +917,8 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        let result: MietteResult<()> = Lifecycle::default().run_compile(&workspace, &config, &runtime);
+        let result: MietteResult<()> =
+            Lifecycle::default().run_step(&Step::new("compile"), &workspace, &config, &runtime);
         assert!(result.is_err(), "a failing build command should fail the compile");
     }
 
@@ -942,7 +982,9 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        Lifecycle::default().run_compile(&workspace, &config, &runtime).unwrap();
+        Lifecycle::default()
+            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .unwrap();
         // The tool module is loaded (and thus built) before the module that references it.
         assert_eq!(
             runtime.logged(),
@@ -997,7 +1039,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let error: miette::Report = Lifecycle::default()
-            .run_compile(&workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
             .unwrap_err();
         assert!(
             matches!(
@@ -1019,7 +1061,8 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        let result: MietteResult<()> = Lifecycle::default().run_compile(&workspace, &config, &runtime);
+        let result: MietteResult<()> =
+            Lifecycle::default().run_step(&Step::new("compile"), &workspace, &config, &runtime);
         assert!(result.is_err(), "compile should fail when no build file can be found");
     }
 

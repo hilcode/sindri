@@ -6,6 +6,7 @@ use crate::runtime::Bootstrap;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
 use crate::types::RelativeFile;
+use crate::types::Step;
 use crate::workspace::Workspace;
 use clap::Parser;
 use clap::Subcommand;
@@ -94,7 +95,7 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
         Action::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
         Action::Compile => {
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
-            lifecycle.run_compile(&workspace, &config, &runtime)?
+            lifecycle.run_step(&Step::new("compile"), &workspace, &config, &runtime)?
         }
         Action::Clean => {
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
