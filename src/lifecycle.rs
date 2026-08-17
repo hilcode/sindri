@@ -109,25 +109,56 @@ impl Display for LifecycleName {
     }
 }
 
+/// Whether a lifecycle's steps operate on an entry module and its dependency graph, or run
+/// meaningfully at the workspace level with no entry-point concept at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryModule {
+    /// [`Lifecycle::run_step`] errors when no entry module can be found — this lifecycle's steps
+    /// have nothing to act on without one (`default`).
+    Required,
+    /// [`Lifecycle::run_step`] tolerates a missing entry module — its `workspace_tasks` alone may
+    /// already be everything this lifecycle needs to do (`clean`, which is workspace-wide).
+    Optional,
+}
+
 #[derive(Debug)]
 pub struct Lifecycle {
     name: LifecycleName,
     steps: Vec<Step>,
+    entry_module: EntryModule,
 }
 
 impl Lifecycle {
     /// Wraps `steps` with the `start`/`end` sentinels every lifecycle carries — framework-owned
     /// anchor points a lifecycle's own step list never needs to spell out.
-    pub fn new(name: LifecycleName, steps: Vec<Step>) -> Self {
+    pub fn new(name: LifecycleName, steps: Vec<Step>, entry_module: EntryModule) -> Self {
         let mut wrapped: Vec<Step> = Vec::with_capacity(steps.len() + 2);
         wrapped.push(Step::new("start"));
         wrapped.extend(steps);
         wrapped.push(Step::new("end"));
-        Self { name, steps: wrapped }
+        Self {
+            name,
+            steps: wrapped,
+            entry_module,
+        }
     }
 
     pub fn name(&self) -> &LifecycleName {
         &self.name
+    }
+
+    /// The `clean` lifecycle: a single `clean` step, wrapping the standalone cleanup task
+    /// [`clean_tasks`] binds to it. Does not require an entry module — it's workspace-wide — but
+    /// still walks the entry module's dependency graph when one is found, exactly like `default`, so
+    /// a future per-module clean task picks up automatically with no change here. Temporary, like
+    /// [`Lifecycle::default`]: both are replaced by `Lifecycles::load` once `.sindri/lifecycles/` is
+    /// wired into the CLI.
+    pub fn clean() -> Self {
+        Lifecycle::new(
+            LifecycleName::new("clean"),
+            vec![Step::new("clean")],
+            EntryModule::Optional,
+        )
     }
 
     pub fn run_lifecycle(&self, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
@@ -137,17 +168,66 @@ impl Lifecycle {
         self.write(&tasks, show_all, &mut runtime.output())
     }
 
-    /// Run every task bound to `target` or an earlier step of this lifecycle. `target` may be any
-    /// step this lifecycle carries — `Lifecycle::build_task_graph` resolves it generically, so this
-    /// is not specific to `compile`.
+    /// Run every task bound to `target` or an earlier step of this lifecycle, for every module
+    /// reachable from `workspace`'s entry point, plus any `workspace_tasks` bound within scope —
+    /// tasks that apply once per build rather than once per module, such as `clean`'s own cleanup
+    /// task. If no entry module can be found, that's tolerated exactly when `workspace_tasks` already
+    /// covers everything this lifecycle needs to do ([`EntryModule::Optional`]); otherwise it's an
+    /// error, since there is nothing to act on ([`EntryModule::Required`]).
+    ///
+    /// `target` may be any step this lifecycle carries — [`Lifecycle::build_task_graph`] resolves it
+    /// generically, so none of this is specific to `compile` or to any one lifecycle. In particular,
+    /// per-module tasks are resolved the same way regardless of which lifecycle `self` is: a plugin
+    /// that binds nothing to `target` simply contributes zero tasks for it, module by module.
     pub fn run_step(
         self,
         target: &Step,
+        workspace_tasks: &[(Task, Step)],
         workspace: &Workspace,
         config: &ExecutionConfig,
         runtime: &impl Runtime,
     ) -> MietteResult<()> {
-        let build_file: BuildFile = BuildFile::find(workspace, runtime)?;
+        let workspace_root: &WorkspaceRoot = workspace.workspace_root();
+        let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
+        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
+            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
+        );
+        let cache: MetadataCache = MetadataCache::new(cache_directory);
+        // One resolution state for the whole run: every task's script — `workspace_tasks`,
+        // `generate-go-work`, and every module's own tasks below — resolves its definition hash and,
+        // once run, its commands against these same two long-lived hubs, so a file shared by more
+        // than one task's script is read from disk at most once per pass for the entire build.
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        let mut outcomes: Vec<TaskOutcome> = Vec::new();
+        let workspace_context: BuildContext = BuildContext::new(
+            workspace_root,
+            &absolute_build_directory,
+            &absolute_build_directory,
+            &cache,
+        );
+        let workspace_graph: TaskGraph = self
+            .build_task_graph(workspace_tasks, target)
+            .expect("every step reachable from the CLI is a built-in lifecycle step");
+        for node in workspace_graph.nodes() {
+            let (outcome, _output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
+                node.task(),
+                &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
+                &workspace_context,
+                config,
+                &mut resolution_state,
+                runtime,
+            )?;
+            outcomes.push(outcome);
+        }
+        let build_file: BuildFile = match BuildFile::find(workspace, runtime) {
+            Ok(build_file) => build_file,
+            // No entry module reachable from the current directory. `workspace_tasks` above already
+            // did everything this lifecycle needs when it doesn't require one (`clean`, run from
+            // anywhere, or from a workspace root with no module of its own); otherwise this is the
+            // same "wrong directory" signal `compile` surfaces when it can't find one.
+            Err(SindriError::ModuleNotFound { .. }) if self.entry_module == EntryModule::Optional => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
         let module_graph: ModuleGraph = ModuleGraph::load(&build_file, workspace, runtime)?;
         for node in module_graph.nodes() {
             runtime
@@ -164,9 +244,6 @@ impl Lifecycle {
             .flat_map(|node: &ModuleNode| node.module().module_tools())
             .filter_map(|reference: &ModuleToolReference| module_graph.index_of(reference.module()))
             .collect();
-        let workspace_root: &WorkspaceRoot = workspace.workspace_root();
-        let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
-        let mut outcomes: Vec<TaskOutcome> = Vec::new();
         // Regenerate go.work — Go's local-dependency view, projected from the declared module
         // dependencies so it can never drift from them — before any module's tasks run, since
         // go-compile/go-test need it as a managed input. Run once, workspace-wide, through the same
@@ -175,25 +252,10 @@ impl Lifecycle {
         // its own, so the context supplied here is a placeholder — its real value (this task's own
         // output directory) is not known until it has run.
         let generate_go_work: Task = GoPlugin::generate_go_work_task(&module_graph, workspace_root);
-        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
-            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
-        );
-        let cache: MetadataCache = MetadataCache::new(cache_directory);
-        let bootstrap_context: BuildContext = BuildContext::new(
-            workspace_root,
-            &absolute_build_directory,
-            &absolute_build_directory,
-            &cache,
-        );
-        // One resolution state for the whole compile: every task's script — the standalone
-        // `generate-go-work` and every module's own tasks below — resolves its definition hash and,
-        // once run, its commands against these same two long-lived hubs, so a file shared by more
-        // than one task's script is read from disk at most once per pass for the entire build.
-        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let (go_work_outcome, go_work_output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
             &generate_go_work,
             &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
-            &bootstrap_context,
+            &workspace_context,
             config,
             &mut resolution_state,
             runtime,
@@ -219,17 +281,20 @@ impl Lifecycle {
             for reference in node.module().module_tools() {
                 tasks.push((module_tool::invocation_task(reference), Step::new("generate")));
             }
-            // A tool-target module builds one step deeper — through `package` — so a task consuming
-            // its binary always sees a fully built, tested tool, even though nothing is bound to
-            // `package` itself for Go: the binary is already a tracked `compile` output.
-            let target_step: &Step = if tool_target_indices.contains(&index) {
-                &package_step
+            // A tool-target module always builds through `default`'s own `package` step, regardless of
+            // which lifecycle this invocation is running — a task consuming its binary needs a fully
+            // built, tested tool whether the top-level invocation is `compile`, `clean`, or anything
+            // else, independent of whether `self` even carries a `package` step at all. Nothing is
+            // bound to `package` itself for Go today — the binary is already a tracked `compile`
+            // output — that's a Go-plugin gap, addressed separately when plugins are worked on.
+            let graph: TaskGraph = if tool_target_indices.contains(&index) {
+                Lifecycle::default()
+                    .build_task_graph(&tasks, &package_step)
+                    .expect("package is a built-in step of the default lifecycle")
             } else {
-                target
+                self.build_task_graph(&tasks, target)
+                    .expect("every step reachable from the CLI is a built-in lifecycle step")
             };
-            let graph: TaskGraph = self
-                .build_task_graph(&tasks, target_step)
-                .expect("every step reachable from the CLI is a built-in lifecycle step");
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
                 .join_directory(node.identity().directory());
@@ -298,49 +363,6 @@ impl Lifecycle {
             outcomes.extend(module_outcomes);
         }
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
-        Ok(())
-    }
-
-    /// Remove everything under the build directory except the `clean` task's own state (its run
-    /// record and output directory, both under `.target/clean/`), so a build always starts from a
-    /// clean slate without also destroying the bookkeeping this very run needs to persist. Goes
-    /// through the normal dirtiness/run/persist pipeline like any other task — a build directory
-    /// with nothing left to remove is a cache hit, silent except in `Verbose` mode.
-    pub fn run_clean(
-        &self,
-        workspace: &Workspace,
-        config: &ExecutionConfig,
-        runtime: &impl Runtime,
-    ) -> MietteResult<()> {
-        let workspace_root: &WorkspaceRoot = workspace.workspace_root();
-        let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
-        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
-            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
-        );
-        let cache: MetadataCache = MetadataCache::new(cache_directory);
-        let context: BuildContext = BuildContext::new(
-            workspace_root,
-            &absolute_build_directory,
-            &absolute_build_directory,
-            &cache,
-        );
-        let clean_task: Task = Task::new(
-            TaskName::new("clean"),
-            Script::clean(),
-            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
-            ManagedTaskInput::new(FileSetPattern::new(["**/*"]).excluding_directories(["clean"])),
-            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
-            ParameterDeclarations::default(),
-        );
-        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
-        run_standalone_task(
-            &clean_task,
-            &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
-            &context,
-            config,
-            &mut resolution_state,
-            runtime,
-        )?;
         Ok(())
     }
 
@@ -421,8 +443,29 @@ impl Default for Lifecycle {
                 Step::new("package"),
                 Step::new("publish"),
             ],
+            EntryModule::Required,
         )
     }
+}
+
+/// The task bound to the `clean` lifecycle's `clean` step: remove everything under the build
+/// directory except the `clean` task's own state (its run record and output directory, both under
+/// `.target/clean/`), so a build always starts from a clean slate without also destroying the
+/// bookkeeping this very run needs to persist. Goes through the normal dirtiness/run/persist pipeline
+/// like any other task — a build directory with nothing left to remove is a cache hit, silent except
+/// in `Verbose` mode.
+pub(crate) fn clean_tasks() -> Vec<(Task, Step)> {
+    vec![(
+        Task::new(
+            TaskName::new("clean"),
+            Script::clean(),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(["**/*"]).excluding_directories(["clean"])),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        ),
+        Step::new("clean"),
+    )]
 }
 
 #[cfg(test)]
@@ -527,7 +570,11 @@ mod tests {
 
     #[test]
     fn lifecycle_new_wraps_the_given_steps_with_start_and_end_sentinels() {
-        let lifecycle: Lifecycle = Lifecycle::new(LifecycleName::new("clean"), vec![Step::new("clean")]);
+        let lifecycle: Lifecycle = Lifecycle::new(
+            LifecycleName::new("clean"),
+            vec![Step::new("clean")],
+            EntryModule::Optional,
+        );
         let names: Vec<&str> = lifecycle.steps().iter().map(|step| step.as_ref()).collect();
         assert_eq!(names, vec!["start", "clean", "end"]);
         assert_eq!(lifecycle.name().to_string(), "clean");
@@ -560,6 +607,7 @@ mod tests {
         let lifecycle: Lifecycle = Lifecycle::new(
             LifecycleName::new("test"),
             vec![Step::new("compile"), Step::new("test")],
+            EntryModule::Required,
         );
         let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("test")).unwrap();
         let names: Vec<String> = graph
@@ -579,6 +627,7 @@ mod tests {
         let lifecycle: Lifecycle = Lifecycle::new(
             LifecycleName::new("test"),
             vec![Step::new("compile"), Step::new("test")],
+            EntryModule::Required,
         );
         let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("compile")).unwrap();
         let names: Vec<String> = graph
@@ -598,6 +647,7 @@ mod tests {
         let lifecycle: Lifecycle = Lifecycle::new(
             LifecycleName::new("test"),
             vec![Step::new("compile"), Step::new("test")],
+            EntryModule::Required,
         );
         let graph: TaskGraph = lifecycle.build_task_graph(&tasks, &Step::new("compile")).unwrap();
         let names: Vec<String> = graph
@@ -651,7 +701,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
             .unwrap();
         assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
     }
@@ -685,7 +735,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
             .unwrap();
         // The dependency is loaded and built before the entry.
         assert_eq!(
@@ -760,6 +810,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&seed).unwrap(),
                 &config,
                 &seed,
@@ -773,6 +824,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&rebuild).unwrap(),
                 &config,
                 &rebuild,
@@ -804,6 +856,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&seed).unwrap(),
                 &config,
                 &seed,
@@ -821,6 +874,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&replay).unwrap(),
                 &config,
                 &replay,
@@ -851,6 +905,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&seed).unwrap(),
                 &config,
                 &seed,
@@ -875,6 +930,7 @@ mod tests {
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
+                &[],
                 &Workspace::locate(&replay).unwrap(),
                 &config,
                 &replay,
@@ -901,7 +957,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
             .unwrap();
         assert!(runtime.created_directory("/workspace/.target"));
         assert!(
@@ -919,7 +975,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let result: MietteResult<()> =
-            Lifecycle::default().run_step(&Step::new("compile"), &workspace, &config, &runtime);
+            Lifecycle::default().run_step(&Step::new("compile"), &[], &workspace, &config, &runtime);
         assert!(result.is_err(), "a failing build command should fail the compile");
     }
 
@@ -984,7 +1040,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
             .unwrap();
         // The tool module is loaded (and thus built) before the module that references it.
         assert_eq!(
@@ -1007,6 +1063,60 @@ mod tests {
                 .iter()
                 .any(|(path, _)| path.to_string_lossy().contains("module-tool-codegen")),
             "the synthesized module-tool task should have run and persisted a run record"
+        );
+    }
+
+    #[test]
+    fn run_step_for_clean_fully_builds_a_tool_target_module() {
+        // Tool-target completeness is resolved against the default lifecycle's own package step,
+        // never against self: self may be running a lifecycle — clean's step list is just
+        // [start, clean, end] — that doesn't carry a package step at all, while a task consuming a
+        // tool's binary always needs it fully built regardless of what the top-level invocation is
+        // doing. So `codegen`, the tool target, runs its whole default build (format, compile, test)
+        // even though this invocation only asked for `clean`; `app`, which merely references it, does
+        // not, since none of its own tasks are bound to a step clean's own lifecycle carries.
+        let tool_output_directory: AbsoluteDirectory = go_compile_output_directory("tools/codegen/");
+        let binary_file: AbsoluteFile = tool_output_directory.join_file(&RelativeFile::new("codegen").unwrap());
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//tools/codegen:codegen" ],
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .file(
+                "/workspace/tools/codegen/sindri.build",
+                r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .file(binary_file.to_string(), "")
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
+            .command("rm -rf", succeeded())
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .command("go test", succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::clean()
+            .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+            .unwrap();
+        assert_eq!(
+            runtime.logged(),
+            vec!["Module loaded: codegen".to_string(), "Module loaded: app".to_string()]
+        );
+        assert!(
+            runtime
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-compile")),
+            "the tool-target module should have been fully built even though only clean was requested"
         );
     }
 
@@ -1040,7 +1150,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let error: miette::Report = Lifecycle::default()
-            .run_step(&Step::new("compile"), &workspace, &config, &runtime)
+            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
             .unwrap_err();
         assert!(
             matches!(
@@ -1063,7 +1173,7 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let result: MietteResult<()> =
-            Lifecycle::default().run_step(&Step::new("compile"), &workspace, &config, &runtime);
+            Lifecycle::default().run_step(&Step::new("compile"), &[], &workspace, &config, &runtime);
         assert!(result.is_err(), "compile should fail when no build file can be found");
     }
 
@@ -1080,7 +1190,26 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        assert!(Lifecycle::default().run_clean(&workspace, &config, &runtime).is_ok());
+        assert!(
+            Lifecycle::clean()
+                .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn run_step_for_clean_walks_the_module_graph_when_an_entry_module_exists() {
+        // clean is workspace-wide and tolerates a missing entry module, but when one is found it
+        // walks the same module graph compile does — proven here by the "Module loaded" log line and
+        // generate-go-work actually running, even though GoPlugin binds no per-module task to `clean`
+        // today (build_task_graph naturally resolves each module's task list to empty for this step).
+        let runtime: DummyRuntime = go_workspace().command("rm -rf", succeeded()).build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::clean()
+            .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+            .unwrap();
+        assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
     }
 
     #[test]
@@ -1100,13 +1229,25 @@ mod tests {
 
         let seed: DummyRuntime = build_directory().build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
-        Lifecycle::default()
-            .run_clean(&Workspace::locate(&seed).unwrap(), &config, &seed)
+        Lifecycle::clean()
+            .run_step(
+                &Step::new("clean"),
+                &clean_tasks(),
+                &Workspace::locate(&seed).unwrap(),
+                &config,
+                &seed,
+            )
             .unwrap();
 
         let replay: DummyRuntime = replay_with_state(build_directory(), &seed).build();
-        Lifecycle::default()
-            .run_clean(&Workspace::locate(&replay).unwrap(), &config, &replay)
+        Lifecycle::clean()
+            .run_step(
+                &Step::new("clean"),
+                &clean_tasks(),
+                &Workspace::locate(&replay).unwrap(),
+                &config,
+                &replay,
+            )
             .unwrap();
         assert!(
             replay.captured_output().is_empty(),
@@ -1128,7 +1269,11 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        assert!(Lifecycle::default().run_clean(&workspace, &config, &runtime).is_err());
+        assert!(
+            Lifecycle::clean()
+                .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+                .is_err()
+        );
     }
 
     #[test]

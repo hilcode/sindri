@@ -2,6 +2,7 @@ use crate::error::SindriError;
 use crate::executor::ExecutionConfig;
 use crate::executor::Verbosity;
 use crate::lifecycle::Lifecycle;
+use crate::lifecycle::clean_tasks;
 use crate::runtime::Bootstrap;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
@@ -95,11 +96,12 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
         Action::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
         Action::Compile => {
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
-            lifecycle.run_step(&Step::new("compile"), &workspace, &config, &runtime)?
+            lifecycle.run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)?
         }
         Action::Clean => {
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
-            lifecycle.run_clean(&workspace, &config, &runtime)?
+            let clean_step: Step = Step::new("clean");
+            Lifecycle::clean().run_step(&clean_step, &clean_tasks(), &workspace, &config, &runtime)?
         }
     }
     Ok(())

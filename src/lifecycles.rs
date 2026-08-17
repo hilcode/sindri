@@ -1,5 +1,6 @@
 use crate::error::SindriError;
 use crate::error::SindriResult;
+use crate::lifecycle::EntryModule;
 use crate::lifecycle::Lifecycle;
 use crate::lifecycle::LifecycleName;
 use crate::runtime::FileSystem;
@@ -19,6 +20,7 @@ struct KnownLifecycle {
     file_name: &'static str,
     lifecycle_name: &'static str,
     content: &'static str,
+    entry_module: EntryModule,
 }
 
 /// The lifecycles this version of Sindri manages, by fixed name — a third lifecycle, or user
@@ -28,11 +30,13 @@ const KNOWN_LIFECYCLES: [KnownLifecycle; 2] = [
         file_name: "default.json",
         lifecycle_name: "default",
         content: include_str!("lifecycles/default.json"),
+        entry_module: EntryModule::Required,
     },
     KnownLifecycle {
         file_name: "clean.json",
         lifecycle_name: "clean",
         content: include_str!("lifecycles/clean.json"),
+        entry_module: EntryModule::Optional,
     },
 ];
 
@@ -108,7 +112,11 @@ impl Lifecycles {
                 path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
                 message: source.to_string(),
             })?;
-            lifecycles.push(Lifecycle::new(LifecycleName::new(known.lifecycle_name), steps));
+            lifecycles.push(Lifecycle::new(
+                LifecycleName::new(known.lifecycle_name),
+                steps,
+                known.entry_module,
+            ));
         }
         if checksums_changed {
             checksums.save(&lifecycles_directory, workspace_root, file_system)?;
@@ -127,7 +135,7 @@ impl Lifecycles {
             .map(|known: &KnownLifecycle| -> Lifecycle {
                 let steps: Vec<Step> =
                     serde_json::from_str(known.content).expect("embedded lifecycle content is always valid JSON");
-                Lifecycle::new(LifecycleName::new(known.lifecycle_name), steps)
+                Lifecycle::new(LifecycleName::new(known.lifecycle_name), steps, known.entry_module)
             })
             .collect();
         Lifecycles { lifecycles }
@@ -505,8 +513,16 @@ mod tests {
     #[test]
     fn validate_no_step_collisions_rejects_two_lifecycles_sharing_a_step() {
         let lifecycles: Vec<Lifecycle> = vec![
-            Lifecycle::new(LifecycleName::new("a"), vec![Step::new("compile")]),
-            Lifecycle::new(LifecycleName::new("b"), vec![Step::new("compile")]),
+            Lifecycle::new(
+                LifecycleName::new("a"),
+                vec![Step::new("compile")],
+                EntryModule::Required,
+            ),
+            Lifecycle::new(
+                LifecycleName::new("b"),
+                vec![Step::new("compile")],
+                EntryModule::Required,
+            ),
         ];
         let error: SindriError = validate_no_step_collisions(&lifecycles).unwrap_err();
         assert!(
@@ -518,8 +534,12 @@ mod tests {
     #[test]
     fn validate_no_step_collisions_accepts_disjoint_lifecycles() {
         let lifecycles: Vec<Lifecycle> = vec![
-            Lifecycle::new(LifecycleName::new("a"), vec![Step::new("compile")]),
-            Lifecycle::new(LifecycleName::new("b"), vec![Step::new("clean")]),
+            Lifecycle::new(
+                LifecycleName::new("a"),
+                vec![Step::new("compile")],
+                EntryModule::Required,
+            ),
+            Lifecycle::new(LifecycleName::new("b"), vec![Step::new("clean")], EntryModule::Optional),
         ];
         assert!(validate_no_step_collisions(&lifecycles).is_ok());
     }
