@@ -147,6 +147,17 @@ impl Lifecycle {
         &self.name
     }
 
+    /// Tasks that run once per build, independent of any module — this lifecycle's own
+    /// `workspace_tasks` argument to [`Lifecycle::run_step`]. Only `clean` has one today
+    /// ([`clean_tasks`]); every other lifecycle contributes none.
+    pub fn workspace_tasks(&self) -> Vec<(Task, Step)> {
+        if self.name == LifecycleName::new("clean") {
+            clean_tasks()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The `clean` lifecycle: a single `clean` step, wrapping the standalone cleanup task
     /// [`clean_tasks`] binds to it. Does not require an entry module — it's workspace-wide — but
     /// still walks the entry module's dependency graph when one is found, exactly like `default`, so

@@ -1,18 +1,24 @@
 use crate::error::SindriError;
+use crate::error::SindriResult;
 use crate::executor::ExecutionConfig;
 use crate::executor::Verbosity;
 use crate::lifecycle::Lifecycle;
-use crate::lifecycle::clean_tasks;
+use crate::lifecycles::Lifecycles;
 use crate::runtime::Bootstrap;
+use crate::task::Task;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
 use crate::types::RelativeFile;
 use crate::types::Step;
 use crate::workspace::Workspace;
+use clap::ArgMatches;
+use clap::Command;
+use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
 use miette::IntoDiagnostic;
 use miette::Result as MietteResult;
+use std::path::PathBuf;
 
 const LONG_ABOUT: &str = "\
 Sindri is a build tool that combines the best properties of existing
@@ -58,17 +64,70 @@ enum Action {
         #[arg(short, long, help = "Show all steps, including those with no tasks.")]
         all: bool,
     },
-    /// Run all tasks up to and including the compile step.
-    #[command(verbatim_doc_comment)]
-    Compile,
-    /// Remove the build directory.
-    #[command(verbatim_doc_comment)]
-    Clean,
 }
 
-pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap) -> MietteResult<()> {
-    let workspace: Workspace = Workspace::locate(&file_system)?;
-    let log_path: Option<AbsoluteFile> = if arguments.log {
+/// The full CLI command: [`Arguments`]'s declarative shape (global flags, the `lifecycle`
+/// subcommand) plus one subcommand per runnable step across every lifecycle `lifecycles` carries —
+/// sourced from loaded/embedded data rather than a hardcoded enum, since the step set is only known
+/// once lifecycles are loaded.
+fn build_command(lifecycles: &Lifecycles) -> Command {
+    let mut command: Command = Arguments::command();
+    for (_, step) in lifecycles.runnable_steps() {
+        command = command.subcommand(
+            Command::new(step.to_string()).about(format!("Run all tasks up to and including the `{step}` step.")),
+        );
+    }
+    command
+}
+
+/// Resolves `workspace`, erroring with the same signal [`Workspace::locate`] gives when none is
+/// found. Reconstructed from the current directory rather than by locating a second time — a
+/// missing workspace was already established once, before this invocation's command was even
+/// parsed.
+fn require_workspace(workspace: Option<Workspace>, file_system: &impl Bootstrap) -> SindriResult<Workspace> {
+    match workspace {
+        Some(workspace) => Ok(workspace),
+        None => {
+            let start: PathBuf = file_system.current_directory().map_err(|source| SindriError::Io {
+                path: PathBuf::new(),
+                source,
+            })?;
+            Err(SindriError::WorkspaceNotFound { start })
+        }
+    }
+}
+
+/// Runs the CLI: parses process arguments against the command built from `lifecycles`, then
+/// dispatches to the matched subcommand. `workspace` and `lifecycles` are already resolved by the
+/// caller — locating a workspace and loading `.sindri/lifecycles/` both happen once, before this is
+/// called, since the command itself needs `lifecycles` to know which step subcommands to offer.
+pub fn run(
+    start: BuildStart,
+    workspace: Option<Workspace>,
+    lifecycles: Lifecycles,
+    file_system: impl Bootstrap,
+) -> MietteResult<()> {
+    let matches: ArgMatches = build_command(&lifecycles).get_matches();
+    dispatch(start, matches, workspace, lifecycles, file_system)
+}
+
+fn dispatch(
+    start: BuildStart,
+    matches: ArgMatches,
+    workspace: Option<Workspace>,
+    lifecycles: Lifecycles,
+    file_system: impl Bootstrap,
+) -> MietteResult<()> {
+    let verbosity: Verbosity = if matches.get_flag("quiet") {
+        Verbosity::Quiet
+    } else if matches.get_flag("verbose") {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Normal
+    };
+    let log: bool = matches.get_flag("log");
+    let workspace: Workspace = require_workspace(workspace, &file_system)?;
+    let log_path: Option<AbsoluteFile> = if log {
         Some(
             workspace
                 .absolute_build_directory()
@@ -84,24 +143,22 @@ pub fn run(start: BuildStart, arguments: Arguments, file_system: impl Bootstrap)
             source,
         })?;
     workspace.log_loaded(&runtime)?;
-    let lifecycle: Lifecycle = Lifecycle::default();
-    let verbosity: Verbosity = if arguments.quiet {
-        Verbosity::Quiet
-    } else if arguments.verbose {
-        Verbosity::Verbose
-    } else {
-        Verbosity::Normal
-    };
-    match arguments.action {
-        Action::Lifecycle { all } => lifecycle.run_lifecycle(all, &runtime).into_diagnostic()?,
-        Action::Compile => {
-            let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
-            lifecycle.run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)?
+    let (name, sub_matches): (&str, &ArgMatches) = matches.subcommand().expect("clap requires a subcommand");
+    match name {
+        "lifecycle" => {
+            let all: bool = sub_matches.get_flag("all");
+            lifecycles
+                .default_lifecycle()
+                .run_lifecycle(all, &runtime)
+                .into_diagnostic()?;
         }
-        Action::Clean => {
+        step_name => {
+            let (lifecycle, step): (Lifecycle, Step) = lifecycles
+                .into_step(step_name)
+                .expect("clap only offers step names sourced from these lifecycles");
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
-            let clean_step: Step = Step::new("clean");
-            Lifecycle::clean().run_step(&clean_step, &clean_tasks(), &workspace, &config, &runtime)?
+            let workspace_tasks: Vec<(Task, Step)> = lifecycle.workspace_tasks();
+            lifecycle.run_step(&step, &workspace_tasks, &workspace, &config, &runtime)?;
         }
     }
     Ok(())
@@ -116,6 +173,7 @@ mod tests {
     use crate::types::Stderr;
     use crate::types::Stdout;
     use crate::types::TaskStatus;
+    use std::io::ErrorKind;
 
     fn succeeded() -> CommandOutput {
         CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded)
@@ -141,28 +199,28 @@ mod tests {
         )
     }
 
+    /// Runs the CLI exactly as `main` does: locate the (already-built) workspace's lifecycles, build
+    /// the augmented command, parse `args` against it, and dispatch.
+    fn run_args(args: &[&str], runtime: DummyRuntime) -> MietteResult<()> {
+        let workspace: Option<Workspace> = Workspace::locate(&runtime).ok();
+        let lifecycles: Lifecycles = match &workspace {
+            Some(workspace) => Lifecycles::load(workspace.workspace_root(), &runtime).unwrap(),
+            None => Lifecycles::embedded_defaults(),
+        };
+        let matches: ArgMatches = build_command(&lifecycles).try_get_matches_from(args).unwrap();
+        dispatch(BuildStart::now(), matches, workspace, lifecycles, runtime)
+    }
+
     #[test]
     fn run_lifecycle_action_succeeds_on_a_valid_workspace() {
         let runtime: DummyRuntime = workspace().build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: false,
-            verbose: false,
-            action: Action::Lifecycle { all: true },
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+        assert!(run_args(&["sindri", "lifecycle", "--all"], runtime).is_ok());
     }
 
     #[test]
     fn run_with_the_log_flag_succeeds() {
         let runtime: DummyRuntime = workspace().build();
-        let arguments: Arguments = Arguments {
-            log: true,
-            quiet: false,
-            verbose: false,
-            action: Action::Lifecycle { all: false },
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+        assert!(run_args(&["sindri", "--log", "lifecycle"], runtime).is_ok());
     }
 
     #[test]
@@ -173,13 +231,7 @@ mod tests {
             .command("gofmt -l .", succeeded())
             .command("go build", succeeded())
             .build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: true,
-            verbose: false,
-            action: Action::Compile,
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+        assert!(run_args(&["sindri", "--quiet", "compile"], runtime).is_ok());
     }
 
     #[test]
@@ -188,13 +240,7 @@ mod tests {
             .file("/workspace/.target/go-compile/binding/app", "")
             .command("rm -rf go-compile", succeeded())
             .build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: true,
-            verbose: false,
-            action: Action::Clean,
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+        assert!(run_args(&["sindri", "--quiet", "clean"], runtime).is_ok());
     }
 
     #[test]
@@ -204,13 +250,7 @@ mod tests {
             .file("/workspace/.target/go-compile/binding/app", "")
             .command("rm -rf go-compile", failed)
             .build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: true,
-            verbose: false,
-            action: Action::Clean,
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_err());
+        assert!(run_args(&["sindri", "--quiet", "clean"], runtime).is_err());
     }
 
     #[test]
@@ -221,13 +261,7 @@ mod tests {
         let runtime: DummyRuntime = workspace()
             .file("/workspace/.target/go-compile/binding/app", "")
             .build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: true,
-            verbose: false,
-            action: Action::Clean,
-        };
-        let error: miette::Report = run(BuildStart::now(), arguments, runtime).unwrap_err();
+        let error: miette::Report = run_args(&["sindri", "--quiet", "clean"], runtime).unwrap_err();
         assert!(
             matches!(
                 error.downcast_ref::<SindriError>(),
@@ -243,24 +277,53 @@ mod tests {
         // list is empty and the script's single `rm -rf` command carries no path arguments — a
         // no-op removal, not zero commands.
         let runtime: DummyRuntime = workspace().command("rm -rf", succeeded()).build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: false,
-            verbose: true,
-            action: Action::Clean,
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_ok());
+        assert!(run_args(&["sindri", "--verbose", "clean"], runtime).is_ok());
     }
 
     #[test]
     fn run_without_a_workspace_returns_an_error() {
         let runtime: DummyRuntime = DummyRuntime::builder().current_directory("/nowhere").build();
-        let arguments: Arguments = Arguments {
-            log: false,
-            quiet: false,
-            verbose: false,
-            action: Action::Lifecycle { all: false },
-        };
-        assert!(run(BuildStart::now(), arguments, runtime).is_err());
+        assert!(run_args(&["sindri", "lifecycle"], runtime).is_err());
+    }
+
+    #[test]
+    fn run_without_a_workspace_reports_an_io_error_when_the_current_directory_cannot_be_read_either() {
+        // No workspace to begin with, and the current directory itself can't even be read — the
+        // fallback `require_workspace` takes to name what's missing hits its own IO error, rather
+        // than the `WorkspaceNotFound` it would otherwise construct.
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .current_directory_error(ErrorKind::PermissionDenied)
+            .build();
+        let error: miette::Report = run_args(&["sindri", "lifecycle"], runtime).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<SindriError>(), Some(SindriError::Io { .. })),
+            "expected SindriError::Io, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn help_outside_a_workspace_lists_the_embedded_default_and_clean_steps() {
+        let lifecycles: Lifecycles = Lifecycles::embedded_defaults();
+        let error: clap::Error = build_command(&lifecycles)
+            .try_get_matches_from(["sindri", "--help"])
+            .unwrap_err();
+        let help: String = error.to_string();
+        for step in ["generate", "compile", "package", "publish", "clean", "lifecycle"] {
+            assert!(help.contains(step), "expected `--help` to list `{step}`, got:\n{help}");
+        }
+    }
+
+    #[test]
+    fn help_inside_a_workspace_lists_the_same_steps_sourced_from_the_bootstrapped_lifecycles() {
+        let runtime: DummyRuntime = workspace().build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let lifecycles: Lifecycles = Lifecycles::load(workspace.workspace_root(), &runtime).unwrap();
+        let error: clap::Error = build_command(&lifecycles)
+            .try_get_matches_from(["sindri", "--help"])
+            .unwrap_err();
+        let help: String = error.to_string();
+        for step in ["generate", "compile", "package", "publish", "clean", "lifecycle"] {
+            assert!(help.contains(step), "expected `--help` to list `{step}`, got:\n{help}");
+        }
     }
 }

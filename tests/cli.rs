@@ -237,6 +237,54 @@ fn version_short_flag() {
 }
 
 #[test]
+fn help_outside_a_workspace_lists_the_embedded_default_and_clean_steps() {
+    let directory: TempDir = TempDir::new().unwrap();
+    let output: Output = sindri().arg("--help").current_dir(directory.path()).output().unwrap();
+    assert!(output.status.success());
+    let stdout: String = String::from_utf8_lossy(&output.stdout).into_owned();
+    for step in [
+        "generate",
+        "format",
+        "compile",
+        "package",
+        "publish",
+        "clean",
+        "lifecycle",
+    ] {
+        assert!(
+            stdout.contains(step),
+            "expected `--help` to list `{step}`, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn help_inside_a_workspace_lists_the_same_steps_sourced_from_the_bootstrapped_lifecycles() {
+    let directory: TempDir = workspace_dir();
+    let output: Output = sindri().arg("--help").current_dir(directory.path()).output().unwrap();
+    assert!(output.status.success());
+    let stdout: String = String::from_utf8_lossy(&output.stdout).into_owned();
+    for step in [
+        "generate",
+        "format",
+        "compile",
+        "package",
+        "publish",
+        "clean",
+        "lifecycle",
+    ] {
+        assert!(
+            stdout.contains(step),
+            "expected `--help` to list `{step}`, got:\n{stdout}"
+        );
+    }
+    assert!(
+        directory.path().join(".sindri/lifecycles/checksums.json").is_file(),
+        "expected `--help` inside a workspace to bootstrap .sindri/lifecycles/"
+    );
+}
+
+#[test]
 fn log_flag_creates_log_file() {
     let directory: TempDir = workspace_dir();
     let output: Output = sindri()
@@ -333,6 +381,17 @@ fn lifecycle_short_all_flag() {
 fn compile_in_valid_go_module_exits_zero() {
     let directory: TempDir = go_module_dir();
     let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "expected exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn format_in_valid_go_module_exits_zero() {
+    let directory: TempDir = go_module_dir();
+    let output: Output = sindri().arg("format").current_dir(directory.path()).output().unwrap();
     assert!(
         output.status.success(),
         "expected exit 0; stderr: {}",
@@ -685,4 +744,33 @@ fn broken_workspace_exits_nonzero() {
         "expected non-zero exit for malformed workspace"
     );
     assert!(!output.stderr.is_empty(), "expected an error message on stderr");
+}
+
+#[test]
+fn tampered_lifecycle_file_exits_nonzero() {
+    let directory: TempDir = workspace_dir();
+    // Bootstrap `.sindri/lifecycles/` first, then tamper with its content — a workspace is present,
+    // so this must fail during `Lifecycles::load`, before the command is even built.
+    sindri()
+        .arg("lifecycle")
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    let lifecycle_file: PathBuf = directory.path().join(".sindri/lifecycles/default.json");
+    assert!(lifecycle_file.is_file(), "expected lifecycle bootstrap to have run");
+    fs::write(&lifecycle_file, r#"["tampered"]"#).unwrap();
+    let output: Output = sindri()
+        .arg("lifecycle")
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for a tampered lifecycle file"
+    );
+    let stderr: String = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("doesn't match what Sindri shipped"),
+        "expected the LifecycleModified message on stderr, got:\n{stderr}"
+    );
 }

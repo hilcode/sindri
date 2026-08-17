@@ -152,6 +152,32 @@ impl Lifecycles {
         })
     }
 
+    /// Consumes this collection, handing back the owned lifecycle and step matching `name` — used
+    /// once dispatch has resolved which step to run, since [`Lifecycle::run_step`] takes `self` by
+    /// value.
+    pub fn into_step(self, name: &str) -> Option<(Lifecycle, Step)> {
+        for lifecycle in self.lifecycles {
+            let matched_step: Option<Step> = lifecycle
+                .steps()
+                .iter()
+                .find(|step: &&Step| step.as_ref() == name && !is_sentinel(step))
+                .cloned();
+            if let Some(step) = matched_step {
+                return Some((lifecycle, step));
+            }
+        }
+        None
+    }
+
+    /// The `default` lifecycle among these — always present, since `default` is one of the two
+    /// lifecycles Sindri loads. Used by the `lifecycle` subcommand's listing.
+    pub fn default_lifecycle(&self) -> &Lifecycle {
+        self.lifecycles
+            .iter()
+            .find(|lifecycle: &&Lifecycle| lifecycle.name() == &LifecycleName::new("default"))
+            .expect("`default` is always one of the loaded lifecycles")
+    }
+
     /// Every non-sentinel step across every loaded lifecycle, in a stable order — what the CLI uses
     /// to build subcommands and help text.
     pub fn runnable_steps(&self) -> impl Iterator<Item = (&Lifecycle, &Step)> {
@@ -507,6 +533,26 @@ mod tests {
         assert!(
             lifecycles.find_step("start").is_none(),
             "sentinels are not runnable steps"
+        );
+    }
+
+    #[test]
+    fn into_step_hands_back_the_owned_lifecycle_and_step_matching_a_name() {
+        let (lifecycle, step): (Lifecycle, Step) = Lifecycles::embedded_defaults().into_step("clean").unwrap();
+        assert_eq!(lifecycle.name().to_string(), "clean");
+        assert_eq!(step.to_string(), "clean");
+    }
+
+    #[test]
+    fn into_step_returns_none_for_an_unknown_name() {
+        assert!(Lifecycles::embedded_defaults().into_step("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn default_lifecycle_resolves_the_default_lifecycle() {
+        assert_eq!(
+            Lifecycles::embedded_defaults().default_lifecycle().name().to_string(),
+            "default"
         );
     }
 
