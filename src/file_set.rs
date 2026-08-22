@@ -185,7 +185,7 @@ mod tests {
         file_set
             .files()
             .iter()
-            .map(|file: &RelativeFile| -> String { file.as_ref().display().to_string() })
+            .map(|file: &RelativeFile| -> String { file.to_string() })
             .collect()
     }
 
@@ -289,7 +289,7 @@ mod tests {
             .union(&go_work)
             .files()
             .iter()
-            .map(|file: &RelativeFile| -> String { file.as_ref().display().to_string() })
+            .map(|file: &RelativeFile| -> String { file.to_string() })
             .collect();
         assert_eq!(
             union,
@@ -321,7 +321,7 @@ mod tests {
         let matched: BTreeSet<String> = file_set
             .files()
             .iter()
-            .map(|file: &RelativeFile| -> String { file.as_ref().display().to_string() })
+            .map(|file: &RelativeFile| -> String { file.to_string() })
             .collect();
         assert_eq!(
             matched,
@@ -342,7 +342,7 @@ mod tests {
         let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(temporary_directory.path().to_path_buf()));
         let missing: AbsoluteDirectory = root
             .to_absolute_directory()
-            .join_directory(&RelativeDirectory::new("output"));
+            .join_directory(&RelativeDirectory::new_unchecked("output"));
         let file_set: FileSet =
             FileSet::resolve(&FileSetPattern::new(["**/*"]), &missing, &root, &system_runtime()).unwrap();
         assert!(file_set.is_empty());

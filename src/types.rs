@@ -303,76 +303,6 @@ impl Display for Step {
     }
 }
 
-/// A task's command: a program plus its arguments, executed directly with no shell. Lives here,
-/// alongside [`CommandOutput`], so [`crate::runtime`] can spawn it directly without parsing a
-/// string. Holding the program separately from its arguments makes the program's presence an
-/// invariant of the type and keeps an argument containing whitespace a single argument.
-#[derive(Clone, Debug)]
-pub struct Command {
-    program: SmolStr,
-    arguments: Vec<SmolStr>,
-    environment: Vec<(SmolStr, SmolStr)>,
-}
-
-impl Command {
-    pub fn new(program: impl Into<SmolStr>, arguments: impl IntoIterator<Item = impl Into<SmolStr>>) -> Command {
-        Command {
-            program: program.into(),
-            arguments: arguments.into_iter().map(|argument| argument.into()).collect(),
-            environment: Vec::new(),
-        }
-    }
-
-    /// Set an environment variable in the process this command spawns, returning the command so
-    /// setters chain onto [`new`](Command::new). Environment variables are execution detail only —
-    /// they do not appear in the [`Display`] rendering used for diagnostics.
-    pub fn with_environment_variable(mut self, name: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Command {
-        self.environment.push((name.into(), value.into()));
-        self
-    }
-
-    pub fn program(&self) -> &str {
-        &self.program
-    }
-
-    pub fn arguments(&self) -> &[SmolStr] {
-        &self.arguments
-    }
-
-    pub fn environment(&self) -> &[(SmolStr, SmolStr)] {
-        &self.environment
-    }
-
-    /// Resolve the `{output}` placeholder in each argument to a task's output directory, yielding a
-    /// ready-to-spawn command. Arguments that do not reference `{output}` — and the environment, which
-    /// carries no placeholder — are carried through unchanged.
-    pub fn with_output_directory(&self, output_directory: &Path) -> Command {
-        let replacement: Cow<'_, str> = output_directory.to_string_lossy();
-        Command {
-            program: self.program.clone(),
-            arguments: self
-                .arguments
-                .iter()
-                .map(|argument: &SmolStr| -> SmolStr { SmolStr::new(argument.replace("{output}", &replacement)) })
-                .collect(),
-            environment: self.environment.clone(),
-        }
-    }
-}
-
-/// Renders the command as a single space-joined line for diagnostics and logs. This is a display
-/// convenience only — execution always uses the structured program and arguments, so an argument
-/// containing spaces is never re-split.
-impl Display for Command {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter.write_str(&self.program)?;
-        for argument in &self.arguments {
-            write!(formatter, " {argument}")?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
 pub struct Version(SmolStr);
@@ -465,16 +395,69 @@ impl<'deserialize> Deserialize<'deserialize> for Language {
     }
 }
 
+/// Why a string failed to become a [`RelativeFile`] or [`RelativeDirectory`]: absolute rather than
+/// relative, a repeated `/` somewhere in the path, or (directory-specific) missing the required
+/// trailing `/`, or (file-specific) carrying one it must not. Carries the fully rendered message so
+/// both `new`'s callers and its `Deserialize` delegate surface identical text.
+#[derive(Clone, Debug)]
+pub struct InvalidRelativePath {
+    message: String,
+}
+
+impl InvalidRelativePath {
+    fn new(message: String) -> InvalidRelativePath {
+        InvalidRelativePath { message }
+    }
+}
+
+impl Display for InvalidRelativePath {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InvalidRelativePath {}
+
 /// A path to a file, relative to some directory (ultimately a [`WorkspaceRoot`]). The "relative"
 /// half of the path type-system: resolve it against an absolute base with
 /// [`AbsoluteDirectory::join_file`] to obtain an [`AbsoluteFile`]. A `PathBuf` only becomes a
 /// `RelativeFile` here, at the edge, so everything downstream is typed.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RelativeFile(PathBuf);
 
 impl RelativeFile {
-    pub fn new(path: impl Into<PathBuf>) -> RelativeFile {
+    /// Validate `path` as a relative file: not absolute, no repeated `/` anywhere, and not
+    /// directory-like (must not end in `/`). The single validating constructor — [`Deserialize`]
+    /// delegates to it directly, so a Nickel-authored file string and a Rust-constructed one are
+    /// held to exactly the same rule.
+    pub fn new(path: impl Into<PathBuf>) -> Result<RelativeFile, InvalidRelativePath> {
+        let path: PathBuf = path.into();
+        let text: Cow<'_, str> = path.to_string_lossy();
+        if !path.is_relative() {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative file, got an absolute path `{}`",
+                path.display()
+            )))
+        } else if text.contains("//") {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative file with no repeated `/`, got `{}`",
+                path.display()
+            )))
+        } else if text.ends_with('/') {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative file, got a directory-like path ending in `/`: `{}`",
+                path.display()
+            )))
+        } else {
+            Ok(RelativeFile(path))
+        }
+    }
+
+    /// Construct a [`RelativeFile`] from a trusted, statically-known-good literal, skipping
+    /// [`new`](RelativeFile::new)'s validation — test-only, for fixture data too tedious to
+    /// `.expect()` at every call site.
+    #[cfg(test)]
+    pub fn new_unchecked(path: impl Into<PathBuf>) -> RelativeFile {
         let path: PathBuf = path.into();
         debug_assert!(
             path.is_relative(),
@@ -482,6 +465,15 @@ impl RelativeFile {
             path.display()
         );
         RelativeFile(path)
+    }
+}
+
+impl<'deserialize> Deserialize<'deserialize> for RelativeFile {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let path: PathBuf = PathBuf::deserialize(deserializer)?;
+        RelativeFile::new(path).map_err(DeserializeError::custom)
     }
 }
 
@@ -499,26 +491,114 @@ impl Display for RelativeFile {
 
 /// A path to a directory, relative to some directory (ultimately a [`WorkspaceRoot`]). Resolve it
 /// against an absolute base with [`AbsoluteDirectory::join_directory`] to obtain an
-/// [`AbsoluteDirectory`].
-#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct RelativeDirectory(PathBuf);
+/// [`AbsoluteDirectory`]. A named directory always renders with a trailing `/` — the authoring
+/// convention that lets a Nickel-facing directory string read as unambiguously a directory, as
+/// opposed to a [`RelativeFile`]'s bare name, which must never carry one. [`Dot`](RelativeDirectory::Dot)
+/// is a distinct variant (not the empty string wearing a trailing slash) precisely because "no
+/// subdirectory" has no sensible trailing-slash rendering of its own — it must join as the
+/// identity, not as `/`, which would make an absolute path out of whatever it's joined against.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum RelativeDirectory {
+    /// The current directory — no subdirectory relative to whatever base this resolves against,
+    /// e.g. the workspace-root module's own directory. Joining against this leaves the base
+    /// unchanged.
+    Dot,
+    /// A named subdirectory. Always carries exactly one trailing `/`, established once here by
+    /// [`RelativeDirectory::new`] rather than left to every call site or renderer to get right.
+    Named(PathBuf),
+}
+
+/// Bridge a computed (not Nickel-authored) path into [`RelativeDirectory::new`]'s strict contract:
+/// unchanged if empty or already ending in `/`, otherwise with exactly one `/` appended. Every call
+/// site using this is deriving a directory from already-typed components — a `strip_prefix` result,
+/// a `parent()`, a qualifier pushed onto a directory — so the value is always well-formed already,
+/// just not yet expressed with the trailing slash the constructor requires.
+fn as_directory_text(path: &Path) -> String {
+    let text: Cow<'_, str> = path.to_string_lossy();
+    if text.is_empty() || text.ends_with('/') {
+        text.into_owned()
+    } else {
+        format!("{text}/")
+    }
+}
 
 impl RelativeDirectory {
-    pub fn new(path: impl Into<PathBuf>) -> RelativeDirectory {
+    /// Validate `path` as a relative directory: not absolute, no repeated `/` anywhere, and
+    /// (unless it names the current directory) ending in exactly one `/`. The single validating
+    /// constructor — [`Deserialize`] delegates to it directly, so a Nickel-authored directory
+    /// string and a Rust-constructed one are held to exactly the same rule.
+    pub fn new(path: impl Into<PathBuf>) -> Result<RelativeDirectory, InvalidRelativePath> {
+        let path: PathBuf = path.into();
+        let text: Cow<'_, str> = path.to_string_lossy();
+        if !path.is_relative() {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative directory, got an absolute path `{}`",
+                path.display()
+            )))
+        } else if text.contains("//") {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative directory with no repeated `/`, got `{}`",
+                path.display()
+            )))
+        } else if text.is_empty() {
+            Ok(RelativeDirectory::Dot)
+        } else if !text.ends_with('/') {
+            Err(InvalidRelativePath::new(format!(
+                "expected a relative directory ending in `/`, got `{}`",
+                path.display()
+            )))
+        } else {
+            Ok(RelativeDirectory::Named(path))
+        }
+    }
+
+    /// Construct a [`RelativeDirectory`] from a trusted, statically-known-good literal, skipping
+    /// [`new`](RelativeDirectory::new)'s validation and normalizing a missing or doubled trailing
+    /// slash instead of rejecting it — test-only, for fixture data too tedious to `.expect()` at
+    /// every call site.
+    #[cfg(test)]
+    pub fn new_unchecked(path: impl Into<PathBuf>) -> RelativeDirectory {
         let path: PathBuf = path.into();
         debug_assert!(
             path.is_relative(),
             "RelativeDirectory constructed from an absolute path: {}",
             path.display()
         );
-        RelativeDirectory(path)
+        let text: Cow<'_, str> = path.to_string_lossy();
+        if text.is_empty() {
+            RelativeDirectory::Dot
+        } else if text.ends_with('/') && !text.ends_with("//") {
+            RelativeDirectory::Named(path)
+        } else {
+            RelativeDirectory::Named(PathBuf::from(format!("{}/", text.trim_end_matches('/'))))
+        }
+    }
+}
+
+impl<'deserialize> Deserialize<'deserialize> for RelativeDirectory {
+    fn deserialize<Deserializer: serde::Deserializer<'deserialize>>(
+        deserializer: Deserializer,
+    ) -> Result<Self, Deserializer::Error> {
+        let path: PathBuf = PathBuf::deserialize(deserializer)?;
+        RelativeDirectory::new(path).map_err(DeserializeError::custom)
     }
 }
 
 impl AsRef<Path> for RelativeDirectory {
     fn as_ref(&self) -> &Path {
-        &self.0
+        match self {
+            RelativeDirectory::Dot => Path::new(""),
+            RelativeDirectory::Named(path) => path.as_path(),
+        }
+    }
+}
+
+impl Display for RelativeDirectory {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            RelativeDirectory::Dot => Ok(()),
+            RelativeDirectory::Named(path) => path.display().fmt(formatter),
+        }
     }
 }
 
@@ -530,13 +610,22 @@ impl AsRef<Path> for RelativeDirectory {
 pub struct AbsoluteDirectory(PathBuf);
 
 impl AbsoluteDirectory {
+    /// Never a Nickel-authored value — always resolved from a real filesystem location or joined
+    /// from already-typed components — so unlike [`RelativeDirectory`] this stays infallible and
+    /// simply normalizes to exactly one trailing `/` rather than rejecting a caller that omitted or
+    /// doubled it.
     pub fn new(path: PathBuf) -> AbsoluteDirectory {
         debug_assert!(
             path.is_absolute(),
             "AbsoluteDirectory constructed from a relative path: {}",
             path.display()
         );
-        AbsoluteDirectory(path)
+        let text: Cow<'_, str> = path.to_string_lossy();
+        if text.ends_with('/') && !text.ends_with("//") {
+            AbsoluteDirectory(path)
+        } else {
+            AbsoluteDirectory(PathBuf::from(format!("{}/", text.trim_end_matches('/'))))
+        }
     }
 
     /// Resolve a relative file inside this directory.
@@ -564,9 +653,15 @@ impl AsRef<Path> for AbsoluteDirectory {
     }
 }
 
+impl Display for AbsoluteDirectory {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        self.0.display().fmt(formatter)
+    }
+}
+
 /// An absolute path to a file. Produced by resolving a relative file against an
 /// [`AbsoluteDirectory`]. Used wherever a file is read or written.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AbsoluteFile(PathBuf);
 
 impl AbsoluteFile {
@@ -594,6 +689,12 @@ impl AsRef<Path> for AbsoluteFile {
     }
 }
 
+impl Display for AbsoluteFile {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        self.0.display().fmt(formatter)
+    }
+}
+
 #[derive(Debug)]
 pub struct WorkspaceRoot(AbsoluteDirectory);
 
@@ -610,12 +711,15 @@ impl WorkspaceRoot {
     /// [`AbsoluteDirectory::join_file`].
     pub fn relativize_file(&self, absolute: &AbsoluteFile) -> RelativeFile {
         RelativeFile::new(self.relative_path(absolute.as_ref()))
+            .expect("path was resolved against this workspace root, so it lies within it")
     }
 
     /// Express an absolute directory as a [`RelativeDirectory`] relative to this root — the inverse
     /// of [`AbsoluteDirectory::join_directory`].
     pub fn relativize_directory(&self, absolute: &AbsoluteDirectory) -> RelativeDirectory {
-        RelativeDirectory::new(self.relative_path(absolute.as_ref()))
+        let relative: PathBuf = self.relative_path(absolute.as_ref());
+        RelativeDirectory::new(as_directory_text(&relative))
+            .expect("path was resolved against this workspace root, so it lies within it")
     }
 
     fn relative_path(&self, absolute: &Path) -> PathBuf {
@@ -634,7 +738,7 @@ impl AsRef<Path> for WorkspaceRoot {
 
 impl Display for WorkspaceRoot {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        self.0.as_ref().display().fmt(formatter)
+        self.0.fmt(formatter)
     }
 }
 
@@ -662,8 +766,9 @@ impl BuildFile {
     /// of [`ModuleIdentity::to_build_file`] and is how the entry module joins the module graph keyed by
     /// the same identity form its dependents would name it with.
     pub fn identity(&self) -> ModuleIdentity {
-        let directory: RelativeDirectory =
-            RelativeDirectory::new(self.0.as_ref().parent().map(Path::to_path_buf).unwrap_or_default());
+        let parent: PathBuf = self.0.as_ref().parent().map(Path::to_path_buf).unwrap_or_default();
+        let directory: RelativeDirectory = RelativeDirectory::new(as_directory_text(&parent))
+            .expect("a build file's parent directory is always well-formed");
         ModuleIdentity::new(directory, self.qualifier())
     }
 
@@ -769,8 +874,9 @@ impl ModuleIdentity {
         if !Self::is_valid_directory(directory_text) {
             return Err(malformed());
         }
+        let directory_text: &str = directory_text.strip_suffix('/').unwrap_or(directory_text);
         Ok(ModuleIdentity {
-            directory: RelativeDirectory::new(PathBuf::from(directory_text)),
+            directory: RelativeDirectory::new(format!("{directory_text}/")).expect("validated by is_valid_directory"),
             qualifier,
         })
     }
@@ -783,7 +889,10 @@ impl ModuleIdentity {
             Some(qualifier) => format!("sindri-{}.build", qualifier.as_ref()),
             None => "sindri.build".to_string(),
         };
-        BuildFile::new(RelativeFile::new(self.directory.as_ref().join(file_name)))
+        BuildFile::new(
+            RelativeFile::new(self.directory.as_ref().join(file_name))
+                .expect("a directory joined with a plain file name is always well-formed"),
+        )
     }
 
     /// The module's directory, relative to the workspace root — where its sources live and where its
@@ -800,7 +909,10 @@ impl ModuleIdentity {
         if let Some(qualifier) = &self.qualifier {
             path.push(qualifier.as_ref());
         }
-        ModulePath(RelativeDirectory::new(path))
+        ModulePath(
+            RelativeDirectory::new(as_directory_text(&path))
+                .expect("a directory optionally joined with a qualifier is always well-formed"),
+        )
     }
 
     fn is_valid_segment(segment: &str) -> bool {
@@ -812,7 +924,12 @@ impl ModuleIdentity {
                 .all(|byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     }
 
+    /// Tolerates at most one trailing `/` (so `Display`'s own canonical, slash-terminated output —
+    /// `RelativeDirectory::Named` always renders one — parses back to the same identity), but no
+    /// more: a doubled trailing slash still yields a trailing empty segment, which `is_valid_segment`
+    /// rejects.
     fn is_valid_directory(directory: &str) -> bool {
+        let directory: &str = directory.strip_suffix('/').unwrap_or(directory);
         !directory.is_empty() && directory.split('/').all(Self::is_valid_segment)
     }
 
@@ -908,7 +1025,7 @@ impl<'deserialize> Deserialize<'deserialize> for ModuleIdentity {
 
 impl Display for ModuleIdentity {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        write!(formatter, "//{}", self.directory.as_ref().display())?;
+        write!(formatter, "//{}", self.directory)?;
         if let Some(qualifier) = &self.qualifier {
             write!(formatter, " [{}]", qualifier.as_ref())?;
         }
@@ -993,16 +1110,16 @@ mod tests {
         let plain: ModuleIdentity = ModuleIdentity::parse("//libs/common").unwrap();
         assert_eq!(
             plain.module_path().as_relative_directory().as_ref(),
-            Path::new("libs/common")
+            Path::new("libs/common/")
         );
         let qualified: ModuleIdentity = ModuleIdentity::parse("//libs/common [kotlin]").unwrap();
         assert_eq!(
             qualified.module_path().as_relative_directory().as_ref(),
-            Path::new("libs/common/kotlin")
+            Path::new("libs/common/kotlin/")
         );
         // The workspace-root module maps to the empty path, so its state sits directly under the
         // build directory.
-        let root: ModuleIdentity = ModuleIdentity::new(RelativeDirectory::new(""), None);
+        let root: ModuleIdentity = ModuleIdentity::new(RelativeDirectory::new_unchecked(""), None);
         assert_eq!(root.module_path().as_relative_directory().as_ref(), Path::new(""));
     }
 
@@ -1024,7 +1141,7 @@ mod tests {
     #[test]
     fn module_identity_qualifier_is_case_insensitive() {
         let canonical: ModuleIdentity = ModuleIdentity::parse("//libs/common [kotlin]").unwrap();
-        assert_eq!(canonical.to_string(), "//libs/common [kotlin]");
+        assert_eq!(canonical.to_string(), "//libs/common/ [kotlin]");
         for text in [
             "//libs/common [kotlin]",
             "//libs/common [Kotlin]",
@@ -1078,9 +1195,21 @@ mod tests {
 
     #[test]
     fn module_identity_round_trips_through_display() {
-        for text in ["//libs/common", "//tools/codegen [bin]"] {
+        // Display's canonical form always ends the directory in `/` (RelativeDirectory::Named's own
+        // invariant); parse accepts that form back, so the two round-trip through each other.
+        for text in ["//libs/common/", "//tools/codegen/ [bin]"] {
             assert_eq!(ModuleIdentity::parse(text).unwrap().to_string(), text);
         }
+    }
+
+    #[test]
+    fn module_identity_parse_tolerates_a_missing_trailing_slash() {
+        // The bare form users already write in `dependencies` declarations still parses, and is the
+        // same identity as the canonical, slash-terminated form Display produces.
+        assert_eq!(
+            ModuleIdentity::parse("//libs/common").unwrap(),
+            ModuleIdentity::parse("//libs/common/").unwrap()
+        );
     }
 
     #[test]
@@ -1114,15 +1243,100 @@ mod tests {
         let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
         let absolute: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/services/api"));
         let derived: WorkingDirectory = WorkingDirectory::derive(&absolute, &root);
-        assert_eq!(derived.as_ref(), Path::new("services/api"));
+        assert_eq!(derived.as_ref(), Path::new("services/api/"));
         assert_eq!(derived.absolute(&root), absolute);
-        let constructed: WorkingDirectory = WorkingDirectory::new(RelativeDirectory::new("services/api"));
+        let constructed: WorkingDirectory = WorkingDirectory::new(RelativeDirectory::new_unchecked("services/api"));
         assert_eq!(constructed.absolute(&root), absolute);
     }
 
     #[test]
     fn language_deserialize_rejects_an_unknown_language() {
         assert!(serde_json::from_str::<Language>(r#""rust""#).is_err());
+    }
+
+    #[test]
+    fn relative_file_new_accepts_a_well_formed_path() {
+        assert_eq!(
+            RelativeFile::new("libs/common/main.go").unwrap().as_ref(),
+            Path::new("libs/common/main.go")
+        );
+    }
+
+    #[test]
+    fn relative_file_new_rejects_an_absolute_path() {
+        let error: InvalidRelativePath = RelativeFile::new("/etc").unwrap_err();
+        assert!(error.to_string().contains("absolute path"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_file_new_rejects_a_repeated_slash() {
+        let error: InvalidRelativePath = RelativeFile::new("libs//common").unwrap_err();
+        assert!(error.to_string().contains("no repeated"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_file_new_rejects_a_trailing_slash() {
+        let error: InvalidRelativePath = RelativeFile::new("libs/common/").unwrap_err();
+        assert!(error.to_string().contains("directory-like"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_directory_new_accepts_the_empty_directory() {
+        assert_eq!(RelativeDirectory::new("").unwrap(), RelativeDirectory::Dot);
+        assert_eq!(RelativeDirectory::new("").unwrap().as_ref(), Path::new(""));
+    }
+
+    #[test]
+    fn relative_directory_new_accepts_an_already_slash_terminated_path() {
+        // Already exactly one trailing slash: `new` reuses the value as-is rather than
+        // reformatting it — confirmed by the result still being exactly one trailing slash, not two.
+        assert_eq!(
+            RelativeDirectory::new("libs/common/").unwrap().as_ref(),
+            Path::new("libs/common/")
+        );
+    }
+
+    #[test]
+    fn relative_directory_new_rejects_an_absolute_path() {
+        let error: InvalidRelativePath = RelativeDirectory::new("/etc").unwrap_err();
+        assert!(error.to_string().contains("absolute path"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_directory_new_rejects_a_repeated_slash() {
+        let error: InvalidRelativePath = RelativeDirectory::new("libs//common/").unwrap_err();
+        assert!(error.to_string().contains("no repeated"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_directory_new_rejects_a_missing_trailing_slash() {
+        let error: InvalidRelativePath = RelativeDirectory::new("libs/common").unwrap_err();
+        assert!(error.to_string().contains("ending in"), "message was: {error}");
+    }
+
+    #[test]
+    fn relative_directory_new_unchecked_normalizes_a_missing_or_doubled_trailing_slash() {
+        assert_eq!(
+            RelativeDirectory::new_unchecked("libs/common").as_ref(),
+            Path::new("libs/common/")
+        );
+        assert_eq!(
+            RelativeDirectory::new_unchecked("libs/common//").as_ref(),
+            Path::new("libs/common/")
+        );
+    }
+
+    #[test]
+    fn absolute_directory_new_normalizes_a_missing_trailing_slash_and_reuses_an_existing_one() {
+        assert_eq!(
+            AbsoluteDirectory::new(PathBuf::from("/workspace")).as_ref(),
+            Path::new("/workspace/")
+        );
+        assert_eq!(
+            AbsoluteDirectory::new(PathBuf::from("/workspace/")).as_ref(),
+            Path::new("/workspace/")
+        );
+        assert_eq!(AbsoluteDirectory::new(PathBuf::from("/")).as_ref(), Path::new("/"));
     }
 
     #[test]
@@ -1156,8 +1370,8 @@ mod tests {
     #[test]
     fn workspace_root_and_build_file_display_and_resolve() {
         let root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
-        assert_eq!(root.to_string(), "/workspace");
-        let build_file: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        assert_eq!(root.to_string(), "/workspace/");
+        let build_file: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         assert_eq!(build_file.to_string(), "sindri.build");
         assert_eq!(
             build_file.absolute(&root).as_ref(),

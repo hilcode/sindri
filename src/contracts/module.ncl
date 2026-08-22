@@ -25,4 +25,8 @@ let Dependency = std.contract.any_of [
   # "release" } }`. A task's declared parameters (owned by the plugin that defines the task) are
   # validated against these before its script ever runs.
   parameters | { _ : { _ : String } } | optional,
+  # Workspace-built tools this module's tasks consume, e.g. `"//tools/codegen:codegen"` — a module
+  # identity, `:`, then the binary that module's package step must produce. Parsed and validated on
+  # the Rust side, the same way a `dependencies` module identity is.
+  module_tools | Array String | optional,
 }

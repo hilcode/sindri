@@ -7,15 +7,17 @@ use crate::file_set::FileSet;
 use crate::lifecycle::TaskGraph;
 use crate::lifecycle::TaskGraphNode;
 use crate::metadata_cache::MetadataCache;
+use crate::module_tool::ModuleToolBinaries;
+pub use crate::nickel_import::ScriptResolutionState;
 use crate::parameter::ParameterBinding;
 use crate::parameter::ParameterState;
 use crate::runtime::Runtime;
-use crate::script::Command as ScriptCommand;
+use crate::script::Command;
+use crate::task::DefinitionHash;
 use crate::task::Task;
 use crate::task::resolve_file_set;
 use crate::types::AbsoluteDirectory;
 use crate::types::BuildStart;
-use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::Fiber;
 use crate::types::ModulePath;
@@ -28,7 +30,6 @@ use crate::types::TaskStatus;
 use crate::types::WorkspaceRoot;
 use miette::IntoDiagnostic;
 use miette::Result as MietteResult;
-use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::io::Write;
 use std::thread::ScopedJoinHandle;
@@ -150,32 +151,35 @@ impl ModuleRebuilt {
 /// reported precisely rather than just as "something failed".
 enum CommandOutcome {
     Succeeded(CommandOutput),
-    Failed {
-        output: CommandOutput,
-        command: ScriptCommand,
-    },
+    Failed { output: CommandOutput, command: Command },
 }
 
 #[derive(Debug)]
 pub struct TaskOutcome {
     task: Task,
     output: CommandOutput,
-    failed_command: Option<ScriptCommand>,
+    failed_command: Option<Command>,
     task_duration: Duration,
     task_start: TaskStart,
     fiber: Fiber,
     dirtiness: Dirtiness,
+    output_directory: AbsoluteDirectory,
 }
 
 impl TaskOutcome {
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     fn from(
         task: Task,
         result: IoResult<CommandOutcome>,
         task_start: TaskStart,
         fiber: Fiber,
         dirtiness: Dirtiness,
+        output_directory: AbsoluteDirectory,
     ) -> TaskOutcome {
-        let (output, failed_command): (CommandOutput, Option<ScriptCommand>) = match result {
+        let (output, failed_command): (CommandOutput, Option<Command>) = match result {
             Ok(CommandOutcome::Succeeded(output)) => (output, None),
             Ok(CommandOutcome::Failed { output, command }) => (output, Some(command)),
             Err(error) => (
@@ -195,12 +199,13 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness,
+            output_directory,
         }
     }
 
     /// A skipped (clean) task: no command ran, so it is recorded as an instant success that still
     /// emits a telemetry event marked as a hit.
-    fn cached(task: Task, task_start: TaskStart, fiber: Fiber) -> TaskOutcome {
+    fn cached(task: Task, task_start: TaskStart, fiber: Fiber, output_directory: AbsoluteDirectory) -> TaskOutcome {
         TaskOutcome {
             task,
             output: CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded),
@@ -209,9 +214,14 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness: Dirtiness::Clean,
+            output_directory,
         }
     }
 
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub fn new(
         task: Task,
@@ -220,6 +230,7 @@ impl TaskOutcome {
         task_start: TaskStart,
         fiber: Fiber,
         dirtiness: Dirtiness,
+        output_directory: AbsoluteDirectory,
     ) -> TaskOutcome {
         TaskOutcome {
             task,
@@ -229,11 +240,16 @@ impl TaskOutcome {
             task_start,
             fiber,
             dirtiness,
+            output_directory,
         }
     }
 
     pub fn task(&self) -> &Task {
         &self.task
+    }
+
+    pub fn output_directory(&self) -> &AbsoluteDirectory {
+        &self.output_directory
     }
 
     pub fn output(&self) -> &CommandOutput {
@@ -243,7 +259,7 @@ impl TaskOutcome {
     /// The specific command that failed, if the task failed because one of its resolved commands
     /// exited unsuccessfully — `None` if the task succeeded, or if it failed before any command ran
     /// (e.g. its script failed to resolve).
-    pub fn failed_command(&self) -> Option<&ScriptCommand> {
+    pub fn failed_command(&self) -> Option<&Command> {
         self.failed_command.as_ref()
     }
 
@@ -303,26 +319,45 @@ impl<'context> ModuleContext<'context> {
     }
 }
 
-/// A task paired with the decision of whether it must run. Built in a serial pre-pass so the
-/// executor knows, before spawning anything, which tasks are clean (and stay silent) and which are
-/// dirty (and run).
+/// A task paired with the decision of whether it must run and, for a dirty task, its already-
+/// resolved commands. Built in a serial pre-pass so the executor knows, before spawning anything,
+/// which tasks are clean (and stay silent) and which are dirty (and run) — and so a dirty task's
+/// script is resolved here, on the calling thread, rather than later by whichever worker thread
+/// happens to run it. `commands` is `Some` exactly when `dirtiness` is [`Dirtiness::Dirty`]; a clean
+/// task never runs, so it never needs commands. `definition_hash` is carried alongside so a
+/// successful run's fresh [`TaskRunRecord`] can be persisted from it directly, without re-deriving
+/// it from the script a second time.
 struct TaskPlan {
     task: Task,
     layout: TaskLayout,
     dirtiness: Dirtiness,
+    definition_hash: DefinitionHash,
+    commands: Option<Vec<Command>>,
 }
 
 /// Build a task's [`TaskLayout`], compute its current run record, and compare it against what was
-/// persisted to decide clean or dirty — the "resolve, then check dirtiness" half of a task's
-/// lifecycle. `module_path` names where the task's own state nests under the build directory,
-/// distinct from `module.module_directory`, the module's real source location. The building block
-/// both [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped
-/// to no module at all) resolve a task with.
+/// persisted to decide clean or dirty — forced dirty regardless, without consulting the persisted
+/// record, when `dependency_rebuilt` says a module this task's module depends on rebuilt (its
+/// outputs were produced against the dependency's previous sources, which are not part of this
+/// module's tracked inputs, so no per-task dirtiness check would notice). If the final decision is
+/// dirty, resolve the task's script into commands right here too, in this same serial pass — the
+/// "resolve, check dirtiness, and (if dirty) resolve commands" whole of a task's pre-run lifecycle.
+/// `module_path` names where the task's own state nests under the build directory, distinct from
+/// `module.module_directory`, the module's real source location. The building block both
+/// [`plan_group`] (one node of a module's step group) and [`run_standalone_task`] (a task scoped to
+/// no module at all) resolve a task with.
+// Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+// swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+// not apply.
+#[allow(clippy::too_many_arguments)]
 fn resolve_task_plan(
     task: &Task,
     module: &ModuleContext,
     module_path: &RelativeDirectory,
     context: &BuildContext,
+    dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
+    resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<TaskPlan> {
     let binding: ParameterBinding = ParameterBinding::resolve(task.declared_parameters(), module.parameter_state)?;
@@ -339,25 +374,52 @@ fn resolve_task_plan(
         layout.output_directory(),
         context.workspace_root(),
         context.cache(),
+        resolution_state,
         runtime,
     )?;
     let persisted: Option<TaskRunRecord> = TaskRunRecord::load(layout.run_record_file(), runtime);
-    let status: Dirtiness = dirtiness(&current_record, persisted.as_ref());
+    let status: Dirtiness = if dependency_rebuilt.is_rebuilt() {
+        Dirtiness::Dirty
+    } else {
+        dirtiness(&current_record, persisted.as_ref())
+    };
+    let commands: Option<Vec<Command>> = match status {
+        Dirtiness::Dirty => Some(task.resolve(
+            module.parameter_state,
+            module.module_directory,
+            context.managed_input_base(),
+            layout.output_directory(),
+            context.workspace_root(),
+            module_tool_binaries,
+            resolution_state,
+            runtime,
+        )?),
+        Dirtiness::Clean => None,
+    };
     Ok(TaskPlan {
         task: task.clone(),
         layout,
         dirtiness: status,
+        definition_hash: current_record.definition_hash(),
+        commands,
     })
 }
 
 /// Compute every node's [`TaskPlan`], deciding clean or dirty for each. Serial and in lifecycle
 /// order, so a source-mutating step's effects are on disk before the next step is hashed.
+// Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+// swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+// not apply.
+#[allow(clippy::too_many_arguments)]
 fn plan_group(
     node_ids: &[TaskGraphNodeId],
     nodes: &[TaskGraphNode],
     module: &ModuleContext,
     module_path: &ModulePath,
     context: &BuildContext,
+    dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
+    resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<Vec<TaskPlan>> {
     node_ids
@@ -368,18 +430,29 @@ fn plan_group(
                 module,
                 module_path.as_relative_directory(),
                 context,
+                dependency_rebuilt,
+                module_tool_binaries,
+                resolution_state,
                 runtime,
             )
         })
         .collect()
 }
 
-/// Run a dirty task's resolved commands and, on success, persist its fresh run record — the "run,
-/// then persist" half of a task's lifecycle. The building block both [`run_misses`] (spawned per
-/// dirty task, one real OS thread each) and [`run_standalone_task`] (run synchronously, on the
+/// Run a dirty task's already-resolved `commands` and, on success, persist its fresh run record
+/// built from its already-known `definition_hash` — the "run, then persist" half of a task's
+/// lifecycle, entirely free of script/Nickel resolution (that already happened in
+/// [`resolve_task_plan`], on the calling thread). The building block both [`run_misses`] (spawned
+/// per dirty task, one real OS thread each) and [`run_standalone_task`] (run synchronously, on the
 /// calling thread) run a task with.
+// Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+// swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+// not apply.
+#[allow(clippy::too_many_arguments)]
 fn run_task_and_persist(
     task: Task,
+    commands: &[Command],
+    definition_hash: DefinitionHash,
     module: &ModuleContext,
     context: &BuildContext,
     layout: &TaskLayout,
@@ -387,17 +460,33 @@ fn run_task_and_persist(
     fiber: Fiber,
     runtime: &impl Runtime,
 ) -> TaskOutcome {
-    let result: IoResult<CommandOutcome> = run_one(&task, module, context, layout.output_directory(), runtime);
-    let outcome: TaskOutcome = TaskOutcome::from(task, result, task_start, fiber, Dirtiness::Dirty);
+    let result: IoResult<CommandOutcome> = run_one(commands, layout.output_directory(), context, runtime);
+    let outcome: TaskOutcome = TaskOutcome::from(
+        task,
+        result,
+        task_start,
+        fiber,
+        Dirtiness::Dirty,
+        layout.output_directory().clone(),
+    );
     if outcome.output().status().is_success() {
-        persist_outcome(outcome.task(), module.module_directory, context, layout, runtime);
+        persist_outcome(
+            outcome.task(),
+            module.module_directory,
+            context,
+            layout,
+            definition_hash,
+            runtime,
+        );
     }
     outcome
 }
 
-/// Run every dirty task in `plans` concurrently, one real OS thread each. A task's resolved script
-/// yields an ordered list of commands, run sequentially on that single thread — concurrency in this
-/// executor is across tasks, never within one task's own command sequence.
+/// Run every dirty task in `plans` concurrently, one real OS thread each. A task's already-resolved
+/// commands (see [`TaskPlan`]) run sequentially on that single thread — concurrency in this executor
+/// is across tasks, never within one task's own command sequence. No Nickel type is ever passed into
+/// a spawned closure here: each dirty task's `Vec<Command>` and [`DefinitionHash`] were resolved
+/// serially, before this function was called.
 fn run_misses(
     plans: &[TaskPlan],
     module: &ModuleContext,
@@ -415,9 +504,24 @@ fn run_misses(
             .map(|(index, &plan)| {
                 let fiber: Fiber = Fiber::new(index);
                 let task: Task = plan.task.clone();
+                let commands: &[Command] = plan
+                    .commands
+                    .as_deref()
+                    .expect("a dirty plan always carries resolved commands");
+                let definition_hash: DefinitionHash = plan.definition_hash;
                 scope.spawn(move || -> TaskOutcome {
                     let task_start: TaskStart = TaskStart::new(runtime.now());
-                    run_task_and_persist(task, module, context, &plan.layout, task_start, fiber, runtime)
+                    run_task_and_persist(
+                        task,
+                        commands,
+                        definition_hash,
+                        module,
+                        context,
+                        &plan.layout,
+                        task_start,
+                        fiber,
+                        runtime,
+                    )
                 })
             })
             .collect();
@@ -428,35 +532,20 @@ fn run_misses(
     })
 }
 
-/// Resolve a task's script and run its commands in order, stopping at the first failure (mirroring
-/// shell `&&` chaining) — a later command in the sequence is assumed to depend on the ones before it
-/// having actually succeeded. A setup failure (script resolution, e.g. a malformed pattern or a
-/// parameter error) surfaces the same way a real command failure does: as the task's own failure.
+/// Run a task's already-resolved commands in order, stopping at the first failure (mirroring shell
+/// `&&` chaining) — a later command in the sequence is assumed to depend on the ones before it
+/// having actually succeeded. Script resolution happened earlier, in [`resolve_task_plan`]; this
+/// only ever runs the plain `Vec<Command>` data that produced.
 fn run_one(
-    task: &Task,
-    module: &ModuleContext,
-    context: &BuildContext,
+    commands: &[Command],
     output_directory: &AbsoluteDirectory,
+    context: &BuildContext,
     runtime: &impl Runtime,
 ) -> IoResult<CommandOutcome> {
     runtime.create_directories(output_directory.as_ref())?;
-    let commands: Vec<ScriptCommand> = task
-        .resolve(
-            module.parameter_state,
-            module.module_directory,
-            context.managed_input_base(),
-            output_directory,
-            context.workspace_root(),
-            runtime,
-        )
-        .map_err(IoError::other)?;
     let mut output: CommandOutput = CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded);
-    for command in &commands {
-        let working_directory: AbsoluteDirectory = context
-            .workspace_root()
-            .to_absolute_directory()
-            .join_directory(command.working_directory());
-        output = runtime.run_command(&to_process_command(command), working_directory.as_ref())?;
+    for command in commands {
+        output = runtime.run_command(command, context.workspace_root())?;
         if !output.status().is_success() {
             return Ok(CommandOutcome::Failed {
                 output,
@@ -467,36 +556,17 @@ fn run_one(
     Ok(CommandOutcome::Succeeded(output))
 }
 
-/// Adapt a script-resolved [`ScriptCommand`] to the [`Command`] shape [`Runtime::run_command`]
-/// spawns. The working directory is not carried here — it is resolved to an absolute path and passed
-/// to `run_command` separately.
-fn to_process_command(command: &ScriptCommand) -> Command {
-    let mut process_command: Command = Command::new(command.program(), command.arguments().iter().cloned());
-    for (name, value) in command.environment() {
-        process_command = process_command.with_environment_variable(name.clone(), value.clone());
-    }
-    process_command
-}
-
-/// Render a script-resolved command as a single space-joined line for diagnostics, the same
-/// convention [`Command`]'s own `Display` uses for a process-ready command.
-fn render_command(command: &ScriptCommand) -> String {
-    let mut rendered: String = command.program().to_string();
-    for argument in command.arguments() {
-        rendered.push(' ');
-        rendered.push_str(argument);
-    }
-    rendered
-}
-
-/// Record a successful task's fresh run record. Best effort: a failure here only means the task is
-/// not cached and re-runs next time, so it is logged rather than allowed to fail a build that
-/// succeeded.
+/// Record a successful task's fresh run record, built from its already-known `definition_hash`
+/// (derived once, in [`resolve_task_plan`] — it cannot have changed since, as only the task's own
+/// commands ran in between) rather than re-deriving one from the script here. Best effort: a
+/// failure here only means the task is not cached and re-runs next time, so it is logged rather than
+/// allowed to fail a build that succeeded.
 fn persist_outcome(
     task: &Task,
     module_directory: &RelativeDirectory,
     context: &BuildContext,
     layout: &TaskLayout,
+    definition_hash: DefinitionHash,
     runtime: &impl Runtime,
 ) {
     // The task's own commands just ran and are the only thing that can have changed its output —
@@ -515,7 +585,8 @@ fn persist_outcome(
         }
     };
     context.cache().invalidate(&output_files);
-    let record: TaskRunRecord = match TaskRunRecord::compute(
+    let record: TaskRunRecord = match TaskRunRecord::with_definition_hash(
+        definition_hash,
         task,
         module_directory,
         context.managed_input_base(),
@@ -552,13 +623,19 @@ fn persist_outcome(
     }
 }
 
+// Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+// swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+// not apply.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_graph(
     graph: &TaskGraph,
     location: &ModuleLocation,
     parameter_state: &ParameterState,
     context: &BuildContext,
     dependency_rebuilt: ModuleRebuilt,
+    module_tool_binaries: &ModuleToolBinaries,
     config: &ExecutionConfig,
+    resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<(Vec<TaskOutcome>, ModuleRebuilt)> {
     let module_directory: RelativeDirectory = context
@@ -568,16 +645,17 @@ pub fn execute_graph(
     let step_groups: Vec<Vec<TaskGraphNodeId>> = group_nodes_by_step(graph.nodes());
     let mut all_outcomes: Vec<TaskOutcome> = Vec::new();
     for group in &step_groups {
-        let mut plans: Vec<TaskPlan> =
-            plan_group(group, graph.nodes(), &module, location.module_path(), context, runtime)?;
-        if dependency_rebuilt.is_rebuilt() {
-            // A rebuilt dependency invalidates this module wholesale: its outputs were produced against
-            // the dependency's previous sources, which are not part of this module's tracked inputs, so
-            // no per-task dirtiness check would notice. Force every task to run.
-            for plan in &mut plans {
-                plan.dirtiness = Dirtiness::Dirty;
-            }
-        }
+        let plans: Vec<TaskPlan> = plan_group(
+            group,
+            graph.nodes(),
+            &module,
+            location.module_path(),
+            context,
+            dependency_rebuilt,
+            module_tool_binaries,
+            resolution_state,
+            runtime,
+        )?;
         if config.verbosity != Verbosity::Quiet {
             for plan in &plans {
                 if plan.dirtiness == Dirtiness::Dirty {
@@ -590,9 +668,12 @@ pub fn execute_graph(
         let batch_start: usize = all_outcomes.len();
         for plan in &plans {
             let outcome: TaskOutcome = match plan.dirtiness {
-                Dirtiness::Clean => {
-                    TaskOutcome::cached(plan.task.clone(), TaskStart::new(runtime.now()), Fiber::new(0))
-                }
+                Dirtiness::Clean => TaskOutcome::cached(
+                    plan.task.clone(),
+                    TaskStart::new(runtime.now()),
+                    Fiber::new(0),
+                    plan.layout.output_directory().clone(),
+                ),
                 Dirtiness::Dirty => miss_outcomes.next().expect("one outcome per dirty task"),
             };
             all_outcomes.push(outcome);
@@ -611,7 +692,7 @@ pub fn execute_graph(
                 task_name: failed.task.name().clone(),
                 command: failed.failed_command().map_or_else(
                     || "no command ran (the task failed before one could)".to_string(),
-                    render_command,
+                    Command::to_string,
                 ),
                 output: failed.output.combined_output(),
             }
@@ -643,21 +724,41 @@ pub fn run_standalone_task(
     module_directory: &RelativeDirectory,
     context: &BuildContext,
     config: &ExecutionConfig,
+    resolution_state: &mut ScriptResolutionState,
     runtime: &impl Runtime,
 ) -> MietteResult<(TaskOutcome, AbsoluteDirectory)> {
     // `generate-go-work` is the only task run this way, and it declares no parameters.
     let no_parameters: ParameterState = ParameterState::default();
     let module: ModuleContext = ModuleContext::new(module_directory, &no_parameters);
-    let plan: TaskPlan = resolve_task_plan(task, &module, module_directory, context, runtime)?;
+    // A standalone task has no module dependencies to propagate a rebuilt signal from, and (today)
+    // never carries `module_tools` of its own.
+    let plan: TaskPlan = resolve_task_plan(
+        task,
+        &module,
+        module_directory,
+        context,
+        ModuleRebuilt::new(false),
+        &ModuleToolBinaries::new(),
+        resolution_state,
+        runtime,
+    )?;
     let output_directory: AbsoluteDirectory = plan.layout.output_directory().clone();
     let outcome: TaskOutcome = match plan.dirtiness {
-        Dirtiness::Clean => TaskOutcome::cached(plan.task, TaskStart::new(runtime.now()), Fiber::new(0)),
+        Dirtiness::Clean => TaskOutcome::cached(
+            plan.task,
+            TaskStart::new(runtime.now()),
+            Fiber::new(0),
+            output_directory.clone(),
+        ),
         Dirtiness::Dirty => {
             if config.verbosity != Verbosity::Quiet {
                 writeln!(runtime.output(), "  \u{2192} {}", plan.task.name()).into_diagnostic()?;
             }
+            let commands: Vec<Command> = plan.commands.expect("a dirty plan always carries resolved commands");
             run_task_and_persist(
                 plan.task,
+                &commands,
+                plan.definition_hash,
                 &module,
                 context,
                 &plan.layout,
@@ -673,7 +774,7 @@ pub fn run_standalone_task(
             task_name: outcome.task().name().clone(),
             command: outcome.failed_command().map_or_else(
                 || "no command ran (the task failed before one could)".to_string(),
-                render_command,
+                Command::to_string,
             ),
             output: outcome.output().combined_output(),
         }
@@ -777,11 +878,16 @@ mod tests {
 
     /// No test in this module exercises a managed input, so any distinct absolute directory works.
     fn managed_input_base(working_directory: &AbsoluteDirectory) -> AbsoluteDirectory {
-        working_directory.join_directory(&RelativeDirectory::new(".target/generate-go-work"))
+        working_directory.join_directory(&RelativeDirectory::new_unchecked(".target/generate-go-work"))
+    }
+
+    /// No test in this module exercises `module_tools`, so an empty registry works everywhere.
+    fn module_tool_binaries() -> ModuleToolBinaries {
+        ModuleToolBinaries::new()
     }
 
     fn metadata_cache(build_directory: &AbsoluteDirectory) -> MetadataCache {
-        MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new(".metadata-cache")))
+        MetadataCache::new(build_directory.join_directory(&RelativeDirectory::new_unchecked(".metadata-cache")))
     }
 
     /// Run a graph against a stub runtime, deriving the incremental state directories from the given
@@ -793,19 +899,25 @@ mod tests {
         runtime: &impl Runtime,
     ) -> MietteResult<Vec<TaskOutcome>> {
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         execute_graph(
             graph,
             &location,
             &ParameterState::default(),
             &context,
             ModuleRebuilt::new(false),
+            &module_tool_binaries(),
             config,
+            &mut resolution_state,
             runtime,
         )
         .map(|(outcomes, _rebuilt): (Vec<TaskOutcome>, ModuleRebuilt)| -> Vec<TaskOutcome> { outcomes })
@@ -817,19 +929,25 @@ mod tests {
         let scratch: tempfile::TempDir = tempfile::TempDir::new().unwrap();
         let working_directory: AbsoluteDirectory = AbsoluteDirectory::new(scratch.path().to_path_buf());
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(&working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         execute_graph(
             graph,
             &location,
             &ParameterState::default(),
             &context,
             ModuleRebuilt::new(false),
+            &module_tool_binaries(),
             config,
+            &mut resolution_state,
             &system_runtime(),
         )
         .unwrap()
@@ -846,19 +964,25 @@ mod tests {
         runtime: &impl Runtime,
     ) -> (Vec<TaskOutcome>, ModuleRebuilt) {
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
-        let build_directory: AbsoluteDirectory = working_directory.join_directory(&RelativeDirectory::new(".target"));
-        let location: ModuleLocation =
-            ModuleLocation::new(working_directory.clone(), ModulePath::new(RelativeDirectory::new("")));
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let location: ModuleLocation = ModuleLocation::new(
+            working_directory.clone(),
+            ModulePath::new(RelativeDirectory::new_unchecked("")),
+        );
         let managed_input_base: AbsoluteDirectory = managed_input_base(working_directory);
         let cache: MetadataCache = metadata_cache(&build_directory);
         let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         execute_graph(
             graph,
             &location,
             &ParameterState::default(),
             &context,
             dependency_rebuilt,
+            &module_tool_binaries(),
             &default_config(),
+            &mut resolution_state,
             runtime,
         )
         .unwrap()
@@ -1124,5 +1248,120 @@ mod tests {
                 .all(|outcome: &TaskOutcome| -> bool { outcome.output().status().is_success() }),
             "both tasks should have run their stubbed command successfully"
         );
+    }
+
+    #[test]
+    fn a_dirty_tasks_definition_hash_is_derived_only_once_per_compile() {
+        // Before commands were resolved in the serial planning phase, persisting a successful run's
+        // fresh record re-derived the definition hash from scratch in `persist_outcome` — a second,
+        // redundant resolution of the same script, on the worker thread that ran it.
+        // `persist_outcome` now reuses the hash `resolve_task_plan` already derived (via
+        // `TaskRunRecord::with_definition_hash`), so a helper the script imports is read only once
+        // for the whole compile, not once per task per pass.
+        let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
+        builder.add_node(TaskGraphNode::new(
+            Task::new(
+                TaskName::new("go-compile"),
+                Script::new("let helper = import \"helper.ncl\" in fun inputs => [ { program = helper.program } ]"),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
+            ),
+            Step::new("compile"),
+        ));
+        let graph: TaskGraph = builder.build();
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/helper.ncl", "{ program = \"go\" }")
+            .command("go", succeeded(""))
+            .build();
+        run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap();
+        assert_eq!(runtime.read_count("/workspace/helper.ncl"), 1);
+    }
+
+    #[test]
+    fn two_dirty_tasks_sharing_an_imported_helper_read_it_from_disk_once_for_the_whole_compile() {
+        // Ties bullets 1-4 together through the real `execute_graph` pipeline: two dirty tasks, each
+        // hash-checked, resolved into commands, run, and persisted, both importing the same helper.
+        // The shared `ScriptResolutionState` (bullet 2) with its shared file-content cache (bullet 3)
+        // and reachable-set-scoped hashing (bullet 4), plus resolving commands in the serial phase
+        // rather than per-task on a worker thread (bullet 1), together bring the helper's disk read
+        // down to exactly one for the whole compile — not one per task, and not one per pass.
+        let import_task = |name: &str, argument: &str| -> Task {
+            Task::new(
+                TaskName::new(name),
+                Script::new(format!(
+                    "let helper = import \"helper.ncl\" in \
+                     fun inputs => [ {{ program = helper.program, arguments = [ \"{argument}\" ] }} ]"
+                )),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
+            )
+        };
+        let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
+        builder.add_node(TaskGraphNode::new(import_task("task-a", "a"), Step::new("compile")));
+        builder.add_node(TaskGraphNode::new(import_task("task-b", "b"), Step::new("compile")));
+        let graph: TaskGraph = builder.build();
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/helper.ncl", "{ program = \"go\" }")
+            .command("go", succeeded(""))
+            .build();
+        run(&graph, &workspace_directory(), &default_config(), &runtime).unwrap();
+        assert_eq!(runtime.read_count("/workspace/helper.ncl"), 1);
+    }
+
+    #[test]
+    fn a_helper_shared_by_two_tasks_is_read_once_within_the_hash_pass() {
+        // Two tasks whose scripts both import the same helper, planned through one long-lived
+        // `ScriptResolutionState` (as `Lifecycle::run_compile` now does for a whole build) — the
+        // hash-pass hub should serve the second task's import from cache rather than reading it
+        // again. Calling `plan_group` directly (rather than `run`/`execute_graph`) isolates this to
+        // the hash pass alone.
+        let import_task = |name: &str| -> Task {
+            Task::new(
+                TaskName::new(name),
+                Script::new("let helper = import \"helper.ncl\" in fun inputs => [ { program = helper.program } ]"),
+                DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+                TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+                ParameterDeclarations::default(),
+            )
+        };
+        let mut builder: TaskGraphBuilder = TaskGraphBuilder::new();
+        builder.add_node(TaskGraphNode::new(import_task("task-a"), Step::new("compile")));
+        builder.add_node(TaskGraphNode::new(import_task("task-b"), Step::new("compile")));
+        let graph: TaskGraph = builder.build();
+
+        let working_directory: AbsoluteDirectory = workspace_directory();
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file("/workspace/helper.ncl", "{ program = \"go\" }")
+            .build();
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(working_directory.clone());
+        let build_directory: AbsoluteDirectory =
+            working_directory.join_directory(&RelativeDirectory::new_unchecked(".target"));
+        let managed_input_base: AbsoluteDirectory = managed_input_base(&working_directory);
+        let cache: MetadataCache = metadata_cache(&build_directory);
+        let context: BuildContext = BuildContext::new(&workspace_root, &build_directory, &managed_input_base, &cache);
+        let module_directory: RelativeDirectory = RelativeDirectory::new_unchecked("");
+        let parameter_state: ParameterState = ParameterState::default();
+        let module: ModuleContext = ModuleContext::new(&module_directory, &parameter_state);
+        let module_path: ModulePath = ModulePath::new(RelativeDirectory::new_unchecked(""));
+        let node_ids: Vec<TaskGraphNodeId> = (0..graph.nodes().len()).map(TaskGraphNodeId::new).collect();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        plan_group(
+            &node_ids,
+            graph.nodes(),
+            &module,
+            &module_path,
+            &context,
+            ModuleRebuilt::new(false),
+            &module_tool_binaries(),
+            &mut resolution_state,
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(runtime.read_count("/workspace/helper.ncl"), 1);
     }
 }

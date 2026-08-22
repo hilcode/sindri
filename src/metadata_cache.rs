@@ -43,7 +43,7 @@ struct PathHash([u8; 32]);
 impl PathHash {
     fn of(file: &RelativeFile) -> PathHash {
         let mut hasher: Hasher = Hasher::new();
-        hasher.update(file.as_ref().to_string_lossy().as_bytes());
+        hasher.update(file.to_string().as_bytes());
         PathHash(*hasher.finalize().as_bytes())
     }
 
@@ -58,7 +58,8 @@ impl PathHash {
             .map(|byte: &u8| -> String { format!("{byte:02x}") })
             .collect();
         let (shard, rest): (&str, &str) = hexadecimal.split_at(2);
-        cache_directory.join_file(&RelativeFile::new(format!("{shard}/{rest}.bin")))
+        cache_directory
+            .join_file(&RelativeFile::new(format!("{shard}/{rest}.bin")).expect("a hex digest is always well-formed"))
     }
 }
 
@@ -143,7 +144,7 @@ impl MetadataCache {
         let mut hasher: Hasher = Hasher::new();
         for file in files.files() {
             let file_hash: FileContentHash = self.hash_of(file, workspace_root, file_system)?;
-            hasher.update(file.as_ref().to_string_lossy().as_bytes());
+            hasher.update(file.to_string().as_bytes());
             hasher.update(&FIELD_SEPARATOR);
             hasher.update(&file_hash.0);
             hasher.update(&FIELD_SEPARATOR);
@@ -456,7 +457,9 @@ mod tests {
     #[test]
     fn loading_a_missing_record_is_treated_as_no_record() {
         let runtime: DummyRuntime = DummyRuntime::builder().file("/workspace/a.go", "alpha").build();
-        let record: Option<PersistedRecord> = cache().load_record(&RelativeFile::new("a.go"), &runtime).unwrap();
+        let record: Option<PersistedRecord> = cache()
+            .load_record(&RelativeFile::new_unchecked("a.go"), &runtime)
+            .unwrap();
         assert!(record.is_none());
     }
 }

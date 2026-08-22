@@ -66,7 +66,8 @@ impl Telemetry {
         let trace_file: TraceFile = TraceFile { trace_events };
         let json: String = serde_json::to_string_pretty(&trace_file).expect("telemetry serialisation is infallible");
         file_system.create_directories(build_directory.as_ref())?;
-        let telemetry_path: AbsoluteFile = build_directory.join_file(&RelativeFile::new("telemetry.json"));
+        let telemetry_path: AbsoluteFile = build_directory
+            .join_file(&RelativeFile::new("telemetry.json").expect("a literal file name is always well-formed"));
         file_system.write(telemetry_path.as_ref(), json.as_bytes())
     }
 }
@@ -125,6 +126,7 @@ mod tests {
             task_start,
             fiber,
             dirtiness,
+            build_directory(),
         )
     }
 

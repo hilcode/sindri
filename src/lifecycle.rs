@@ -3,25 +3,35 @@ use crate::executor::BuildContext;
 use crate::executor::ExecutionConfig;
 use crate::executor::ModuleLocation;
 use crate::executor::ModuleRebuilt;
+use crate::executor::ScriptResolutionState;
 use crate::executor::TaskOutcome;
 use crate::executor::execute_graph;
 use crate::executor::run_standalone_task;
 use crate::go_plugin::GoPlugin;
 use crate::metadata_cache::MetadataCache;
 use crate::module::ArtifactType;
+use crate::module::ModuleToolReference;
 use crate::module_graph::ModuleGraph;
+use crate::module_graph::ModuleNode;
+use crate::module_tool;
+use crate::module_tool::ModuleToolBinaries;
 use crate::runtime::Runtime;
 use crate::task::Task;
+use crate::task::TaskName;
 use crate::telemetry::Telemetry;
 use crate::types::AbsoluteDirectory;
+use crate::types::AbsoluteFile;
 use crate::types::BuildFile;
+use crate::types::FileKind;
 use crate::types::RelativeDirectory;
+use crate::types::RelativeFile;
 #[cfg(test)]
 use crate::types::Stdout;
 use crate::types::Step;
 use crate::types::WorkspaceRoot;
 use crate::workspace::Workspace;
 use miette::Result as MietteResult;
+use std::collections::HashSet;
 use std::io::Result as IoResult;
 use std::io::Write;
 
@@ -117,6 +127,16 @@ impl Lifecycle {
                 .map_err(|source| SindriError::Log { source })?;
         }
         let compile_step: Step = Step::new("compile");
+        let package_step: Step = Step::new("package");
+        // Node indices targeted by any module's `module_tools` — these build one step deeper
+        // (`package` instead of `compile`), and their produced binaries are registered for every
+        // later module's `module_tools` references to resolve against.
+        let tool_target_indices: HashSet<usize> = module_graph
+            .nodes()
+            .iter()
+            .flat_map(|node: &ModuleNode| node.module().module_tools())
+            .filter_map(|reference: &ModuleToolReference| module_graph.index_of(reference.module()))
+            .collect();
         let workspace_root: &WorkspaceRoot = workspace.workspace_root();
         let absolute_build_directory: AbsoluteDirectory = workspace.absolute_build_directory();
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
@@ -128,8 +148,9 @@ impl Lifecycle {
         // its own, so the context supplied here is a placeholder — its real value (this task's own
         // output directory) is not known until it has run.
         let generate_go_work: Task = GoPlugin::generate_go_work_task(&module_graph, workspace_root);
-        let cache_directory: AbsoluteDirectory =
-            absolute_build_directory.join_directory(&RelativeDirectory::new(".metadata-cache"));
+        let cache_directory: AbsoluteDirectory = absolute_build_directory.join_directory(
+            &RelativeDirectory::new(".metadata-cache/").expect("a literal directory name is always well-formed"),
+        );
         let cache: MetadataCache = MetadataCache::new(cache_directory);
         let bootstrap_context: BuildContext = BuildContext::new(
             workspace_root,
@@ -137,11 +158,17 @@ impl Lifecycle {
             &absolute_build_directory,
             &cache,
         );
+        // One resolution state for the whole compile: every task's script — the standalone
+        // `generate-go-work` and every module's own tasks below — resolves its definition hash and,
+        // once run, its commands against these same two long-lived hubs, so a file shared by more
+        // than one task's script is read from disk at most once per pass for the entire build.
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let (go_work_outcome, go_work_output_directory): (TaskOutcome, AbsoluteDirectory) = run_standalone_task(
             &generate_go_work,
-            &RelativeDirectory::new(""),
+            &RelativeDirectory::new("").expect("the empty directory is always well-formed"),
             &bootstrap_context,
             config,
+            &mut resolution_state,
             runtime,
         )?;
         outcomes.push(go_work_outcome);
@@ -157,22 +184,44 @@ impl Lifecycle {
         // task makes `execute_graph` return early via `?`, so a broken build writes no telemetry: the
         // partial trace is dropped, keeping every telemetry.json a whole-build record.
         let mut module_rebuilt: Vec<ModuleRebuilt> = Vec::with_capacity(module_graph.nodes().len());
-        for node in module_graph.nodes() {
-            let tasks: Vec<(Task, Step)> = GoPlugin::tasks(node.module().artifact_type());
+        let mut module_tool_binaries: ModuleToolBinaries = ModuleToolBinaries::new();
+        for (index, node) in module_graph.nodes().iter().enumerate() {
+            let mut tasks: Vec<(Task, Step)> = GoPlugin::tasks(node.module().artifact_type());
+            // One synthesized task per `module_tools` entry, bound to `generate` so it may write into
+            // this module's own source tree before `compile` runs.
+            for reference in node.module().module_tools() {
+                tasks.push((module_tool::invocation_task(reference), Step::new("generate")));
+            }
+            // A tool-target module builds one step deeper — through `package` — so a task consuming
+            // its binary always sees a fully built, tested tool, even though nothing is bound to
+            // `package` itself for Go: the binary is already a tracked `compile` output.
+            let target_step: &Step = if tool_target_indices.contains(&index) {
+                &package_step
+            } else {
+                &compile_step
+            };
             let graph: TaskGraph = self
-                .build_task_graph(&tasks, &compile_step)
-                .expect("compile is a built-in lifecycle step");
+                .build_task_graph(&tasks, target_step)
+                .expect("compile and package are both built-in lifecycle steps");
             let module_directory: AbsoluteDirectory = workspace_root
                 .to_absolute_directory()
                 .join_directory(node.identity().directory());
             let location: ModuleLocation = ModuleLocation::new(module_directory, node.identity().module_path());
-            // A module must rebuild if any module it depends on rebuilt on this run. Dependency indices
-            // are all smaller than this node's — nodes are stored dependency-first — so their rebuilt
-            // status is already recorded.
+            // A module must rebuild if any module it depends on rebuilt on this run, or if any module
+            // it references via `module_tools` rebuilt — its generated output may now be stale even
+            // though none of its own tracked source changed. Dependency and tool-target indices are
+            // all smaller than this node's — nodes are stored dependency-first and tool-first — so
+            // their rebuilt status is already recorded.
             let dependency_rebuilt: ModuleRebuilt = ModuleRebuilt::new(
                 node.dependencies()
                     .iter()
-                    .any(|&index: &usize| module_rebuilt[index].is_rebuilt()),
+                    .any(|&index: &usize| module_rebuilt[index].is_rebuilt())
+                    || node
+                        .module()
+                        .module_tools()
+                        .iter()
+                        .filter_map(|reference: &ModuleToolReference| module_graph.index_of(reference.module()))
+                        .any(|tool_index: usize| module_rebuilt[tool_index].is_rebuilt()),
             );
             let (module_outcomes, rebuilt): (Vec<TaskOutcome>, ModuleRebuilt) = execute_graph(
                 &graph,
@@ -180,10 +229,45 @@ impl Lifecycle {
                 node.module().parameters(),
                 &context,
                 dependency_rebuilt,
+                &module_tool_binaries,
                 config,
+                &mut resolution_state,
                 runtime,
             )?;
             module_rebuilt.push(rebuilt);
+            if tool_target_indices.contains(&index) {
+                let go_compile_outcome: &TaskOutcome = module_outcomes
+                    .iter()
+                    .find(|outcome: &&TaskOutcome| outcome.task().name() == &TaskName::new("go-compile"))
+                    .expect("every module_tools target is an executable module, which always has a go-compile task");
+                let output_directory: &AbsoluteDirectory = go_compile_outcome.output_directory();
+                for other in module_graph.nodes() {
+                    for reference in other.module().module_tools() {
+                        if reference.module() != node.identity() {
+                            continue;
+                        }
+                        let binary_file: AbsoluteFile = output_directory.join_file(
+                            &RelativeFile::new(reference.binary().to_string())
+                                .expect("a validated binary name is always a well-formed relative file"),
+                        );
+                        let kind: Option<FileKind> =
+                            runtime
+                                .file_kind(binary_file.as_ref())
+                                .map_err(|source| SindriError::Io {
+                                    path: workspace_root.relativize_file(&binary_file).as_ref().to_path_buf(),
+                                    source,
+                                })?;
+                        if kind != Some(FileKind::File) {
+                            return Err(SindriError::ModuleToolBinaryMissing {
+                                module: node.identity().clone(),
+                                binary: reference.binary().clone(),
+                            }
+                            .into());
+                        }
+                        module_tool_binaries.insert(node.identity().clone(), reference.binary().clone(), binary_file);
+                    }
+                }
+            }
             outcomes.extend(module_outcomes);
         }
         let _ = Telemetry::write(&outcomes, &absolute_build_directory, config.build_start(), runtime);
@@ -242,9 +326,17 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirtiness::TaskLayout;
     use crate::executor::Verbosity;
     use crate::file_set::FileSetPattern;
+    use crate::parameter::Parameter;
+    use crate::parameter::ParameterBinding;
     use crate::parameter::ParameterDeclarations;
+    use crate::parameter::ParameterName;
+    use crate::parameter::ParameterState;
+    use crate::parameter::ParameterType;
+    use crate::parameter::ParameterValue;
+    use crate::parameter::PluginName;
     use crate::runtime::DummyRuntime;
     use crate::runtime::DummyRuntimeBuilder;
     use crate::script::Script;
@@ -257,6 +349,7 @@ mod tests {
     use crate::types::Stderr;
     use crate::types::TaskStatus;
     use crate::workspace::Workspace;
+    use std::path::PathBuf;
 
     fn succeeded() -> CommandOutput {
         CommandOutput::new(Stdout::default(), Stderr::default(), TaskStatus::Succeeded)
@@ -624,6 +717,130 @@ mod tests {
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let result: MietteResult<()> = Lifecycle::new().run_compile(&workspace, &config, &runtime);
         assert!(result.is_err(), "a failing build command should fail the compile");
+    }
+
+    /// The `go-compile` output directory a module built with `mode = "debug"` lands in — computed the
+    /// same way [`crate::executor::resolve_task_plan`] does, so a test can pre-register the binary a
+    /// tool module's `go-compile` is expected to have produced, at exactly the path Sindri will look
+    /// for it.
+    fn go_compile_output_directory(module_directory: &str) -> AbsoluteDirectory {
+        let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterType::new("String"),
+        )]);
+        let values: ParameterState = ParameterState::new([(
+            PluginName::new("sindri-go"),
+            ParameterName::new("mode"),
+            ParameterValue::new("\"debug\""),
+        )]);
+        let binding: ParameterBinding = ParameterBinding::resolve(&declared, &values).unwrap();
+        TaskLayout::new(
+            &AbsoluteDirectory::new(PathBuf::from("/workspace/.target")),
+            &RelativeDirectory::new_unchecked(module_directory),
+            &TaskName::new("go-compile"),
+            binding.binding_hash(),
+        )
+        .output_directory()
+        .clone()
+    }
+
+    #[test]
+    fn run_compile_orders_a_module_tools_task_after_its_tool_module() {
+        // `app` declares `module_tools = [ "//tools/codegen:codegen" ]`. The tool module must be
+        // fully built (including its go-compile step, which produces `codegen`) before `app`'s
+        // synthesized module-tool task runs the binary.
+        let tool_output_directory: AbsoluteDirectory = go_compile_output_directory("tools/codegen/");
+        let binary_file: AbsoluteFile = tool_output_directory.join_file(&RelativeFile::new("codegen").unwrap());
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//tools/codegen:codegen" ],
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .file(
+                "/workspace/tools/codegen/sindri.build",
+                r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .file(binary_file.to_string(), "")
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .command("go test", succeeded())
+            .command(binary_file.to_string().as_str(), succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap();
+        // The tool module is loaded (and thus built) before the module that references it.
+        assert_eq!(
+            runtime.logged(),
+            vec!["Module loaded: codegen".to_string(), "Module loaded: app".to_string()]
+        );
+        // The tool module built through `package` — a go-compile run record was persisted under its
+        // own state subtree.
+        assert!(
+            runtime
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-compile")),
+            "the tool module should have built and persisted a go-compile run record"
+        );
+        // The synthesized module-tool task ran the resolved binary path directly.
+        assert!(
+            runtime
+                .written_files()
+                .iter()
+                .any(|(path, _)| path.to_string_lossy().contains("module-tool-codegen")),
+            "the synthesized module-tool task should have run and persisted a run record"
+        );
+    }
+
+    #[test]
+    fn run_compile_fails_when_the_tool_binary_is_missing_after_the_module_builds() {
+        // The tool module builds successfully but never produces a file named `codegen` in its
+        // go-compile output — the binary Sindri expects after "building up to and including package".
+        let runtime: DummyRuntime = DummyRuntime::builder()
+            .file(
+                "/workspace/sindri.workspace",
+                r#"{ name = "test", sindri_version = "0.1.0" }"#,
+            )
+            .file(
+                "/workspace/sindri.build",
+                r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+                     module_tools = [ "//tools/codegen:codegen" ],
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .file(
+                "/workspace/tools/codegen/sindri.build",
+                r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0",
+                     parameters = { "sindri-go" = { mode = "debug" } } }"#,
+            )
+            .command("rm -f go.work", succeeded())
+            .command("go work init", succeeded())
+            .command("gofmt -l .", succeeded())
+            .command("go build", succeeded())
+            .command("go test", succeeded())
+            .current_directory("/workspace")
+            .build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
+        let error: miette::Report = Lifecycle::new().run_compile(&workspace, &config, &runtime).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SindriError>(),
+                Some(SindriError::ModuleToolBinaryMissing { .. })
+            ),
+            "expected ModuleToolBinaryMissing, got {error:?}"
+        );
     }
 
     #[test]

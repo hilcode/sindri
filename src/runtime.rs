@@ -1,13 +1,15 @@
 use crate::file_set::CompiledFileSetPattern;
 use crate::file_set::FileSetPattern;
 use crate::local_time_with_elapsed::LocalTimeWithElapsed;
+use crate::script::Command;
+use crate::types::AbsoluteDirectory;
 use crate::types::AbsoluteFile;
 use crate::types::BuildStart;
-use crate::types::Command;
 use crate::types::CommandOutput;
 use crate::types::DirEntry;
 use crate::types::FileKind;
 use crate::types::FileMetadata;
+use crate::types::WorkspaceRoot;
 use ignore::DirEntry as WalkEntry;
 use ignore::WalkBuilder;
 use std::env::current_dir;
@@ -66,7 +68,7 @@ pub trait FileSystem {
 /// [`Bootstrap::into_runtime`].
 pub trait Runtime: FileSystem + Sync {
     fn now(&self) -> Instant;
-    fn run_command(&self, command: &Command, working_directory: &Path) -> IoResult<CommandOutput>;
+    fn run_command(&self, command: &Command, workspace_root: &WorkspaceRoot) -> IoResult<CommandOutput>;
     fn log(&self, message: &str) -> IoResult<()>;
     fn output(&self) -> impl Write + '_;
 }
@@ -223,7 +225,10 @@ impl Runtime for SystemRuntime {
         Instant::now()
     }
 
-    fn run_command(&self, command: &Command, working_directory: &Path) -> IoResult<CommandOutput> {
+    fn run_command(&self, command: &Command, workspace_root: &WorkspaceRoot) -> IoResult<CommandOutput> {
+        let working_directory: AbsoluteDirectory = workspace_root
+            .to_absolute_directory()
+            .join_directory(command.working_directory());
         let output: Output = ProcessCommand::new(command.program())
             .args(command.arguments().iter().map(|argument| argument.as_str()))
             .envs(
@@ -232,7 +237,7 @@ impl Runtime for SystemRuntime {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str())),
             )
-            .current_dir(working_directory)
+            .current_dir(working_directory.as_ref())
             .output()?;
         Ok(CommandOutput::new(
             output.stdout.into(),
@@ -375,8 +380,9 @@ impl DummyRuntime {
             .collect()
     }
 
-    /// How many times [`FileSystem::read`] was called for `path`. Lets a test prove a caching layer
-    /// actually avoids redundant reads, rather than merely returning the right answer.
+    /// How many times [`FileSystem::read`] or [`FileSystem::read_to_string`] was called for `path`.
+    /// Lets a test prove a caching layer actually avoids redundant reads, rather than merely
+    /// returning the right answer.
     pub fn read_count(&self, path: impl AsRef<Path>) -> usize {
         self.reads
             .lock()
@@ -424,6 +430,7 @@ impl FileSystem for DummyRuntime {
     }
 
     fn read_to_string(&self, path: &Path) -> IoResult<String> {
+        self.reads.lock().unwrap().push(path.to_path_buf());
         match self.files.get(path) {
             Some(file) => {
                 String::from_utf8(file.contents.clone()).map_err(|error| IoError::new(ErrorKind::InvalidData, error))
@@ -536,7 +543,7 @@ impl Runtime for DummyRuntime {
         self.now
     }
 
-    fn run_command(&self, command: &Command, _working_directory: &Path) -> IoResult<CommandOutput> {
+    fn run_command(&self, command: &Command, _workspace_root: &WorkspaceRoot) -> IoResult<CommandOutput> {
         let command_line: String = command.to_string();
         match self
             .commands
@@ -760,6 +767,16 @@ mod tests {
     }
 
     #[test]
+    fn read_to_string_is_reflected_in_read_count() {
+        let runtime: DummyRuntime = DummyRuntime::builder().file("/file.ncl", "contents").build();
+        assert_eq!(runtime.read_count("/file.ncl"), 0);
+        runtime.read_to_string(Path::new("/file.ncl")).unwrap();
+        assert_eq!(runtime.read_count("/file.ncl"), 1);
+        runtime.read_to_string(Path::new("/file.ncl")).unwrap();
+        assert_eq!(runtime.read_count("/file.ncl"), 2);
+    }
+
+    #[test]
     fn read_directory_lists_immediate_children_with_their_kinds() {
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file("/workspace/sindri.build", "")
@@ -796,14 +813,15 @@ mod tests {
         let stubbed: CommandOutput =
             CommandOutput::new(Stdout::new(b"ok".to_vec()), Stderr::default(), TaskStatus::Succeeded);
         let runtime: DummyRuntime = DummyRuntime::builder().command("go build", stubbed).build();
+        let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
         let output: CommandOutput = runtime
-            .run_command(&Command::new("go", ["build"]), Path::new("/workspace"))
+            .run_command(&Command::new("go", ["build"]), &workspace_root)
             .unwrap();
         assert_eq!(output.stdout().as_bytes(), b"ok");
         assert_eq!(output.status(), TaskStatus::Succeeded);
         assert_eq!(
             runtime
-                .run_command(&Command::new("go", ["test"]), Path::new("/workspace"))
+                .run_command(&Command::new("go", ["test"]), &workspace_root)
                 .unwrap_err()
                 .kind(),
             ErrorKind::NotFound

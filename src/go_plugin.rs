@@ -17,8 +17,6 @@ use crate::types::AbsoluteDirectory;
 use crate::types::Language;
 use crate::types::Step;
 use crate::types::WorkspaceRoot;
-use std::borrow::Cow;
-use std::path::PathBuf;
 
 /// A platform-independent superset of every file type the Go toolchain might compile — all Go and
 /// C-family sources cgo can pull in, plus assembly and the module manifests. Over-inclusion only
@@ -105,21 +103,19 @@ impl GoPlugin {
     /// is workspace-wide and runs once, before every module's tasks, via
     /// [`crate::executor::run_standalone_task`].
     pub fn generate_go_work_task(graph: &ModuleGraph, workspace_root: &WorkspaceRoot) -> Task {
-        let module_directories: Vec<AbsoluteDirectory> = graph
+        let module_directories: Vec<String> = graph
             .nodes()
             .iter()
             .filter(|node: &&ModuleNode| -> bool { matches!(node.module().language(), Language::Go) })
-            .map(|node: &ModuleNode| -> AbsoluteDirectory {
+            .map(|node: &ModuleNode| -> String {
                 let directory: AbsoluteDirectory = workspace_root
                     .to_absolute_directory()
                     .join_directory(node.identity().directory());
-                // The workspace-root module resolves with a trailing separator, which `go.work` does
-                // not match against a `use` entry — strip it so every directory is written uniformly.
-                let text: Cow<'_, str> = directory.as_ref().to_string_lossy();
-                match text.strip_suffix('/') {
-                    Some(stripped) => AbsoluteDirectory::new(PathBuf::from(stripped)),
-                    None => directory,
-                }
+                // Every `AbsoluteDirectory` carries a trailing separator by construction (Sindri's own
+                // directory convention), but `go work init`'s generated `use` entry does not match
+                // against one — strip it here, in the string domain, since the typed `AbsoluteDirectory`
+                // itself can no longer represent the slash-free form `go` needs.
+                directory.to_string().trim_end_matches('/').to_string()
             })
             .collect();
         Task::new(
@@ -137,6 +133,8 @@ impl GoPlugin {
 mod tests {
     use super::*;
     use crate::module_graph::ModuleGraph;
+    use crate::module_tool::ModuleToolBinaries;
+    use crate::nickel_import::ScriptResolutionState;
     use crate::parameter::ParameterName;
     use crate::parameter::ParameterState;
     use crate::parameter::ParameterValue;
@@ -193,12 +191,15 @@ mod tests {
     fn resolve_with(task: &Task, parameter_state: &ParameterState) -> Vec<Command> {
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let workspace_root: WorkspaceRoot = WorkspaceRoot::new(AbsoluteDirectory::new(PathBuf::from("/workspace")));
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         task.resolve(
             parameter_state,
-            &RelativeDirectory::new(""),
+            &RelativeDirectory::new_unchecked(""),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out")),
             &workspace_root,
+            &ModuleToolBinaries::new(),
+            &mut resolution_state,
             &runtime,
         )
         .unwrap()
@@ -327,7 +328,7 @@ mod tests {
             WorkingDirectory::derive(&workspace_root().to_absolute_directory(), &workspace_root());
         let config: WorkspaceConfig = WorkspaceConfig::load(&workspace_root(), &runtime).unwrap();
         let workspace: Workspace = Workspace::new(workspace_root(), working_directory, config);
-        let entry: BuildFile = BuildFile::new(RelativeFile::new("sindri.build"));
+        let entry: BuildFile = BuildFile::new(RelativeFile::new_unchecked("sindri.build"));
         ModuleGraph::load(&entry, &workspace, &runtime).unwrap()
     }
 
@@ -345,13 +346,16 @@ mod tests {
     fn generate_go_work_task_inits_a_workspace_covering_every_go_module() {
         let task: Task = GoPlugin::generate_go_work_task(&module_graph_with_dependency(), &workspace_root());
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = task
             .resolve(
                 &ParameterState::default(),
-                &RelativeDirectory::new(""),
+                &RelativeDirectory::new_unchecked(""),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding")),
                 &workspace_root(),
+                &ModuleToolBinaries::new(),
+                &mut resolution_state,
                 &runtime,
             )
             .unwrap();

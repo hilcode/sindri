@@ -122,6 +122,42 @@ fn multi_module_dir() -> TempDir {
     directory
 }
 
+/// A workspace whose entry `app` executable declares `module_tools = [ "//tools/codegen:codegen" ]`.
+/// The `codegen` binary, built from `tools/codegen/`, writes `generated_greeting.go` — defining
+/// `generatedGreeting`, which `app`'s `main.go` calls — into `app`'s own directory when Sindri runs it
+/// during `generate`, before `app`'s own `compile` step needs it.
+fn codegen_dir() -> TempDir {
+    let directory: TempDir = workspace_dir();
+    fs::write(
+        directory.path().join("sindri.build"),
+        r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+             module_tools = [ "//tools/codegen:codegen" ],
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(directory.path().join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
+    fs::write(
+        directory.path().join("main.go"),
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(generatedGreeting())\n}\n",
+    )
+    .unwrap();
+    let codegen: PathBuf = directory.path().join("tools").join("codegen");
+    fs::create_dir_all(&codegen).unwrap();
+    fs::write(
+        codegen.join("sindri.build"),
+        r#"{ name = "codegen", language = "go", type = "executable", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(codegen.join("go.mod"), "module example.com/codegen\n\ngo 1.21\n").unwrap();
+    fs::write(
+        codegen.join("main.go"),
+        "package main\n\nimport \"os\"\n\nconst generated = \"package main\\n\\nfunc generatedGreeting() string { return \\\"Hello from codegen!\\\" }\\n\"\n\nfunc main() {\n\tif err := os.WriteFile(\"generated_greeting.go\", []byte(generated), 0o644); err != nil {\n\t\tpanic(err)\n\t}\n}\n",
+    )
+    .unwrap();
+    directory
+}
+
 /// Like [`multi_module_dir`], but with the executable in its own `app/` subdirectory, disjoint from the
 /// library's `lib/` directory, so neither module's source glob sweeps the other. This isolates the
 /// dependency edge: only edge propagation — not input-glob overlap — can tie `app`'s freshness to the
@@ -325,6 +361,41 @@ fn compile_module_with_local_go_library_dependency_builds() {
     assert!(
         go_work.contains("lib/greeting"),
         "the generated go.work should list the local library, got:\n{go_work}"
+    );
+}
+
+#[test]
+fn compile_module_with_module_tools_generates_and_compiles_the_tool_output() {
+    let directory: TempDir = codegen_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "expected exit 0 building a module with module_tools; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated: String = fs::read_to_string(directory.path().join("generated_greeting.go"))
+        .expect("the codegen binary should have written generated_greeting.go into app's directory");
+    assert!(
+        generated.contains("Hello from codegen!"),
+        "unexpected generated file content:\n{generated}"
+    );
+    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    let binary_path: PathBuf = fs::read_dir(&output_directory)
+        .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
+        .next()
+        .expect("app's compile should leave exactly one binary")
+        .unwrap()
+        .path();
+    let run: Output = Command::new(&binary_path).output().unwrap();
+    assert!(
+        run.status.success(),
+        "the compiled binary should run successfully; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "Hello from codegen!",
+        "the compiled binary should print the codegen-generated greeting"
     );
 }
 

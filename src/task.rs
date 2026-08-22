@@ -2,6 +2,10 @@ use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::file_set::FileSet;
 use crate::file_set::FileSetPattern;
+use crate::module::BinaryName;
+use crate::module::ModuleToolReference;
+use crate::module_tool::ModuleToolBinaries;
+use crate::nickel_import::ScriptResolutionState;
 use crate::nickel_import::TransitiveSource;
 use crate::nickel_import::resolve_transitive_source;
 use crate::parameter::ParameterBinding;
@@ -20,6 +24,7 @@ use blake3::Hasher;
 use serde::Deserialize;
 use serde::Serialize;
 use smol_str::SmolStr;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
@@ -113,6 +118,7 @@ pub struct Task {
     managed_input: ManagedTaskInput,
     output: TaskOutput,
     declared_parameters: ParameterDeclarations,
+    module_tools: Vec<ModuleToolReference>,
 }
 
 impl Task {
@@ -131,11 +137,23 @@ impl Task {
             managed_input,
             output,
             declared_parameters,
+            module_tools: Vec::new(),
         }
+    }
+
+    /// Attach the workspace-built tools this task's script may reference via
+    /// `inputs."module-tools"` — see [`crate::module_tool::ModuleToolBinaries`].
+    pub fn with_module_tools(mut self, module_tools: impl IntoIterator<Item = ModuleToolReference>) -> Task {
+        self.module_tools = module_tools.into_iter().collect();
+        self
     }
 
     pub fn name(&self) -> &TaskName {
         &self.name
+    }
+
+    pub fn module_tools(&self) -> &[ModuleToolReference] {
+        &self.module_tools
     }
 
     pub fn script(&self) -> &Script {
@@ -160,11 +178,16 @@ impl Task {
 
     /// Resolve this task for a concrete build: bind `parameter_state` against the task's declared
     /// parameters, match its declared input against the module directory and its managed input
-    /// against `managed_input_base` — their union is the task's effective input — and apply the
-    /// script to the bound parameters and effective input to yield the ordered commands to run.
-    /// `managed_input_base` is distinct from `module_directory` because a managed input need not live
-    /// in the module at all: `go-compile`'s managed `go.work`, for instance, lives in the
-    /// `generate-go-work` task's own output directory, shared workspace-wide.
+    /// against `managed_input_base` — their union is the task's effective input — resolve this
+    /// task's own `module_tools` references against `module_tool_binaries`, and apply the script to
+    /// all of the above to yield the ordered commands to run. `managed_input_base` is distinct from
+    /// `module_directory` because a managed input need not live in the module at all: `go-compile`'s
+    /// managed `go.work`, for instance, lives in the `generate-go-work` task's own output directory,
+    /// shared workspace-wide.
+    // Every parameter here is a distinct, non-swappable type (no two share a type, so a positional
+    // swap is already a compile error) — the usual reason to bundle rather than allow this lint does
+    // not apply.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         &self,
         parameter_state: &ParameterState,
@@ -172,6 +195,8 @@ impl Task {
         managed_input_base: &AbsoluteDirectory,
         output_directory: &AbsoluteDirectory,
         workspace_root: &WorkspaceRoot,
+        module_tool_binaries: &ModuleToolBinaries,
+        resolution_state: &mut ScriptResolutionState,
         file_system: &impl FileSystem,
     ) -> SindriResult<Vec<Command>> {
         let binding: ParameterBinding = ParameterBinding::resolve(&self.declared_parameters, parameter_state)?;
@@ -190,6 +215,16 @@ impl Task {
             file_system,
         )?;
         let effective_input: FileSet = declared_files.union(&managed_files);
+        let module_tool_bindings: BTreeMap<BinaryName, AbsoluteFile> = self
+            .module_tools
+            .iter()
+            .map(|reference: &ModuleToolReference| -> (BinaryName, AbsoluteFile) {
+                let file: &AbsoluteFile = module_tool_binaries
+                    .resolve(reference)
+                    .expect("a module_tools target is registered before any module that could reference it runs");
+                (reference.binary().clone(), file.clone())
+            })
+            .collect();
         let inputs: ScriptInputs = ScriptInputs::new(
             &binding,
             &effective_input,
@@ -197,9 +232,14 @@ impl Task {
             managed_input_base,
             workspace_root,
             module_directory,
+            &module_tool_bindings,
         );
-        self.script
-            .evaluate(&inputs, &self.script_path(&module_directory_absolute), file_system)
+        self.script.evaluate(
+            &inputs,
+            &self.script_path(&module_directory_absolute),
+            resolution_state,
+            file_system,
+        )
     }
 
     /// Where this task's script is addressed for the purpose of resolving its own relative
@@ -207,7 +247,8 @@ impl Task {
     /// embedded Nickel source rather than a real file on disk. Shared by [`Task::resolve`] and
     /// [`Task::definition_hash`] so both anchor the same script's imports identically.
     fn script_path(&self, module_directory_absolute: &AbsoluteDirectory) -> AbsoluteFile {
-        module_directory_absolute.join_file(&RelativeFile::new(format!("{}.ncl", self.name)))
+        module_directory_absolute
+            .join_file(&RelativeFile::new(format!("{}.ncl", self.name)).expect("a task name is always well-formed"))
     }
 
     /// This task's definition hash (see [`DefinitionHash`]), computed against the version of Sindri
@@ -220,11 +261,13 @@ impl Task {
         &self,
         module_directory: &RelativeDirectory,
         workspace_root: &WorkspaceRoot,
+        resolution_state: &mut ScriptResolutionState,
         file_system: &impl FileSystem,
     ) -> SindriResult<DefinitionHash> {
         self.definition_hash_with_salt(
             module_directory,
             workspace_root,
+            resolution_state,
             file_system,
             SINDRI_VERSION,
             NICKEL_VERSION,
@@ -238,6 +281,7 @@ impl Task {
         &self,
         module_directory: &RelativeDirectory,
         workspace_root: &WorkspaceRoot,
+        resolution_state: &mut ScriptResolutionState,
         file_system: &impl FileSystem,
         sindri_version: &str,
         nickel_version: &str,
@@ -245,12 +289,17 @@ impl Task {
         let module_directory_absolute: AbsoluteDirectory =
             workspace_root.to_absolute_directory().join_directory(module_directory);
         let script_path: AbsoluteFile = self.script_path(&module_directory_absolute);
-        let transitive_source: TransitiveSource =
-            resolve_transitive_source(self.script.source(), &script_path, workspace_root, file_system)?;
+        let transitive_source: TransitiveSource = resolve_transitive_source(
+            self.script.source(),
+            &script_path,
+            workspace_root,
+            resolution_state,
+            file_system,
+        )?;
         let mut hasher: Hasher = Hasher::new();
         update_field(&mut hasher, &self.name.to_string());
         for (path, content) in transitive_source.files() {
-            update_field(&mut hasher, &path.as_ref().to_string_lossy());
+            update_field(&mut hasher, &path.to_string());
             update_field(&mut hasher, content);
         }
         for pattern_hash in [
@@ -316,7 +365,7 @@ mod tests {
     const MODULE: &str = "libs/common";
 
     fn module_directory() -> RelativeDirectory {
-        RelativeDirectory::new(MODULE)
+        RelativeDirectory::new_unchecked(MODULE)
     }
 
     fn workspace_root() -> WorkspaceRoot {
@@ -329,6 +378,10 @@ mod tests {
 
     fn managed_input_base() -> AbsoluteDirectory {
         AbsoluteDirectory::new(PathBuf::from("/workspace/.target/generate-go-work/binding"))
+    }
+
+    fn module_tool_binaries() -> ModuleToolBinaries {
+        ModuleToolBinaries::new()
     }
 
     #[test]
@@ -358,6 +411,22 @@ mod tests {
         assert_eq!(task.managed_input().pattern().globs(), managed_input.pattern().globs());
         assert_eq!(task.output().pattern().globs(), output.pattern().globs());
         assert!(!task.declared_parameters().is_empty());
+        assert!(task.module_tools().is_empty());
+    }
+
+    #[test]
+    fn with_module_tools_sets_and_exposes_the_list() {
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen:codegen").unwrap();
+        let task: Task = Task::new(
+            TaskName::new("module-tool-codegen"),
+            Script::new("fun inputs => [ { program = inputs.\"module-tools\".\"codegen\" } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        )
+        .with_module_tools([reference.clone()]);
+        assert_eq!(task.module_tools(), &[reference]);
     }
 
     #[test]
@@ -371,12 +440,15 @@ mod tests {
             TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
             ParameterDeclarations::default(),
         );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
+            &mut resolution_state,
             &runtime,
         );
         assert!(matches!(result, Err(SindriError::Io { .. })));
@@ -393,12 +465,15 @@ mod tests {
             TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
             ParameterDeclarations::default(),
         );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
+            &mut resolution_state,
             &runtime,
         );
         assert!(matches!(result, Err(SindriError::Io { .. })));
@@ -427,6 +502,7 @@ mod tests {
             TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
             ParameterDeclarations::default(),
         );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = task
             .resolve(
                 &ParameterState::default(),
@@ -434,6 +510,8 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
+                &mut resolution_state,
                 &runtime,
             )
             .unwrap();
@@ -468,6 +546,7 @@ mod tests {
             ParameterName::new("mode"),
             ParameterValue::new("\"release\""),
         )]);
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = task
             .resolve(
                 &values,
@@ -475,6 +554,8 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
+                &mut resolution_state,
                 &runtime,
             )
             .unwrap();
@@ -484,6 +565,43 @@ mod tests {
             commands[0].arguments(),
             &[SmolStr::new("build"), SmolStr::new("release")]
         );
+    }
+
+    #[test]
+    fn resolution_resolves_a_module_tools_reference_to_its_absolute_path() {
+        let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let reference: ModuleToolReference = ModuleToolReference::parse("//tools/codegen:codegen").unwrap();
+        let task: Task = Task::new(
+            TaskName::new("module-tool-codegen"),
+            Script::new("fun inputs => [ { program = inputs.\"module-tools\".\"codegen\" } ]"),
+            DeclaredTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ManagedTaskInput::new(FileSetPattern::new(Vec::<&str>::new())),
+            TaskOutput::new(FileSetPattern::new(Vec::<&str>::new())),
+            ParameterDeclarations::default(),
+        )
+        .with_module_tools([reference.clone()]);
+        let binary_file: AbsoluteFile =
+            AbsoluteFile::new(PathBuf::from("/workspace/.target/tools/codegen/binding/codegen"));
+        let mut binaries: ModuleToolBinaries = ModuleToolBinaries::new();
+        binaries.insert(
+            reference.module().clone(),
+            reference.binary().clone(),
+            binary_file.clone(),
+        );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
+        let commands: Vec<Command> = task
+            .resolve(
+                &ParameterState::default(),
+                &module_directory(),
+                &managed_input_base(),
+                &output_directory(),
+                &workspace_root(),
+                &binaries,
+                &mut resolution_state,
+                &runtime,
+            )
+            .unwrap();
+        assert_eq!(commands[0].program(), binary_file.to_string());
     }
 
     #[test]
@@ -501,12 +619,15 @@ mod tests {
                 ParameterType::new("String"),
             )]),
         );
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let result: SindriResult<Vec<Command>> = task.resolve(
             &ParameterState::default(),
             &module_directory(),
             &managed_input_base(),
             &output_directory(),
             &workspace_root(),
+            &module_tool_binaries(),
+            &mut resolution_state,
             &runtime,
         );
         assert!(matches!(result, Err(SindriError::ParameterMissing { .. })));
@@ -545,6 +666,7 @@ mod tests {
             ParameterName::new("mode"),
             ParameterValue::new("\"release\""),
         )]);
+        let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
         let commands: Vec<Command> = task
             .resolve(
                 &values,
@@ -552,6 +674,8 @@ mod tests {
                 &managed_input_base(),
                 &output_directory(),
                 &workspace_root(),
+                &module_tool_binaries(),
+                &mut resolution_state,
                 &runtime,
             )
             .unwrap();
@@ -561,13 +685,21 @@ mod tests {
     #[test]
     fn editing_an_imported_script_source_changes_the_definition_hash() {
         let task: Task = go_compile_task();
+        let mut before_state: ScriptResolutionState = ScriptResolutionState::new();
         let before: DefinitionHash = task
-            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .definition_hash(
+                &module_directory(),
+                &workspace_root(),
+                &mut before_state,
+                &runtime_with_helper("go"),
+            )
             .unwrap();
+        let mut after_state: ScriptResolutionState = ScriptResolutionState::new();
         let after: DefinitionHash = task
             .definition_hash(
                 &module_directory(),
                 &workspace_root(),
+                &mut after_state,
                 &runtime_with_helper("go-edited"),
             )
             .unwrap();
@@ -577,11 +709,23 @@ mod tests {
     #[test]
     fn the_same_task_and_source_reproduce_the_same_definition_hash() {
         let task: Task = go_compile_task();
+        let mut first_state: ScriptResolutionState = ScriptResolutionState::new();
         let first: DefinitionHash = task
-            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .definition_hash(
+                &module_directory(),
+                &workspace_root(),
+                &mut first_state,
+                &runtime_with_helper("go"),
+            )
             .unwrap();
+        let mut second_state: ScriptResolutionState = ScriptResolutionState::new();
         let second: DefinitionHash = task
-            .definition_hash(&module_directory(), &workspace_root(), &runtime_with_helper("go"))
+            .definition_hash(
+                &module_directory(),
+                &workspace_root(),
+                &mut second_state,
+                &runtime_with_helper("go"),
+            )
             .unwrap();
         assert_eq!(first, second);
     }
@@ -590,14 +734,38 @@ mod tests {
     fn a_version_salt_bump_changes_every_definition_hash() {
         let task: Task = go_compile_task();
         let runtime: DummyRuntime = runtime_with_helper("go");
+        let mut baseline_state: ScriptResolutionState = ScriptResolutionState::new();
         let before: DefinitionHash = task
-            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.1.0", "0.17.0")
+            .definition_hash_with_salt(
+                &module_directory(),
+                &workspace_root(),
+                &mut baseline_state,
+                &runtime,
+                "0.1.0",
+                "0.17.0",
+            )
             .unwrap();
+        let mut sindri_bumped_state: ScriptResolutionState = ScriptResolutionState::new();
         let sindri_bumped: DefinitionHash = task
-            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.2.0", "0.17.0")
+            .definition_hash_with_salt(
+                &module_directory(),
+                &workspace_root(),
+                &mut sindri_bumped_state,
+                &runtime,
+                "0.2.0",
+                "0.17.0",
+            )
             .unwrap();
+        let mut nickel_bumped_state: ScriptResolutionState = ScriptResolutionState::new();
         let nickel_bumped: DefinitionHash = task
-            .definition_hash_with_salt(&module_directory(), &workspace_root(), &runtime, "0.1.0", "0.18.0")
+            .definition_hash_with_salt(
+                &module_directory(),
+                &workspace_root(),
+                &mut nickel_bumped_state,
+                &runtime,
+                "0.1.0",
+                "0.18.0",
+            )
             .unwrap();
         assert_ne!(before, sindri_bumped);
         assert_ne!(before, nickel_bumped);
@@ -623,8 +791,9 @@ mod tests {
             )]),
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
+        let mut before_state: ScriptResolutionState = ScriptResolutionState::new();
         let before: DefinitionHash = task
-            .definition_hash(&module_directory(), &workspace_root(), &runtime)
+            .definition_hash(&module_directory(), &workspace_root(), &mut before_state, &runtime)
             .unwrap();
         for mode in ["debug", "release"] {
             let values: ParameterState = ParameterState::new([(
@@ -632,6 +801,7 @@ mod tests {
                 ParameterName::new("mode"),
                 ParameterValue::new(format!("\"{mode}\"")),
             )]);
+            let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
             let commands: Vec<Command> = task
                 .resolve(
                     &values,
@@ -639,13 +809,16 @@ mod tests {
                     &managed_input_base(),
                     &output_directory(),
                     &workspace_root(),
+                    &module_tool_binaries(),
+                    &mut resolution_state,
                     &runtime,
                 )
                 .unwrap();
             assert_eq!(commands[0].program(), "go");
         }
+        let mut after_state: ScriptResolutionState = ScriptResolutionState::new();
         let after: DefinitionHash = task
-            .definition_hash(&module_directory(), &workspace_root(), &runtime)
+            .definition_hash(&module_directory(), &workspace_root(), &mut after_state, &runtime)
             .unwrap();
         assert_eq!(before, after);
     }
