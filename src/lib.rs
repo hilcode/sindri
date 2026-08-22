@@ -14,6 +14,7 @@ pub mod module_tool;
 pub mod nickel_eval;
 pub mod nickel_import;
 pub mod parameter;
+pub mod plugin;
 pub mod runtime;
 pub mod script;
 pub mod task;

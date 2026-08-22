@@ -65,14 +65,19 @@ the way a multi-plugin world needs.
 
 ### 3a — Plugin type surface
 
-- [ ] A `Plugin` struct (name: reuse the existing `PluginName`; tasks bound
-  to steps, mirroring what `Lifecycle` is to `Step`).
+- [x] A `Plugin` struct (name: reuse the existing `PluginName`; tasks bound
+  to steps, mirroring what `Lifecycle` is to `Step`). Added in
+  `src/plugin.rs`: `name: PluginName`, `tasks: Vec<(Task, Step)>`, with
+  `name()`/`tasks()` accessors — construction and loading are out of scope
+  here, added in 3b.
 - [ ] Decide the manifest format — JSON shape for task/step/glob/parameter
   structure, left open here — with script bodies as separate `.ncl` files
   referenced by relative path within the plugin directory. A real on-disk
   plugin file's own path becomes its `script_path` directly; no synthetic-
   location machinery is needed the way embedded/inline sources need one
-  today (`Task::script_path`, `task.rs`).
+  today (`Task::script_path`, `task.rs`). Deferred to 3b, alongside
+  `Plugins::load` itself, which is what actually needs a concrete shape to
+  parse into.
 
 ### 3b — `.sindri/plugins/` bootstrap + checksum-verified load
 
