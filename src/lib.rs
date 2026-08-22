@@ -1,3 +1,4 @@
+mod checksums;
 pub mod cli;
 pub mod dirtiness;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod nickel_eval;
 pub mod nickel_import;
 pub mod parameter;
 pub mod plugin;
+pub mod plugins;
 pub mod runtime;
 pub mod script;
 pub mod task;

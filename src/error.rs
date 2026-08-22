@@ -155,6 +155,13 @@ pub enum SindriError {
         first: LifecycleName,
         second: LifecycleName,
     },
+
+    #[error("`{}` doesn't match what Sindri shipped", path.display())]
+    #[diagnostic(
+        help("editing plugin files isn't supported yet — delete it (or `.sindri/plugins/`) to regenerate the default"),
+        code(sindri::plugin::modified)
+    )]
+    PluginModified { path: PathBuf },
 }
 
 #[cfg(test)]
@@ -245,6 +252,9 @@ mod tests {
             step: Step::new("compile"),
             first: LifecycleName::new("default"),
             second: LifecycleName::new("other"),
+        });
+        assert_has_help_and_code(&SindriError::PluginModified {
+            path: PathBuf::from(".sindri/plugins/go/manifest.json"),
         });
     }
 }

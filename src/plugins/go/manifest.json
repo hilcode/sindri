@@ -1,0 +1,47 @@
+{
+  "tasks": [
+    {
+      "name": "go-format",
+      "step": "format",
+      "script": "scripts/go-format.ncl",
+      "declared_input": ["**/*.go"]
+    },
+    {
+      "name": "go-compile",
+      "step": "compile",
+      "script": "scripts/go-compile.ncl",
+      "declared_input": ["**/*.{go,c,h,cc,cpp,cxx,hh,hpp,hxx,m,s,S}", "go.mod", "go.sum"],
+      "managed_input": ["go.work"],
+      "output": ["**/*"],
+      "parameters": [
+        {
+          "plugin": "sindri-go",
+          "name": "mode",
+          "type": "std.contract.from_predicate (fun value => value == \"debug\" || value == \"release\")"
+        }
+      ]
+    },
+    {
+      "name": "go-package",
+      "step": "package",
+      "script": "scripts/go-package.ncl",
+      "declared_input": ["**/*.{go,c,h,cc,cpp,cxx,hh,hpp,hxx,m,s,S}", "go.mod", "go.sum"],
+      "managed_input": ["go.work"],
+      "output": ["**/*"],
+      "parameters": [
+        {
+          "plugin": "sindri-go",
+          "name": "mode",
+          "type": "std.contract.from_predicate (fun value => value == \"debug\" || value == \"release\")"
+        }
+      ]
+    },
+    {
+      "name": "go-test",
+      "step": "test",
+      "script": "scripts/go-test.ncl",
+      "declared_input": ["**/*.{go,c,h,cc,cpp,cxx,hh,hpp,hxx,m,s,S}", "go.mod", "go.sum"],
+      "managed_input": ["go.work"]
+    }
+  ]
+}

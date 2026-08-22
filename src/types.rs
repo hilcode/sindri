@@ -723,6 +723,19 @@ impl WorkspaceRoot {
             .expect("path was resolved against this workspace root, so it lies within it")
     }
 
+    /// An absolute file's path relative to this root, as an owned [`PathBuf`] — the form a
+    /// path-bearing error variant carries, without the caller needing to go through
+    /// [`RelativeFile`]'s `AsRef<Path>` itself.
+    pub fn relative_path_buf(&self, absolute: &AbsoluteFile) -> PathBuf {
+        self.relative_path(absolute.as_ref())
+    }
+
+    /// An absolute directory's path relative to this root, as an owned [`PathBuf`] — the
+    /// directory counterpart to [`WorkspaceRoot::relative_path_buf`].
+    pub fn relative_directory_path_buf(&self, absolute: &AbsoluteDirectory) -> PathBuf {
+        self.relative_path(absolute.as_ref())
+    }
+
     fn relative_path(&self, absolute: &Path) -> PathBuf {
         absolute
             .strip_prefix(self.0.as_ref())

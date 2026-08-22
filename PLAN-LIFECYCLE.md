@@ -81,11 +81,19 @@ the way a multi-plugin world needs.
 
 ### 3b — `.sindri/plugins/` bootstrap + checksum-verified load
 
-- [ ] New `src/plugins.rs`, generalizing `KNOWN_LIFECYCLES`/
+- [x] New `src/plugins.rs`, generalizing `KNOWN_LIFECYCLES`/
   `Lifecycles::load`'s exact shape from "one file per known thing" to "a
   small fixed set of files per known plugin" (a manifest plus each of its
-  script files).
-- [ ] `Plugins::load(workspace_root, file_system) -> SindriResult<Plugins>`:
+  script files). The manifest format decided here: a JSON `{ "tasks": [...] }`
+  list, each entry naming a task/step/script-relative-path plus glob lists
+  for declared/managed input and output and a parameter list (each entry's
+  own `plugin`/`name`/`type`) — mirrors `Task`/`Step` field-for-field, parsed
+  by `TaskManifest`/`ParameterManifest`. A checksum manifest key is a
+  `RelativeFile` relative to `.sindri/plugins/` itself (e.g. `go/manifest.json`),
+  since — unlike lifecycles' flat single-file-per-thing layout — a plugin's
+  files are nested under its own subdirectory and share one manifest with
+  every other known plugin.
+- [x] `PluginRegistry::load(workspace, file_system) -> SindriResult<PluginRegistry>`:
   locate/create `.sindri/plugins/`; for each known plugin, seed any missing
   file (and record its checksum) from embedded content — per-file, so a
   partially present plugin only has its missing pieces recreated, same as
@@ -93,30 +101,61 @@ the way a multi-plugin world needs.
   file (freshly seeded or pre-existing) against the manifest; mismatch → a
   new `SindriError::PluginModified` (mirrors `LifecycleModified`, "editing
   plugin files isn't supported yet" help text), a hard error before any
-  build work starts; parse into `Plugin`/`Task` structures.
-  - [ ] Test: seeds missing files (and a checksum manifest) when absent.
-  - [ ] Test: recreates only the missing piece of a partially-present
+  build work starts; parse into `Plugin`/`Task` structures. Split into
+  `load_known_file` (one file's seed-or-read-then-verify) and
+  `load_known_plugin` (one plugin's files plus its manifest parse) rather
+  than one large function, so each piece of branching is independently
+  readable. Named `PluginRegistry`, not `Plugins` — a specific, singular
+  collection (every plugin this binary knows about), not a bare plural.
+  - [x] Test: seeds missing files (and a checksum manifest) when absent.
+  - [x] Test: recreates only the missing piece of a partially-present
     plugin, leaving valid siblings untouched.
-  - [ ] Test: reads a pre-seeded, checksum-matching plugin without
+  - [x] Test: reads a pre-seeded, checksum-matching plugin without
     rewriting anything.
-  - [ ] Test: a mismatched file fails with `PluginModified` before any
+  - [x] Test: a mismatched file fails with `PluginModified` before any
     build work starts.
-- [ ] Route `.sindri/plugins/`'s path through `Workspace::
+- [x] Route `.sindri/plugins/`'s path through `Workspace::
   absolute_sindri_directory()` — fixing an existing seam where
   `Lifecycles::load` builds `.sindri/lifecycles/`'s path inline instead of
   using that shared accessor — rather than duplicating the seam here.
-- [ ] `Plugins::embedded_defaults()` twin: confirm during implementation
-  whether anything actually needs it. `--help` outside a workspace only
-  needs step *names* (`Lifecycles::embedded_defaults()` already covers
-  that), not what tasks fill them, so plugins may only ever need to load
-  from within a workspace — don't build the no-filesystem twin ahead of a
-  real caller.
+  `PluginRegistry::load` takes `&Workspace` (not `&WorkspaceRoot`, unlike
+  `Lifecycles::load`) so it can reach that accessor directly.
+- [x] `PluginRegistry`'s no-filesystem twin: not built. Nothing calls
+  `PluginRegistry::load` yet (that starts in 3c), so there is no real
+  caller to justify one ahead of time.
+- [x] The shared checksum-manifest machinery itself (seed/verify/read
+  content, keyed and valued by proper domain types — a `RelativeFile` key,
+  a `Checksum` newtype wrapping a real `blake3::Hash` rather than a bare
+  hex `String`) moved out of `lifecycles.rs` into `src/checksums.rs`, so
+  `PluginRegistry::load` and `Lifecycles::load` share one implementation
+  instead of two copies of the same seed/checksum-verify logic.
+- [x] The Go plugin's executable-linking script — bound to `compile` today,
+  selected by an `if artifact_type == Executable` branch inside
+  `GoPlugin::tasks()` — moves to a `package`-step task instead
+  (`go-package`, using the renamed `scripts/go-package.ncl`, formerly
+  `go-compile-executable.ncl`). This closes an existing gap noted in
+  `lifecycle.rs`'s tool-target build path ("nothing is bound to `package`
+  itself for Go today — the binary is already a tracked `compile` output")
+  and turns `go-compile` into one universal task with no per-artifact-type
+  branching at all (`go build ./...`, identical for every module); only
+  `go-package` is executable-only, a smaller conditional-application
+  problem for 3c than picking between two full `go-compile` variants.
+  3c must update `lifecycle.rs`'s tool-target binary lookup (currently
+  `TaskName::new("go-compile")`) to resolve the binary from `go-package`'s
+  output instead.
 
 ### 3c — Rewire `GoPlugin` callers
 
 - [ ] Delete `GoPlugin::tasks()` / `compile_parameters()`; the four
-  `lifecycle.rs` call sites resolve tasks through the loaded `Plugins`
+  `lifecycle.rs` call sites resolve tasks through the loaded `PluginRegistry`
   instead.
+- [ ] Apply `go-package` only to executable modules (library modules get
+  `go-format/go-compile/go-test` only) — the conditional-application
+  problem 3b's manifest redesign left for this phase; see 3b's note above.
+- [ ] Update the tool-target binary lookup in `lifecycle.rs` (currently
+  `TaskName::new("go-compile")`) to resolve against `go-package`'s output
+  directory instead, since that's the task that now actually links and
+  places the tracked binary.
 - [ ] `generate_go_work_task` stays Rust-side glue *for this phase only* —
   its script content is built via `format!()` embedding the discovered
   list of Go module directories, data no task's `inputs` can express yet.

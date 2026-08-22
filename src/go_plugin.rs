@@ -55,7 +55,7 @@ impl GoPlugin {
     /// output) invalidates every module's compile and test the same way an edited source file would.
     pub fn tasks(artifact_type: &ArtifactType) -> Vec<(Task, Step)> {
         let compile_script: Script = match artifact_type {
-            ArtifactType::Executable => Script::go_compile_executable(),
+            ArtifactType::Executable => Script::go_package(),
             _ => Script::go_compile(),
         };
         vec![

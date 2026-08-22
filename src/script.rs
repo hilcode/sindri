@@ -177,8 +177,8 @@ impl Script {
         Script::new(include_str!("scripts/go-compile.ncl"))
     }
 
-    pub fn go_compile_executable() -> Script {
-        Script::new(include_str!("scripts/go-compile-executable.ncl"))
+    pub fn go_package() -> Script {
+        Script::new(include_str!("scripts/go-package.ncl"))
     }
 
     pub fn go_test() -> Script {
@@ -553,7 +553,7 @@ mod tests {
         for (script, program, first_argument, parameters) in [
             (Script::go_format(), "gofmt", "-l", ParameterBinding::empty()),
             (Script::go_compile(), "go", "build", mode_binding("debug")),
-            (Script::go_compile_executable(), "go", "build", mode_binding("debug")),
+            (Script::go_package(), "go", "build", mode_binding("debug")),
             (Script::go_test(), "go", "test", ParameterBinding::empty()),
         ] {
             let input_files: FileSet = file_set(&[]);
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn go_compile_executable_writes_its_binary_to_the_output_directory() {
+    fn go_package_writes_its_binary_to_the_output_directory() {
         let parameters: ParameterBinding = mode_binding("debug");
         let input_files: FileSet = file_set(&[]);
         let output_directory: AbsoluteDirectory = AbsoluteDirectory::new(PathBuf::from("/workspace/.target/out"));
@@ -604,7 +604,7 @@ mod tests {
         );
         let runtime: DummyRuntime = DummyRuntime::builder().build();
         let mut resolution_state: ScriptResolutionState = ScriptResolutionState::new();
-        let commands: Vec<Command> = Script::go_compile_executable()
+        let commands: Vec<Command> = Script::go_package()
             .evaluate(&inputs, &script_path(), &mut resolution_state, &runtime)
             .unwrap();
         assert_eq!(

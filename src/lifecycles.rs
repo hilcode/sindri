@@ -1,3 +1,5 @@
+use crate::checksums::Checksum;
+use crate::checksums::Checksums;
 use crate::error::SindriError;
 use crate::error::SindriResult;
 use crate::lifecycle::EntryModule;
@@ -10,10 +12,6 @@ use crate::types::RelativeDirectory;
 use crate::types::RelativeFile;
 use crate::types::Step;
 use crate::types::WorkspaceRoot;
-use blake3::Hasher;
-use serde::Deserialize;
-use serde::Serialize;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 struct KnownLifecycle {
@@ -60,22 +58,20 @@ impl Lifecycles {
         file_system
             .create_directories(lifecycles_directory.as_ref())
             .map_err(|source| SindriError::Io {
-                path: workspace_root
-                    .relativize_directory(&lifecycles_directory)
-                    .as_ref()
-                    .to_path_buf(),
+                path: workspace_root.relative_directory_path_buf(&lifecycles_directory),
                 source,
             })?;
         let mut checksums: Checksums = Checksums::load(&lifecycles_directory, workspace_root, file_system)?;
         let mut checksums_changed: bool = false;
         let mut lifecycles: Vec<Lifecycle> = Vec::with_capacity(KNOWN_LIFECYCLES.len());
         for known in &KNOWN_LIFECYCLES {
-            let file: AbsoluteFile = lifecycles_directory
-                .join_file(&RelativeFile::new(known.file_name).expect("a literal file name is always well-formed"));
+            let relative_file: RelativeFile =
+                RelativeFile::new(known.file_name).expect("a literal file name is always well-formed");
+            let file: AbsoluteFile = lifecycles_directory.join_file(&relative_file);
             let exists: bool = file_system
                 .file_kind(file.as_ref())
                 .map_err(|source| SindriError::Io {
-                    path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
+                    path: workspace_root.relative_path_buf(&file),
                     source,
                 })?
                 .is_some();
@@ -84,32 +80,32 @@ impl Lifecycles {
             // that a write is visible to an immediately following read (the test double in particular
             // never makes one visible to the other), and a real disk write doesn't need re-reading to
             // know what it contains either.
-            let content: String = if !exists || checksums.get(known.file_name).is_none() {
+            let content: String = if !exists || checksums.get(&relative_file).is_none() {
                 file_system
                     .write(file.as_ref(), known.content.as_bytes())
                     .map_err(|source| SindriError::Io {
-                        path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
+                        path: workspace_root.relative_path_buf(&file),
                         source,
                     })?;
-                checksums.insert(known.file_name, blake3_hex(known.content.as_bytes()));
+                checksums.insert(relative_file.clone(), Checksum::of(known.content.as_bytes()));
                 checksums_changed = true;
                 known.content.to_string()
             } else {
                 file_system
                     .read_to_string(file.as_ref())
                     .map_err(|source| SindriError::Io {
-                        path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
+                        path: workspace_root.relative_path_buf(&file),
                         source,
                     })?
             };
-            let actual_checksum: String = blake3_hex(content.as_bytes());
-            if checksums.get(known.file_name) != Some(actual_checksum.as_str()) {
+            let actual_checksum: Checksum = Checksum::of(content.as_bytes());
+            if checksums.get(&relative_file) != Some(&actual_checksum) {
                 return Err(SindriError::LifecycleModified {
-                    path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
+                    path: workspace_root.relative_path_buf(&file),
                 });
             }
             let steps: Vec<Step> = serde_json::from_str(&content).map_err(|source| SindriError::Schema {
-                path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
+                path: workspace_root.relative_path_buf(&file),
                 message: source.to_string(),
             })?;
             lifecycles.push(Lifecycle::new(
@@ -219,77 +215,6 @@ fn validate_no_step_collisions(lifecycles: &[Lifecycle]) -> SindriResult<()> {
     Ok(())
 }
 
-fn blake3_hex(bytes: &[u8]) -> String {
-    let mut hasher: Hasher = Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize().to_hex().to_string()
-}
-
-/// The checksum manifest at `.sindri/lifecycles/checksums.json` — recorded whenever a known lifecycle
-/// file is (re)seeded, and checked on every later load, since Sindri doesn't yet support editing these
-/// files: a mismatch means the file diverged from what Sindri itself wrote.
-#[derive(Default, Serialize, Deserialize)]
-struct Checksums(BTreeMap<String, String>);
-
-impl Checksums {
-    fn load(
-        directory: &AbsoluteDirectory,
-        workspace_root: &WorkspaceRoot,
-        file_system: &impl FileSystem,
-    ) -> SindriResult<Checksums> {
-        let file: AbsoluteFile = checksums_file(directory);
-        let exists: bool = file_system
-            .file_kind(file.as_ref())
-            .map_err(|source| SindriError::Io {
-                path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
-                source,
-            })?
-            .is_some();
-        if !exists {
-            return Ok(Checksums::default());
-        }
-        let content: String = file_system
-            .read_to_string(file.as_ref())
-            .map_err(|source| SindriError::Io {
-                path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
-                source,
-            })?;
-        serde_json::from_str(&content).map_err(|source| SindriError::Schema {
-            path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
-            message: source.to_string(),
-        })
-    }
-
-    fn save(
-        &self,
-        directory: &AbsoluteDirectory,
-        workspace_root: &WorkspaceRoot,
-        file_system: &impl FileSystem,
-    ) -> SindriResult<()> {
-        let file: AbsoluteFile = checksums_file(directory);
-        let content: String =
-            serde_json::to_string_pretty(self).expect("checksum manifest serialization is infallible");
-        file_system
-            .write(file.as_ref(), content.as_bytes())
-            .map_err(|source| SindriError::Io {
-                path: workspace_root.relativize_file(&file).as_ref().to_path_buf(),
-                source,
-            })
-    }
-
-    fn get(&self, file_name: &str) -> Option<&str> {
-        self.0.get(file_name).map(String::as_str)
-    }
-
-    fn insert(&mut self, file_name: &str, checksum: String) {
-        self.0.insert(file_name.to_string(), checksum);
-    }
-}
-
-fn checksums_file(directory: &AbsoluteDirectory) -> AbsoluteFile {
-    directory.join_file(&RelativeFile::new("checksums.json").expect("a literal file name is always well-formed"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +254,7 @@ mod tests {
 
     #[test]
     fn load_recreates_only_the_missing_file_and_leaves_a_valid_sibling_untouched() {
-        let default_checksum: String = blake3_hex(KNOWN_LIFECYCLES[0].content.as_bytes());
+        let default_checksum: String = Checksum::of(KNOWN_LIFECYCLES[0].content.as_bytes()).to_hex();
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(
                 "/workspace/.sindri/lifecycles/default.json",
@@ -361,8 +286,8 @@ mod tests {
 
     #[test]
     fn load_reads_a_pre_seeded_checksum_matching_directory_without_rewriting_it() {
-        let default_checksum: String = blake3_hex(KNOWN_LIFECYCLES[0].content.as_bytes());
-        let clean_checksum: String = blake3_hex(KNOWN_LIFECYCLES[1].content.as_bytes());
+        let default_checksum: String = Checksum::of(KNOWN_LIFECYCLES[0].content.as_bytes()).to_hex();
+        let clean_checksum: String = Checksum::of(KNOWN_LIFECYCLES[1].content.as_bytes()).to_hex();
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(
                 "/workspace/.sindri/lifecycles/default.json",
@@ -458,7 +383,7 @@ mod tests {
     #[test]
     fn load_fails_when_an_existing_files_content_is_not_valid_utf8() {
         let invalid_utf8: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
-        let checksum: String = blake3_hex(&invalid_utf8);
+        let checksum: String = Checksum::of(&invalid_utf8).to_hex();
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file("/workspace/.sindri/lifecycles/default.json", invalid_utf8)
             .file(
@@ -473,7 +398,7 @@ mod tests {
     #[test]
     fn load_fails_when_an_existing_files_content_is_valid_utf8_but_not_valid_json() {
         let content: &str = "not a json array";
-        let checksum: String = blake3_hex(content.as_bytes());
+        let checksum: String = Checksum::of(content.as_bytes()).to_hex();
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file("/workspace/.sindri/lifecycles/default.json", content)
             .file(
