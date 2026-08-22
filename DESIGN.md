@@ -135,6 +135,18 @@ dependencies = {
 
 Glob-based file tracking within a module is implicit (see §7). Cross-module ordering is derived entirely from explicit `module` dependency declarations, not from file glob overlap.
 
+### Parameter values
+
+A module supplies values for the parameters (§6) its tasks' scripts declare, keyed first by owning plugin then by parameter name:
+
+```nickel
+parameters = {
+  "sindri-go" = { mode = "release" },
+},
+```
+
+Every parameter a task's script declares must have a value here — there is no implicit default. Two modules built from the same sources but with different parameter values coexist side by side in the build directory rather than overwriting one another, since the resolved values are hashed into the binding hash that names each task's output location (§7).
+
 ### Inheriting from a parent
 
 Build files can import shared declarations from the workspace root or from intermediate parent directories. A common pattern is a root `sindri.ncl` file:
@@ -169,7 +181,7 @@ start → generate → format → compile → document → test-compile
 
 | Step | Description | Source-mutating? |
 |------|-------------|:---:|
-| `start` | Sentinel. No tasks run here. | — |
+| `start` | Runs before every other step, for any invocation — the earliest point a task can bind to. | No |
 | `generate` | Generate source or resource files. May write into the source tree. | Yes |
 | `format` | Apply or check code formatting. May write into the source tree. | Yes |
 | `compile` | Compile main sources. | No |
@@ -180,15 +192,15 @@ start → generate → format → compile → document → test-compile
 | `integration-test` | Run integration tests. | No |
 | `package` | Assemble distributable artifacts (JARs, binaries, etc.). | No |
 | `publish` | Push artifacts to a remote repository or registry. The destination, credentials, and protocol are entirely plugin-defined. | No |
-| `end` | Sentinel. No tasks run here. | — |
+| `end` | Runs once the lifecycle's own last named step has actually run — i.e. only when the invocation reaches the end of the lifecycle, not when it stops at an earlier step. | No |
 
-`start` and `end` exist solely as anchor points for plugins that need to run before the first or after the last built-in step.
+`start` and `end` are ordinary steps a task may bind to directly, not mere placeholders: a task bound to `start` runs before anything else, unconditionally, on every invocation; a task bound to `end` runs once the lifecycle's own last named step has run, so it never fires for an invocation that stops short of the full lifecycle. They are also the two anchor points a plugin references via `pre`/`post` when inserting a brand-new step at the very beginning or very end of the lifecycle (see "Extending the lifecycle", below) — running something before/after the whole lifecycle and inserting a step at either extreme are two different, non-contradictory uses of the same two sentinels.
 
 ### Source-mutating steps
 
-`generate` and `format` are the only steps that may write to the source tree. Because `generate` precedes `format`, which precedes `compile`, any generated files are formatted and then compiled in a single build — no intermediate build is required.
+`generate` and `format` are the two steps *intended* to write to the source tree — a convention every other step's task is expected to honor, not something Sindri enforces or sandboxes against. Nothing stops a task bound to a later step from writing to source too; the tool simply doesn't guarantee anything about when that write is noticed. Because `generate` precedes `format`, which precedes `compile`, any generated files are formatted and then compiled in a single build — no intermediate build is required.
 
-Downstream steps (`compile`, `lint`, etc.) see the source tree only after both mutating steps have completed. The build tool hashes source files after the mutating steps finish and uses those hashes as the inputs for all subsequent steps.
+Sindri hashes source files once, after both mutating steps finish, and reuses those hashes as the inputs for every step from `compile` onward within that same build (§7). This is what the convention protects: a task bound to a later step that writes to source anyway won't corrupt the current build, but its own edit won't be picked up until hashing runs again on the *next* invocation — the same kind of responsibility §10 already places on plugin authors for non-determinism, rather than a guarantee the tool actively checks.
 
 ### Targeting a step
 
@@ -247,25 +259,59 @@ Multiple plugins may contribute tasks to the same lifecycle step. When they do, 
 A plugin is a Nickel package. It contributes one or more task declarations conforming to the `Task` schema shipped with `sindri`. The build tool validates every plugin against this schema at startup.
 
 ```nickel
-# A simplified illustration of a Java compile task declaration
+# A simplified illustration of a Go compile task declaration
 {
-  task    = "java-compile",
+  task    = "go-compile",
   step    = "compile",
-  inputs  = [ "src/main/java/**/*.java", "src/main/resources/**/*" ],
-  outputs = [ ".target/classes/**/*" ],
-  tools   = [ "javac" ],
-  command = "javac -d .target/classes $(find src/main/java -name '*.java')",
+  inputs  = [ "**/*.go" ],
+  outputs = [ "**/*" ],
+  tools   = [ "go" ],
+  script  = fun inputs => [
+    { program = "go", arguments = [ "build", "-o", inputs."output-directory", "./..." ] },
+  ],
 }
 ```
 
-### Input and output globs
+A task's commands are not a static field — they come from evaluating the task's `script` (below) against its bound parameters and resolved inputs.
+
+### Scripts and Commands
+
+A **Command** is a single runnable process invocation, executed directly with no shell:
+
+```nickel
+{
+  program           = "go",                 # required — the executable
+  arguments         = [ "build", "./..." ], # optional, default []
+  environment       = { GOWORK = "…" },      # optional, default {}
+  working-directory = "my-lib",             # optional, default: the module directory
+}
+```
+
+`program` stands apart from `arguments` — rather than being their head — because it is the token `sindri` resolves and verifies against the available tools (Tool verification, below). `arguments` is always a list, never a shell string, so there is no quoting or shell expansion to reason about.
+
+A **Script** is a Nickel expression that, given a task's bound parameter values and its resolved input file set, evaluates to a non-empty, ordered list of `Command`s. The expression is pure — it performs no I/O and cannot read the host environment. `sindri` supplies the parameter values and the matched files (it owns globbing); the expression only computes each command's argument vector, environment, and working directory.
+
+This is the separation the task model rests on: the script decides *what* to run, as plain data; `sindri` performs the *running*. A script's identity for caching purposes (§7) is its **definition hash**, taken over the expression's source — together with everything it imports — never over the resolved argument vectors, environments, or directories it evaluates to, since those are only ever a function of already-hashed inputs.
+
+### Parameters
+
+A **Parameter** is a named build setting owned by the plugin that defines it, identified by `(plugin, name)` — so two plugins may each define, say, a `mode` parameter with no collision and no shared registry to conflict over. Its legal values are constrained by a **ParameterType**: a Nickel contract the plugin authors inline (`on/off`, `one_of("debug", "release")`, …), rather than one drawn from a shared type registry.
+
+A script declares which parameters it requires as authored data, read without evaluating the script itself — so a task is forced to supply a value for every parameter its script requires. `sindri` validates a supplied binding against that declared set *before* it evaluates the script: a missing or ill-typed value is a build-definition error naming the task and the parameter, never a raw Nickel failure deep inside a plugin.
+
+Parameters are what let a debug build and a release build — or a normal build and a coverage build — coexist in the build directory without overwriting each other (§7): the resolved parameter values are hashed into a **binding hash** that names each task's output location, so switching between parameter values never forces a full rebuild.
+
+### Input and output file sets
 
 Each task declares:
 
-- **`inputs`**: globs (relative to the module's `sindri.build`) of files the task reads.
-- **`outputs`**: globs of files the task produces.
+- a **declared** input — the build file's own glob of files it consumes ("where are my sources"),
+- a **managed** input — a glob contributed by the plugin itself, for artifacts it generated and already knows the location of (e.g. a generated `go.work`); the user never writes this,
+- one **output** — a glob of files the task produces, resolved against the task's own output directory (§7) once the script has run.
 
-All globs are tracked by file watchers (§9). When a file matching an input glob changes, the task is marked dirty and will re-run on the next build.
+Each of these is a **FileSetPattern**: an ordered list of include-only globs. A file is a member iff it matches at least one glob — there are no excludes and no separate directory-scoping rules. A `FileSetPattern` is a plain description; it is resolved against the workspace into the concrete matched files only at build time. A task's effective input is the union of its declared and managed file sets — this is how a generated artifact such as `go.work` enters a task's fingerprint (§7) without the user's own glob ever needing to mention it.
+
+All declared globs are tracked by file watchers (§9). When a file matching one changes, the task is marked dirty and will re-run on the next build.
 
 ### Task ordering
 
@@ -293,7 +339,9 @@ Plugins can declare their own dependencies, independent of the modules that use 
   module_tools = [
     { module = "//tools/codegen", binary = "codegen" },
   ],
-  command      = "codegen --input src/main/schema --output src/generated",
+  script       = fun inputs => [
+    { program = "codegen", arguments = [ "--input", "src/main/schema", "--output", "src/generated" ] },
+  ],
 }
 ```
 
@@ -307,7 +355,7 @@ Workspace-built tools are therefore first-class participants in the build graph.
 
 ### The `Task` schema
 
-The build tool ships a set of typed Nickel contracts as part of its core. `sindri` applies them automatically when it loads build files and plugins — no import is required. A task declaration is simply a plain Nickel record:
+The build tool ships a set of typed Nickel contracts as part of its core. `sindri` applies them automatically when it loads build files and plugins — no import is required. A task declaration — its script, its declared parameters, and its input/output patterns — is simply a plain Nickel record:
 
 ```nickel
 {
@@ -320,11 +368,26 @@ The build tool ships a set of typed Nickel contracts as part of its core. `sindr
 
 ### Native build tools vs. low-level compilers
 
-For languages with capable native build tools — Go (`go build`) and Rust (`cargo`) being the primary examples — plugins invoke the native tool directly rather than the low-level compiler (`go tool compile`, `rustc`). This delegates dependency resolution, caching, and incremental compilation to the native tool, keeping plugins simple at the cost of reduced Sindri visibility into the build.
+For languages with a capable native build tool — Go (`go build`) and Rust (`cargo`) being the primary examples — plugins invoke the native tool directly rather than the low-level compiler (`go tool compile`, `rustc`). For languages without a dominant native build tool (Java, C, C++), plugins invoke the compiler directly.
 
-For languages without a dominant native build tool (Java, C, C++), plugins invoke the compiler directly and Sindri is fully in control.
+The dividing line between the two modes is the same one in every case:
 
-In the future, a plugin may offer both modes as a user preference: native tool for simplicity, low-level compiler for full Sindri visibility, precise incrementality, and remote-cache eligibility at the task level.
+> **Sindri owns knowledge and orchestration; the native tool owns the translation of source into object code.**
+
+Sindri always owns the module graph, the dependency declarations, the lifecycle, dirtiness tracking, telemetry, and BSP. The native tool always owns compilation, linking, and its own build cache. The modes differ only in *how far* into the "translation" half Sindri reaches:
+
+- **Native-tool mode** delegates dependency resolution, caching, and incremental *compilation* to the native tool, keeping plugins simple at the cost of reduced Sindri visibility into individual compilation units. It does **not** delegate Sindri's own responsibilities — see the responsibilities below.
+- **Low-level mode** invokes the compiler per unit, so Sindri discovers inputs, feeds them to the compiler, and owns incrementality and caching at the task level. This buys full visibility and remote-cache eligibility, at the cost of re-deriving what the native tool would otherwise do (build-constraint evaluation, cgo, embedding, the package graph, linking).
+
+Low-level mode is reserved for languages with no native build tool, and for the future case where remote caching or per-task visibility justifies the additional cost (§16). It is never required merely to make Sindri "do more" — native-tool mode already has Sindri owning the entire build graph.
+
+#### Native-tool mode does not defer correctness to the tool
+
+Choosing native-tool mode delegates *compilation*, not *correctness*. In this mode Sindri still:
+
+- **Tracks dirtiness authoritatively** over its own view of the inputs, never trusting the native tool's cache to decide whether a Sindri task may be skipped. The MVP tracks a deliberate **platform-independent superset** of each module's source — a glob of every file type the tool might compile (for Go: `**/*.{go,c,h,cc,cpp,cxx,hh,hpp,hxx,m,s,S}` plus `go.mod`/`go.sum`) — and lets the native tool select among them. Over-inclusion only ever costs a spurious rebuild; it can never miss an input. A precise, per-target set via the tool's own introspection (Go's `go list`, which also surfaces `//go:embed` inputs) is a future refinement (§16).
+- **Keeps state relocatable.** Discovery yields absolute paths; Sindri relativizes every tracked file against the workspace root before hashing or persisting, so a workspace can be moved or renamed without invalidating state (§7). A tracked file that does not resolve under the workspace root is an error, never a silent skip.
+- **Treats the `sindri.build` declarations as the source of truth.** The inter-module dependencies declared in `sindri.build` (§4) — not the native tool's own configuration — define the build graph. Where the native tool needs its own view of local dependencies (Go's `go.work` / `replace` directives, for example), Sindri *generates* it from the declarations rather than reading a hand-maintained file, so the two can never drift.
 
 ### Plugin tooling
 
@@ -348,25 +411,43 @@ Before executing any step, `sindri` constructs a task graph for the requested li
 
 Tasks with no dependency edges between them are eligible to run in parallel. `sindri` runs as many eligible tasks concurrently as there are available CPU cores (configurable).
 
+### Resolution
+
+A `Task` — its script, its declared and managed inputs, its output, and its declared parameters (§6) — is a **description**: on its own it holds no file lists, no parameter values, and no concrete commands. **Resolution** binds it for a concrete build:
+
+- each parameter is bound to a value, validated against its `ParameterType` contract;
+- each `FileSetPattern` is matched against the workspace to yield the concrete files — the input file sets before the script runs, the output file set after it runs;
+- the script is applied to the bound parameters and the resolved (declared ∪ managed) input files to yield the ordered commands to actually run.
+
 ### Incremental correctness
 
-`sindri` maintains a persistent record (inspired by Mill) of:
+`sindri` maintains a persistent record of three distinct hashes per resolved task — i.e. per `(task, binding-hash)` pair, so distinct parameter bindings (§6) have entirely independent dirtiness state. Conflating these three is the main hazard the model guards against:
 
-- The hash of each input file at the time of the last successful task run.
-- The hash of each output file at the time of the last successful task run.
-- The task declaration itself (including command, tools, and glob patterns).
+1. **Definition hash** — did the build definition change? Taken over the task's name, its script's transitive source (the expression together with every file it imports), its input and output pattern hashes, its declared parameters, and a `(sindri, Nickel)` version salt, since both shape how the script evaluates. A bump of either version deliberately dirties every task.
+2. **Content hash** — did a tracked file change, appear, or disappear? Computed separately for the resolved input file set and the resolved output file set, over each member file's path and content. This is the file-level dirtiness signal.
+3. **Binding hash** — over the resolved parameter values, ordered by parameter (§6). Not a dirtiness signal: it names the output location, so different parameter bindings coexist side by side instead of overwriting one another:
 
-A task is re-run when any of the following is true:
+   ```
+   <build-dir>/<module>/<task-name>/<binding-hash>/
+   ```
 
-- Any input file's current hash differs from its recorded hash.
-- Any output file is missing or its hash differs from its recorded hash.
-- The task declaration has changed (e.g. a plugin update changed the command).
+A resolved task is re-run when any of the following is true:
 
-A task is skipped when all of the above are false.
+- its definition hash changed (the script's source, an import, a pattern, a declaration, or the Sindri/Nickel version),
+- its resolved input file set is dirty (a tracked file's content changed, was added, or was removed),
+- its resolved output file set is dirty (an expected artifact was modified or is missing — this guards against tampering or partial results).
 
-If a task fails, its hash record is not updated. On the next invocation the task will re-run: either the input hashes reflect partial changes made before the failure, or the output hashes reflect an inconsistent state. In both cases the mismatch is detected and the task re-runs automatically. No staging areas or rollback mechanism are needed — hash-based tracking makes the build self-correcting.
+A resolved task is skipped when all three are false.
 
-After a source-mutating step (`generate`, `format`) completes, `sindri` re-hashes the source tree before evaluating dirtiness for subsequent steps. This ensures that generated or reformatted files are treated as fresh inputs to the compile step.
+If a task fails, its record is not persisted: on the next invocation, the mismatch between the persisted (absent, or stale) record and the freshly computed one is detected and the task re-runs automatically. No staging areas or rollback mechanism are needed — this makes the build self-correcting.
+
+### Metadata cache
+
+`sindri` keeps a per-file cache of content hashes, keyed by workspace-relative path: a tracked file's hash, once resolved, is reused by every later dirtiness check or run record that consults it, until something explicitly tells the cache that file may have changed. A file shared by more than one resolved input or output set — a common case, since sibling tasks routinely declare overlapping globs — is therefore read and hashed only as many times as it is actually invalidated, not once per consultation.
+
+The cache is backed by one small persisted record per tracked file — never a single workspace-wide blob rewritten wholesale — so confirmed state survives a build getting interrupted before it finishes. Each record holds the file's size, modification time, and content hash as of the last time it was written. A lookup first takes a cheap `stat`-equivalent reading of the file's current size and modification time: if both still match the persisted record, its hash is trusted without reading the file's content at all; if the size differs, or the file is missing, the file is dirty without needing to read it either; only when the size matches but the modification time has moved does the file actually get read, to resolve the ambiguity — some VCS/checkout tools set every checked-out file's modification time to the checkout or commit time rather than leaving it to reflect a per-file edit, so two files can easily end up sharing one modification time despite differing content; this is a real case a build tool has to handle correctly, not just a theoretical one. Records are addressed by a hash of their own path rather than a mirror of the source tree, so lookups don't depend on — or expose — the tree's own layout, and records are spread evenly across a bounded set of subdirectories regardless of how unevenly the real tree is shaped.
+
+A task's own output is the one thing its own run is guaranteed to change, and a dirtiness check may already have cached those files as missing or stale before the task ran — so `sindri` drops the in-memory (this-build) entry for every file in a task's resolved output as soon as that task finishes, before anything reads them through the cache again. This invalidation is deliberately soft: it never declares a file dirty by itself, it only forces the next read to be a real one, so a later task in the same build that only consumes this file — rather than running it — still sees an accurate hash and can correctly stay clean if the content it actually depends on turns out unchanged, even though the task that produced it did run. Once a task's resolved input and output are settled, `sindri` persists their fresh records so a later build can trust them via the cheap check instead of reading their content again.
 
 ### Caching
 
@@ -376,7 +457,7 @@ The caching architecture is designed to support a remote cache backend (shared a
 
 ### Telemetry
 
-After every build — success or failure — `sindri` writes `<build_dir>/telemetry.json` in the **Chrome trace format**, directly loadable in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` without additional tooling.
+After every successful build, `sindri` writes `<build_dir>/telemetry.json` in the **Chrome trace format**, directly loadable in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` without additional tooling. A failed build writes no trace — it returns early on the failing task and is diagnosed from its error rather than its timeline, which keeps every `telemetry.json` a record of a whole build rather than an aborted fragment. This follows from the engine's return-early control flow; a future decoupled event sink (§11) could instead let a telemetry listener flush on build-end regardless of outcome, at which point this behaviour would likely change.
 
 Each executed task produces one complete event (`"ph": "X"`, meaning start time and duration are recorded together):
 
@@ -457,21 +538,23 @@ Artifact and module dependencies may be mixed freely within a scope.
 
 ### Transitive visibility
 
-By default, a module's dependencies are not visible to its consumers. If module A depends on B, a module that depends on A does not get B on its compilation classpath — it must declare B itself if it needs it.
+By default, a module's dependencies are not visible to its consumers. If module A depends on B, a module that depends on A does not see B at compile time — it must declare B itself if it needs it.
 
-A `compile`-scope dependency can be marked `export = true` to make it visible to consumers:
+The `export` scope declares compile dependencies that *are* re-exported to consumers. Its entries are compile-time inputs exactly like `compile` entries — the two scopes together are what the module compiles against — but `export` entries are additionally visible to modules that depend on this one:
 
 ```nickel
 dependencies = {
   compile = [
-    { artifact = "example-org:core-lib"                  },  # not visible to consumers
-    { artifact = "example-org:api-types", export = true  },  # visible to consumers
-    { module   = "//libs/common",         export = true  },  # modules too
+    { artifact = "example-org:core-lib" },  # a compile-time input, not visible to consumers
+  ],
+  export = [
+    { artifact = "example-org:api-types" },  # a compile-time input and visible to consumers
+    { module   = "//libs/common"         },  # modules too
   ],
 },
 ```
 
-`export` is only meaningful on `compile`-scoped dependencies; it has no effect on `test`, `test-runtime`, or `runtime` scopes and is an error if set there.
+Re-export is a property of the compilation path only, so there is deliberately no exported counterpart to the `test`, `test-runtime`, or `runtime` scopes: an entry is re-exported precisely by being placed in `export` rather than `compile`.
 
 There is no compile-only scope. Dependencies that are needed at compile time but not at runtime (e.g. annotation processors, symbol processors) are not module-level dependencies at all — they are declared in the plugin's own configuration namespace and placed on the appropriate path by the plugin:
 
@@ -489,7 +572,7 @@ There is no compile-only scope. Dependencies that are needed at compile time but
 }
 ```
 
-These are resolved through the same lock file mechanism as regular dependencies. The plugin owns the distinction between compile classpath and processor path; the module just declares which processors it uses.
+These are resolved through the same lock file mechanism as regular dependencies. The plugin owns the distinction between compile-time inputs and processor path; the module just declares which processors it uses.
 
 ### Lock file
 
@@ -598,6 +681,10 @@ Given the same `devenv.lock` (pinning the Nix environment) and `sindri.lock` (pi
 
 When the `generate` step produces files into a source directory (e.g. `src/generated/java/`), the corresponding task's output glob is registered as a BSP source root. IDEs see generated files as part of the module's source set without requiring a build to have run first — `sindri` reports the expected output directory even if it does not yet exist.
 
+### Engine event sink (consideration)
+
+BSP and watch mode (§9) are inherently streaming: diagnostics are pushed as they are found and progress is reported live to the IDE. Today the build engine returns a `Vec<TaskOutcome>` that the caller post-processes (terminal progress, telemetry, state persistence). Once a second, streaming consumer (BSP) exists, consider having the engine instead emit events — `TaskStarted`, `TaskFinished{hit|miss}`, `TaskFailed`, `BuildFinished` — to a sink that interested parties observe. A terminal reporter, a telemetry writer, the state persister, and a BSP bridge each become independent listeners, and decisions currently baked into control flow — such as whether telemetry is written for a failed build (§7) — become a listener's concern instead. Prefer a simple synchronous observer trait (in the style of the `FileSystem` / `Runtime` traits) over a full asynchronous message bus until the IDE and watch use cases prove they need true fan-out.
+
 ---
 
 ## 12. Configuration Language
@@ -620,11 +707,12 @@ Module        — the shape of a sindri.build file
 Workspace     — the shape of a sindri.workspace file
 Task          — the shape of a plugin task declaration
 LifecycleStep — the shape of a plugin lifecycle extension
-ArtifactDep   — { artifact: String, export?: Bool }
-ModuleDep     — { module: String, export?: Bool }
+ArtifactDep   — { artifact: String }
+ModuleDep     — { module: String }
 Dependency    — ArtifactDep | ModuleDep
-Dependencies  — { compile?: Array Dependency, test?: Array Dependency,
-                  runtime?: Array Dependency, test-runtime?: Array Dependency }
+Dependencies  — { compile?: Array Dependency, export?: Array Dependency,
+                  test?: Array Dependency, runtime?: Array Dependency,
+                  test-runtime?: Array Dependency }
 ```
 
 `sindri` applies the appropriate contract when it reads each file: `Module` for every `sindri.build`, `Workspace` for `sindri.workspace`, `Task` for every plugin task declaration, and so on.
@@ -703,13 +791,11 @@ Items deliberately deferred; they need a decision before implementation begins.
 
 1. **Plugin distribution**: How are plugins versioned and fetched? A dedicated `sindri` plugin registry? Maven Central? Git references? This affects sindri.workspace's `plugins` field and the lock file format.
 
-2. **Plugin command execution environment**: Plugin `command` fields are strings run in the shell. Should `sindri` define a minimal portable shell subset, require POSIX sh, or support a structured command representation (list of arguments) to avoid shell quoting issues and improve portability within WSL2?
+2. **Test result reporting**: How are test results reported? JUnit XML? A custom format? How does this integrate with BSP's test reporting protocol?
 
-3. **Test result reporting**: How are test results reported? JUnit XML? A custom format? How does this integrate with BSP's test reporting protocol?
+3. **Module version inheritance**: Can a workspace declare a default version for all modules and allow individual modules to override it?
 
-4. **Module version inheritance**: Can a workspace declare a default version for all modules and allow individual modules to override it?
-
-5. **Module-level dependency version overrides**: The lock file is workspace-level, but individual modules may need to pin a different version of an artifact (e.g. a binary module depending on an older library than the rest of the workspace). The mechanism for declaring module-level overrides and the edge cases they introduce (two modules pinning different versions of the same artifact while a third depends on both) need careful design.
+4. **Module-level dependency version overrides**: The lock file is workspace-level, but individual modules may need to pin a different version of an artifact (e.g. a binary module depending on an older library than the rest of the workspace). The mechanism for declaring module-level overrides and the edge cases they introduce (two modules pinning different versions of the same artifact while a third depends on both) need careful design.
 
 ---
 
@@ -717,6 +803,7 @@ Items deliberately deferred; they need a decision before implementation begins.
 
 Items agreed to be out of scope for the initial implementation.
 
+- **Cross-task references**: A downstream task consuming an upstream task's output cannot statically know the upstream's binding hash (§7), so a plain glob cannot reach it. The planned mechanism is a symbolic reference, `//module/@task-name/file-name`, that `sindri` resolves to `<task-name>/<binding-hash>/file-name` at build time. Which upstream binding a reference selects is a validation rule, not a propagation rule: it is valid only if the downstream's parameter binding covers every parameter the upstream task requires, checked statically at build-definition load time — it does not let a reference select a *different* upstream binding (e.g. a release downstream depending on a debug upstream). Once available, this subsumes the current Phase 5e mechanism, where a rebuilt dependency forces its whole dependent module to rebuild wholesale rather than only the tasks that actually consume the changed file.
 - **Verbose / investigative mode**: A mode (e.g. `sindri --investigate`) that logs which files triggered a rebuild, which tasks were marked dirty and why, and what the file watcher observed. Useful for diagnosing misconfigured globs or unexpected rebuild loops.
 - **Local and remote caching**: Store task outputs in a content-addressable cache (keyed by input hash) so that reverting a change restores outputs without re-running the task. The same structure supports a remote cache backend shared across machines and CI. Most valuable once Sindri invokes low-level compilers directly — native tools like `go build` and `cargo` have their own caches already.
 - **Automatic plugin reordering**: Currently, lifecycle conflicts require the user to reorder plugins manually in `sindri.workspace`. A future version could detect and suggest (or automatically apply) a valid ordering.
@@ -726,3 +813,6 @@ Items agreed to be out of scope for the initial implementation.
 - **Low-level compiler support for Go and Rust**: Plugins that bypass `go build`/`cargo` and invoke `go tool compile`/`rustc` directly, giving Sindri full visibility into the build graph, precise incrementality, and remote-cache eligibility at the task level. Would require Sindri to understand and translate `go.mod`/`Cargo.toml` configuration — or expose a migration path for users who want to move from native-tool mode to low-level mode.
 - **Symlink support**: Allow symlinks whose targets resolve to paths within the workspace root. Requires canonicalizing paths on discovery and verifying targets during glob traversal. Symlinks pointing outside the workspace remain an error.
 - **Container image building and signing**: Additional lifecycle steps for building OCI images and signing artifacts.
+- **Precise Go input tracking**: The MVP tracks a platform-independent superset glob of each module's source and lets `go build` select among it (§6). Using Go's own introspection (`go list -json`) for the exact, per-target input set would additionally handle:
+  - **`//go:embed`**: assets embedded into the binary via `//go:embed` directives are build inputs but are not `.go`/C source, so the superset glob does not track them — editing an embedded asset is not currently detected as a change.
+  - **`//go:build` constraints**: build tags and `_GOOS_GOARCH` filename suffixes select which files compile for a given target; the superset glob deliberately ignores them (tracking all files regardless of target), trading per-target precision for platform-independent state.

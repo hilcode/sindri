@@ -1,0 +1,29 @@
+# List available recipes
+default:
+    @just --list
+
+# Rebuild and reinstall `sindri` if anything changed, so the examples never run a stale binary.
+# Defers to the repo's `install` recipe, which defers to `cargo` — `cargo` decides staleness across
+# every input (sources, `Cargo.lock`, and the embedded `*.ncl` contracts, tracked through
+# `include_str!`), so this is a fast no-op when nothing changed and a full rebuild + reinstall when
+# it did.
+install:
+    cd .. && just install
+
+# Compile one example (rebuilds and reinstalls `sindri` first if the sources changed)
+compile example: install
+    cd {{example}} && sindri compile
+
+# Print one example's resolved lifecycle steps and their tasks
+lifecycle example: install
+    cd {{example}} && sindri lifecycle
+
+# Remove the build output (.target) from one example
+clean example:
+    rm -rf {{example}}/.target
+
+# Compile every example
+compile-all: (compile "hello") (compile "greeter") (compile "multi-module") (compile "parameterized")
+
+# Remove the build output from every example
+clean-all: (clean "hello") (clean "greeter") (clean "multi-module") (clean "parameterized")

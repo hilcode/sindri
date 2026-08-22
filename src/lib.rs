@@ -1,10 +1,21 @@
+pub mod cli;
+pub mod dirtiness;
 pub mod error;
+pub mod executor;
+pub mod file_set;
+pub mod go_plugin;
 pub mod lifecycle;
 pub mod local_time_with_elapsed;
+pub mod metadata_cache;
 pub mod module;
+pub mod module_graph;
 pub mod nickel_eval;
-pub mod output;
-pub mod plugin;
+pub mod nickel_import;
+pub mod parameter;
+pub mod runtime;
+pub mod script;
+pub mod task;
+pub mod telemetry;
 pub mod types;
 pub mod workspace;
 

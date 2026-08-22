@@ -1,4 +1,13 @@
+use sindri::parameter::Parameter;
+use sindri::parameter::ParameterBinding;
+use sindri::parameter::ParameterDeclarations;
+use sindri::parameter::ParameterName;
+use sindri::parameter::ParameterState;
+use sindri::parameter::ParameterType;
+use sindri::parameter::ParameterValue;
+use sindri::parameter::PluginName;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
@@ -10,6 +19,31 @@ fn sindri() -> Command {
 
 fn expected_version_output() -> String {
     format!("sindri {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The binding hash a parameter-less task (`generate-go-work`) resolves to.
+fn empty_binding_hash() -> String {
+    ParameterBinding::empty().binding_hash().to_hex()
+}
+
+/// The binding hash `go-compile` resolves to for a given `sindri-go.mode` value. Every Go module
+/// below binds `mode = "debug"` unless it's specifically exercising a second, coexisting binding, so
+/// `mode_binding_hash("debug")` is the binding-hash path segment shared by most fixtures here.
+fn mode_binding_hash(mode: &str) -> String {
+    let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
+        PluginName::new("sindri-go"),
+        ParameterName::new("mode"),
+        ParameterType::new("String"),
+    )]);
+    let values: ParameterState = ParameterState::new([(
+        PluginName::new("sindri-go"),
+        ParameterName::new("mode"),
+        ParameterValue::new(format!("\"{mode}\"")),
+    )]);
+    ParameterBinding::resolve(&declared, &values)
+        .unwrap()
+        .binding_hash()
+        .to_hex()
 }
 
 fn workspace_dir() -> TempDir {
@@ -26,10 +60,124 @@ fn module_dir() -> TempDir {
     let directory: TempDir = workspace_dir();
     fs::write(
         directory.path().join("sindri.build"),
-        r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0" }"#,
+        r#"{ name = "my-app", language = "go", type = "executable", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
     )
     .unwrap();
     directory
+}
+
+fn testdata_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("testdata")
+}
+
+fn go_module_dir() -> TempDir {
+    let directory: TempDir = module_dir();
+    let source: PathBuf = testdata_dir().join("go-module");
+    fs::copy(source.join("main.go"), directory.path().join("main.go")).unwrap();
+    fs::copy(source.join("go.mod"), directory.path().join("go.mod")).unwrap();
+    directory
+}
+
+fn failing_go_module_dir() -> TempDir {
+    let directory: TempDir = module_dir();
+    let source: PathBuf = testdata_dir().join("failing-go-module");
+    fs::copy(source.join("main.go"), directory.path().join("main.go")).unwrap();
+    fs::copy(source.join("go.mod"), directory.path().join("go.mod")).unwrap();
+    directory
+}
+
+/// A workspace whose entry `app` executable declares a `{ module = … }` dependency on a local
+/// `//lib/greeting` library. `app` imports `example.com/greeting`, which only resolves once Sindri
+/// generates the `go.work` covering both module directories.
+fn multi_module_dir() -> TempDir {
+    let directory: TempDir = workspace_dir();
+    fs::write(
+        directory.path().join("sindri.build"),
+        r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+             dependencies = { compile = [ { module = "//lib/greeting" } ] },
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(directory.path().join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
+    fs::write(
+        directory.path().join("main.go"),
+        "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/greeting\"\n)\n\nfunc main() {\n\tfmt.Println(greeting.Message(\"Sindri\"))\n}\n",
+    )
+    .unwrap();
+    let greeting: PathBuf = directory.path().join("lib").join("greeting");
+    fs::create_dir_all(&greeting).unwrap();
+    fs::write(
+        greeting.join("sindri.build"),
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(greeting.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
+    fs::write(
+        greeting.join("greeting.go"),
+        "package greeting\n\nimport \"fmt\"\n\nfunc Message(name string) string {\n\treturn fmt.Sprintf(\"Hello, %s!\", name)\n}\n",
+    )
+    .unwrap();
+    directory
+}
+
+/// Like [`multi_module_dir`], but with the executable in its own `app/` subdirectory, disjoint from the
+/// library's `lib/` directory, so neither module's source glob sweeps the other. This isolates the
+/// dependency edge: only edge propagation — not input-glob overlap — can tie `app`'s freshness to the
+/// library's, which is exactly what multi-module incrementality must guarantee.
+fn isolated_multi_module_dir() -> TempDir {
+    let directory: TempDir = workspace_dir();
+    let app: PathBuf = directory.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        app.join("sindri.build"),
+        r#"{ name = "app", language = "go", type = "executable", version = "0.1.0",
+             dependencies = { compile = [ { module = "//lib" } ] },
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(app.join("go.mod"), "module example.com/app\n\ngo 1.21\n").unwrap();
+    fs::write(
+        app.join("main.go"),
+        "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/greeting\"\n)\n\nfunc main() {\n\tfmt.Println(greeting.Message(\"Sindri\"))\n}\n",
+    )
+    .unwrap();
+    let lib: PathBuf = directory.path().join("lib");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(
+        lib.join("sindri.build"),
+        r#"{ name = "greeting", language = "go", type = "library", version = "0.1.0",
+             parameters = { "sindri-go" = { mode = "debug" } } }"#,
+    )
+    .unwrap();
+    fs::write(lib.join("go.mod"), "module example.com/greeting\n\ngo 1.21\n").unwrap();
+    fs::write(lib.join("greeting.go"), greeting_source("Hello")).unwrap();
+    directory
+}
+
+/// The library source, parameterised by the word its `Message` greets with, so a test can edit the
+/// dependency's behaviour and observe whether the dependent picked up the change.
+fn greeting_source(word: &str) -> String {
+    format!(
+        "package greeting\n\nimport \"fmt\"\n\nfunc Message(name string) string {{\n\treturn fmt.Sprintf(\"{word}, %s!\", name)\n}}\n"
+    )
+}
+
+/// The lone binary the `app` executable's `go-compile` writes into its own tracked output directory
+/// (`.target/app/compile/go-compile/output/`), read back so a test can tell whether it was rebuilt.
+fn app_binary(workspace: &Path) -> Vec<u8> {
+    let output_directory: PathBuf = workspace
+        .join(".target")
+        .join("app")
+        .join("go-compile")
+        .join(mode_binding_hash("debug"));
+    let entry: fs::DirEntry = fs::read_dir(&output_directory)
+        .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
+        .next()
+        .expect("the executable's compile should leave exactly one binary")
+        .unwrap();
+    fs::read(entry.path()).unwrap()
 }
 
 #[test]
@@ -146,13 +294,256 @@ fn lifecycle_short_all_flag() {
 }
 
 #[test]
-fn compile_shows_task_graph() {
-    let directory: TempDir = module_dir();
+fn compile_in_valid_go_module_exits_zero() {
+    let directory: TempDir = go_module_dir();
     let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "expected exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn compile_module_with_local_go_library_dependency_builds() {
+    let directory: TempDir = multi_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "expected exit 0 building a module with a local library dependency; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let go_work: String = fs::read_to_string(
+        directory
+            .path()
+            .join(".target")
+            .join("generate-go-work")
+            .join(empty_binding_hash())
+            .join("go.work"),
+    )
+    .expect("a go.work should be generated in the build directory");
+    assert!(
+        go_work.contains("lib/greeting"),
+        "the generated go.work should list the local library, got:\n{go_work}"
+    );
+}
+
+#[test]
+fn second_multi_module_compile_is_silent_and_editing_the_dependency_rebuilds_the_dependent() {
+    let directory: TempDir = isolated_multi_module_dir();
+    let app: PathBuf = directory.path().join("app");
+    let first: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first compile failed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let original_binary: Vec<u8> = app_binary(directory.path());
+
+    // Nothing changed: the second compile must be silent (both modules cache-hit).
+    let second: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(second.status.success(), "second compile failed");
+    assert!(
+        second.stdout.is_empty(),
+        "a second compile on an unchanged multi-module tree should be silent; got: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    // Edit only the dependency. The dependent's own sources are untouched and live in a disjoint
+    // directory, so only the dependency edge can rebuild it — and it must, or its binary would keep
+    // embedding the library's old behaviour.
+    fs::write(directory.path().join("lib").join("greeting.go"), greeting_source("Hi")).unwrap();
+    let rebuild: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    assert!(
+        rebuild.status.success(),
+        "rebuild after editing the dependency failed; stderr: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "editing the dependency should re-run a compile; got: {}",
+        String::from_utf8_lossy(&rebuild.stdout)
+    );
+    assert_ne!(
+        app_binary(directory.path()),
+        original_binary,
+        "the dependent's binary should change, proving it rebuilt against the edited dependency"
+    );
+}
+
+#[test]
+fn compile_shows_progress_output() {
+    let directory: TempDir = go_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
     let stdout: String = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(stdout.contains("go-compile"), "missing go-compile task");
-    assert!(stdout.contains("go build ./..."), "missing go build command");
+    assert!(stdout.contains("go-compile"), "missing go-compile progress line");
+    assert!(stdout.contains('\u{2713}'), "missing success checkmark");
+}
+
+#[test]
+fn compile_quiet_flag_suppresses_progress() {
+    let directory: TempDir = go_module_dir();
+    let output: Output = sindri()
+        .args(["compile", "--quiet"])
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "expected no stdout with --quiet; got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn compile_creates_telemetry_json() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let telemetry_path: PathBuf = directory.path().join(".target").join("telemetry.json");
+    assert!(telemetry_path.exists(), "telemetry.json was not created");
+    let content: String = fs::read_to_string(&telemetry_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let events: &Vec<serde_json::Value> = parsed["traceEvents"].as_array().unwrap();
+    assert!(!events.is_empty(), "traceEvents should not be empty");
+    for event in events {
+        assert!(event["dur"].as_u64().unwrap() > 0, "all dur values should be positive");
+    }
+}
+
+#[test]
+fn compile_failing_go_code_exits_nonzero() {
+    let directory: TempDir = failing_go_module_dir();
+    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(!output.status.success(), "expected non-zero exit for broken Go code");
+    assert!(!output.stderr.is_empty(), "expected error output on stderr");
+}
+
+#[test]
+fn compile_quiet_with_failure_still_shows_error() {
+    let directory: TempDir = failing_go_module_dir();
+    let output: Output = sindri()
+        .args(["compile", "--quiet"])
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "expected non-zero exit");
+    assert!(
+        !output.stderr.is_empty(),
+        "expected error output on stderr even with --quiet"
+    );
+    assert!(output.stdout.is_empty(), "expected no stdout with --quiet");
+}
+
+fn go_compile_output_directory(workspace: &Path) -> PathBuf {
+    // A plain `sindri.build` module has no qualifier, so its state lives directly under `.target`
+    // (no module-path segment): `.target/<task-name>/<binding-hash>/`.
+    workspace
+        .join(".target")
+        .join("go-compile")
+        .join(mode_binding_hash("debug"))
+}
+
+#[test]
+fn second_compile_on_unchanged_tree_is_silent() {
+    let directory: TempDir = go_module_dir();
+    let first: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        first.status.success(),
+        "first compile failed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("go-compile"),
+        "first compile should run go-compile"
+    );
+    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    assert!(
+        fs::read_dir(&output_directory).unwrap().next().is_some(),
+        "first compile should leave a built binary in {output_directory:?}"
+    );
+
+    let second: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(second.status.success(), "second compile failed");
+    assert!(
+        second.stdout.is_empty(),
+        "second compile on an unchanged tree should be silent; got: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+}
+
+#[test]
+fn editing_a_source_file_triggers_a_rebuild() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    fs::write(
+        directory.path().join("main.go"),
+        "package main\n\nfunc main() {\n\tprintln(\"changed\")\n}\n",
+    )
+    .unwrap();
+    let rebuild: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(rebuild.status.success(), "rebuild after edit failed");
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "editing a source file should re-run go-compile"
+    );
+}
+
+#[test]
+fn deleting_the_output_binary_triggers_a_rebuild() {
+    let directory: TempDir = go_module_dir();
+    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    for entry in fs::read_dir(&output_directory).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let rebuild: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(rebuild.status.success(), "rebuild after deleting output failed");
+    assert!(
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
+        "deleting the output binary should re-run go-compile (self-healing)"
+    );
+}
+
+#[test]
+fn two_parameter_bindings_of_one_module_coexist_without_overwriting_each_other() {
+    let directory: TempDir = go_module_dir();
+    let debug_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        debug_build.status.success(),
+        "debug-mode compile failed; stderr: {}",
+        String::from_utf8_lossy(&debug_build.stderr)
+    );
+    let debug_output_directory: PathBuf = go_compile_output_directory(directory.path());
+    assert!(
+        fs::read_dir(&debug_output_directory).unwrap().next().is_some(),
+        "the debug binding should leave a binary in {debug_output_directory:?}"
+    );
+
+    // Switch the same module to release mode and rebuild. This must add a new binding-hash
+    // directory alongside the debug one, not overwrite it.
+    let build_file: PathBuf = directory.path().join("sindri.build");
+    let source: String = fs::read_to_string(&build_file).unwrap();
+    fs::write(&build_file, source.replace(r#"mode = "debug""#, r#"mode = "release""#)).unwrap();
+    let release_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    assert!(
+        release_build.status.success(),
+        "release-mode compile failed; stderr: {}",
+        String::from_utf8_lossy(&release_build.stderr)
+    );
+    let release_output_directory: PathBuf = directory
+        .path()
+        .join(".target")
+        .join("go-compile")
+        .join(mode_binding_hash("release"));
+    assert!(
+        fs::read_dir(&release_output_directory).unwrap().next().is_some(),
+        "the release binding should leave a binary in {release_output_directory:?}"
+    );
+    assert!(
+        fs::read_dir(&debug_output_directory).unwrap().next().is_some(),
+        "the debug binding's output should still exist after building the release binding"
+    );
 }
 
 #[test]
