@@ -17,6 +17,7 @@ use crate::module_graph::ModuleNode;
 use crate::module_tool;
 use crate::module_tool::ModuleToolBinaries;
 use crate::parameter::ParameterDeclarations;
+use crate::plugins::PluginRegistry;
 use crate::runtime::Runtime;
 use crate::script::Script;
 use crate::task::DeclaredTaskInput;
@@ -172,10 +173,10 @@ impl Lifecycle {
         )
     }
 
-    pub fn run_lifecycle(&self, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
+    pub fn run_lifecycle(&self, plugins: &PluginRegistry, show_all: bool, runtime: &impl Runtime) -> IoResult<()> {
         // The listing is workspace-generic, with no module in hand; show the executable form of the
         // go-compile task as a representative.
-        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks_for(plugins, &ArtifactType::Executable);
         self.write(&tasks, show_all, &mut runtime.output())
     }
 
@@ -195,6 +196,7 @@ impl Lifecycle {
         target: &Step,
         workspace_tasks: &[(Task, Step)],
         workspace: &Workspace,
+        plugins: &PluginRegistry,
         config: &ExecutionConfig,
         runtime: &impl Runtime,
     ) -> MietteResult<()> {
@@ -286,7 +288,7 @@ impl Lifecycle {
         let mut module_rebuilt: Vec<ModuleRebuilt> = Vec::with_capacity(module_graph.nodes().len());
         let mut module_tool_binaries: ModuleToolBinaries = ModuleToolBinaries::new();
         for (index, node) in module_graph.nodes().iter().enumerate() {
-            let mut tasks: Vec<(Task, Step)> = GoPlugin::tasks(node.module().artifact_type());
+            let mut tasks: Vec<(Task, Step)> = GoPlugin::tasks_for(plugins, node.module().artifact_type());
             // One synthesized task per `module_tools` entry, bound to `generate` so it may write into
             // this module's own source tree before `compile` runs.
             for reference in node.module().module_tools() {
@@ -295,9 +297,9 @@ impl Lifecycle {
             // A tool-target module always builds through `default`'s own `package` step, regardless of
             // which lifecycle this invocation is running — a task consuming its binary needs a fully
             // built, tested tool whether the top-level invocation is `compile`, `clean`, or anything
-            // else, independent of whether `self` even carries a `package` step at all. Nothing is
-            // bound to `package` itself for Go today — the binary is already a tracked `compile`
-            // output — that's a Go-plugin gap, addressed separately when plugins are worked on.
+            // else, independent of whether `self` even carries a `package` step at all. For Go,
+            // `go-package` is the task bound to `package` — the one that actually links and places
+            // the tracked binary.
             let graph: TaskGraph = if tool_target_indices.contains(&index) {
                 Lifecycle::default()
                     .build_task_graph(&tasks, &package_step)
@@ -339,11 +341,11 @@ impl Lifecycle {
             )?;
             module_rebuilt.push(rebuilt);
             if tool_target_indices.contains(&index) {
-                let go_compile_outcome: &TaskOutcome = module_outcomes
+                let go_package_outcome: &TaskOutcome = module_outcomes
                     .iter()
-                    .find(|outcome: &&TaskOutcome| outcome.task().name() == &TaskName::new("go-compile"))
-                    .expect("every module_tools target is an executable module, which always has a go-compile task");
-                let output_directory: &AbsoluteDirectory = go_compile_outcome.output_directory();
+                    .find(|outcome: &&TaskOutcome| outcome.task().name() == &TaskName::new("go-package"))
+                    .expect("every module_tools target is an executable module, which always has a go-package task");
+                let output_directory: &AbsoluteDirectory = go_package_outcome.output_directory();
                 for other in module_graph.nodes() {
                     for reference in other.module().module_tools() {
                         if reference.module() != node.identity() {
@@ -545,6 +547,12 @@ mod tests {
         builder
     }
 
+    /// The plugins loaded from `workspace`'s (bootstrapped) `.sindri/plugins/` — every test below
+    /// that runs a step needs one, the same way it needs an `ExecutionConfig`.
+    fn plugins(workspace: &Workspace, runtime: &DummyRuntime) -> PluginRegistry {
+        PluginRegistry::load(workspace, runtime).unwrap()
+    }
+
     fn make_task(name: &str) -> Task {
         Task::new(
             TaskName::new(name),
@@ -671,8 +679,10 @@ mod tests {
 
     #[test]
     fn write_hides_empty_steps_by_default() {
+        let runtime: DummyRuntime = go_workspace().build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let lifecycle: Lifecycle = Lifecycle::default();
-        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks_for(&plugins(&workspace, &runtime), &ArtifactType::Executable);
         let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&tasks, false, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
@@ -683,8 +693,10 @@ mod tests {
 
     #[test]
     fn write_shows_empty_steps_with_all_flag() {
+        let runtime: DummyRuntime = go_workspace().build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let lifecycle: Lifecycle = Lifecycle::default();
-        let tasks: Vec<(Task, Step)> = GoPlugin::tasks(&ArtifactType::Executable);
+        let tasks: Vec<(Task, Step)> = GoPlugin::tasks_for(&plugins(&workspace, &runtime), &ArtifactType::Executable);
         let mut buffer: Stdout = Stdout::default();
         lifecycle.write(&tasks, true, &mut buffer).unwrap();
         let output: &str = buffer.as_str();
@@ -712,7 +724,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("compile"),
+                &[],
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
     }
@@ -746,7 +765,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("compile"),
+                &[],
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         // The dependency is loaded and built before the entry.
         assert_eq!(
@@ -817,12 +843,14 @@ mod tests {
     fn editing_a_dependency_forces_the_dependent_via_the_edge() {
         // A first build persists every module's run record.
         let seed: DummyRuntime = multi_module_workspace().build();
+        let seed_workspace: Workspace = Workspace::locate(&seed).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&seed).unwrap(),
+                &seed_workspace,
+                &plugins(&seed_workspace, &seed),
                 &config,
                 &seed,
             )
@@ -832,11 +860,13 @@ mod tests {
         let rebuild: DummyRuntime = replay_with_state(multi_module_workspace(), &seed)
             .file("/workspace/lib/lib.go", "package lib\n\nvar Changed = true\n")
             .build();
+        let rebuild_workspace: Workspace = Workspace::locate(&rebuild).unwrap();
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&rebuild).unwrap(),
+                &rebuild_workspace,
+                &plugins(&rebuild_workspace, &rebuild),
                 &config,
                 &rebuild,
             )
@@ -864,11 +894,13 @@ mod tests {
             .command("go build", succeeded())
             .build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
+        let seed_workspace: Workspace = Workspace::locate(&seed).unwrap();
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&seed).unwrap(),
+                &seed_workspace,
+                &plugins(&seed_workspace, &seed),
                 &config,
                 &seed,
             )
@@ -882,11 +914,13 @@ mod tests {
             &seed,
         )
         .build();
+        let replay_workspace: Workspace = Workspace::locate(&replay).unwrap();
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&replay).unwrap(),
+                &replay_workspace,
+                &plugins(&replay_workspace, &replay),
                 &config,
                 &replay,
             )
@@ -913,11 +947,13 @@ mod tests {
             .command("go build", succeeded())
             .build();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
+        let seed_workspace: Workspace = Workspace::locate(&seed).unwrap();
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&seed).unwrap(),
+                &seed_workspace,
+                &plugins(&seed_workspace, &seed),
                 &config,
                 &seed,
             )
@@ -938,11 +974,13 @@ mod tests {
             &seed,
         )
         .build();
+        let replay_workspace: Workspace = Workspace::locate(&replay).unwrap();
         Lifecycle::default()
             .run_step(
                 &Step::new("compile"),
                 &[],
-                &Workspace::locate(&replay).unwrap(),
+                &replay_workspace,
+                &plugins(&replay_workspace, &replay),
                 &config,
                 &replay,
             )
@@ -968,7 +1006,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("compile"),
+                &[],
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         assert!(runtime.created_directory("/workspace/.target"));
         assert!(
@@ -985,16 +1030,22 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        let result: MietteResult<()> =
-            Lifecycle::default().run_step(&Step::new("compile"), &[], &workspace, &config, &runtime);
+        let result: MietteResult<()> = Lifecycle::default().run_step(
+            &Step::new("compile"),
+            &[],
+            &workspace,
+            &plugins(&workspace, &runtime),
+            &config,
+            &runtime,
+        );
         assert!(result.is_err(), "a failing build command should fail the compile");
     }
 
-    /// The `go-compile` output directory a module built with `mode = "debug"` lands in — computed the
+    /// The `go-package` output directory a module built with `mode = "debug"` lands in — computed the
     /// same way [`crate::executor::resolve_task_plan`] does, so a test can pre-register the binary a
-    /// tool module's `go-compile` is expected to have produced, at exactly the path Sindri will look
+    /// tool module's `go-package` is expected to have produced, at exactly the path Sindri will look
     /// for it.
-    fn go_compile_output_directory(module_directory: &str) -> AbsoluteDirectory {
+    fn go_package_output_directory(module_directory: &str) -> AbsoluteDirectory {
         let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
             PluginName::new("sindri-go"),
             ParameterName::new("mode"),
@@ -1009,7 +1060,7 @@ mod tests {
         TaskLayout::new(
             &AbsoluteDirectory::new(PathBuf::from("/workspace/.target")),
             &RelativeDirectory::new_unchecked(module_directory),
-            &TaskName::new("go-compile"),
+            &TaskName::new("go-package"),
             binding.binding_hash(),
         )
         .output_directory()
@@ -1019,9 +1070,9 @@ mod tests {
     #[test]
     fn run_compile_orders_a_module_tools_task_after_its_tool_module() {
         // `app` declares `module_tools = [ "//tools/codegen:codegen" ]`. The tool module must be
-        // fully built (including its go-compile step, which produces `codegen`) before `app`'s
+        // fully built (including its go-package step, which produces `codegen`) before `app`'s
         // synthesized module-tool task runs the binary.
-        let tool_output_directory: AbsoluteDirectory = go_compile_output_directory("tools/codegen/");
+        let tool_output_directory: AbsoluteDirectory = go_package_output_directory("tools/codegen/");
         let binary_file: AbsoluteFile = tool_output_directory.join_file(&RelativeFile::new("codegen").unwrap());
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(
@@ -1051,21 +1102,28 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::default()
-            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("compile"),
+                &[],
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         // The tool module is loaded (and thus built) before the module that references it.
         assert_eq!(
             runtime.logged(),
             vec!["Module loaded: codegen".to_string(), "Module loaded: app".to_string()]
         );
-        // The tool module built through `package` — a go-compile run record was persisted under its
+        // The tool module built through `package` — a go-package run record was persisted under its
         // own state subtree.
         assert!(
             runtime
                 .written_files()
                 .iter()
-                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-compile")),
-            "the tool module should have built and persisted a go-compile run record"
+                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-package")),
+            "the tool module should have built and persisted a go-package run record"
         );
         // The synthesized module-tool task ran the resolved binary path directly.
         assert!(
@@ -1086,7 +1144,7 @@ mod tests {
         // doing. So `codegen`, the tool target, runs its whole default build (format, compile, test)
         // even though this invocation only asked for `clean`; `app`, which merely references it, does
         // not, since none of its own tasks are bound to a step clean's own lifecycle carries.
-        let tool_output_directory: AbsoluteDirectory = go_compile_output_directory("tools/codegen/");
+        let tool_output_directory: AbsoluteDirectory = go_package_output_directory("tools/codegen/");
         let binary_file: AbsoluteFile = tool_output_directory.join_file(&RelativeFile::new("codegen").unwrap());
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(
@@ -1116,7 +1174,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::clean()
-            .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("clean"),
+                &clean_tasks(),
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         assert_eq!(
             runtime.logged(),
@@ -1126,7 +1191,7 @@ mod tests {
             runtime
                 .written_files()
                 .iter()
-                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-compile")),
+                .any(|(path, _)| path.starts_with("/workspace/.target/tools/codegen/go-package")),
             "the tool-target module should have been fully built even though only clean was requested"
         );
     }
@@ -1134,7 +1199,7 @@ mod tests {
     #[test]
     fn run_compile_fails_when_the_tool_binary_is_missing_after_the_module_builds() {
         // The tool module builds successfully but never produces a file named `codegen` in its
-        // go-compile output — the binary Sindri expects after "building up to and including package".
+        // go-package output — the binary Sindri expects after "building up to and including package".
         let runtime: DummyRuntime = DummyRuntime::builder()
             .file(
                 "/workspace/sindri.workspace",
@@ -1161,7 +1226,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         let error: miette::Report = Lifecycle::default()
-            .run_step(&Step::new("compile"), &[], &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("compile"),
+                &[],
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -1183,8 +1255,14 @@ mod tests {
             .build();
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
-        let result: MietteResult<()> =
-            Lifecycle::default().run_step(&Step::new("compile"), &[], &workspace, &config, &runtime);
+        let result: MietteResult<()> = Lifecycle::default().run_step(
+            &Step::new("compile"),
+            &[],
+            &workspace,
+            &plugins(&workspace, &runtime),
+            &config,
+            &runtime,
+        );
         assert!(result.is_err(), "compile should fail when no build file can be found");
     }
 
@@ -1203,7 +1281,14 @@ mod tests {
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         assert!(
             Lifecycle::clean()
-                .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+                .run_step(
+                    &Step::new("clean"),
+                    &clean_tasks(),
+                    &workspace,
+                    &plugins(&workspace, &runtime),
+                    &config,
+                    &runtime,
+                )
                 .is_ok()
         );
     }
@@ -1218,7 +1303,14 @@ mod tests {
         let workspace: Workspace = Workspace::locate(&runtime).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         Lifecycle::clean()
-            .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+            .run_step(
+                &Step::new("clean"),
+                &clean_tasks(),
+                &workspace,
+                &plugins(&workspace, &runtime),
+                &config,
+                &runtime,
+            )
             .unwrap();
         assert_eq!(runtime.logged(), vec!["Module loaded: my-app".to_string()]);
     }
@@ -1239,23 +1331,27 @@ mod tests {
         }
 
         let seed: DummyRuntime = build_directory().build();
+        let seed_workspace: Workspace = Workspace::locate(&seed).unwrap();
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Normal, BuildStart::now());
         Lifecycle::clean()
             .run_step(
                 &Step::new("clean"),
                 &clean_tasks(),
-                &Workspace::locate(&seed).unwrap(),
+                &seed_workspace,
+                &plugins(&seed_workspace, &seed),
                 &config,
                 &seed,
             )
             .unwrap();
 
         let replay: DummyRuntime = replay_with_state(build_directory(), &seed).build();
+        let replay_workspace: Workspace = Workspace::locate(&replay).unwrap();
         Lifecycle::clean()
             .run_step(
                 &Step::new("clean"),
                 &clean_tasks(),
-                &Workspace::locate(&replay).unwrap(),
+                &replay_workspace,
+                &plugins(&replay_workspace, &replay),
                 &config,
                 &replay,
             )
@@ -1282,15 +1378,25 @@ mod tests {
         let config: ExecutionConfig = ExecutionConfig::new(Verbosity::Quiet, BuildStart::now());
         assert!(
             Lifecycle::clean()
-                .run_step(&Step::new("clean"), &clean_tasks(), &workspace, &config, &runtime)
+                .run_step(
+                    &Step::new("clean"),
+                    &clean_tasks(),
+                    &workspace,
+                    &plugins(&workspace, &runtime),
+                    &config,
+                    &runtime,
+                )
                 .is_err()
         );
     }
 
     #[test]
     fn run_lifecycle_prints_the_compile_step_and_its_tasks() {
-        let runtime: DummyRuntime = DummyRuntime::builder().build();
-        Lifecycle::default().run_lifecycle(false, &runtime).unwrap();
+        let runtime: DummyRuntime = go_workspace().build();
+        let workspace: Workspace = Workspace::locate(&runtime).unwrap();
+        Lifecycle::default()
+            .run_lifecycle(&plugins(&workspace, &runtime), false, &runtime)
+            .unwrap();
         let output: Stdout = runtime.captured_output();
         assert!(
             output.as_str().contains("compile"),

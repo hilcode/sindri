@@ -4,6 +4,7 @@ use crate::executor::ExecutionConfig;
 use crate::executor::Verbosity;
 use crate::lifecycle::Lifecycle;
 use crate::lifecycles::Lifecycles;
+use crate::plugins::PluginRegistry;
 use crate::runtime::Bootstrap;
 use crate::task::Task;
 use crate::types::AbsoluteFile;
@@ -143,13 +144,14 @@ fn dispatch(
             source,
         })?;
     workspace.log_loaded(&runtime)?;
+    let plugins: PluginRegistry = PluginRegistry::load(&workspace, &runtime)?;
     let (name, sub_matches): (&str, &ArgMatches) = matches.subcommand().expect("clap requires a subcommand");
     match name {
         "lifecycle" => {
             let all: bool = sub_matches.get_flag("all");
             lifecycles
                 .default_lifecycle()
-                .run_lifecycle(all, &runtime)
+                .run_lifecycle(&plugins, all, &runtime)
                 .into_diagnostic()?;
         }
         step_name => {
@@ -158,7 +160,7 @@ fn dispatch(
                 .expect("clap only offers step names sourced from these lifecycles");
             let config: ExecutionConfig = ExecutionConfig::new(verbosity, start);
             let workspace_tasks: Vec<(Task, Step)> = lifecycle.workspace_tasks();
-            lifecycle.run_step(&step, &workspace_tasks, &workspace, &config, &runtime)?;
+            lifecycle.run_step(&step, &workspace_tasks, &workspace, &plugins, &config, &runtime)?;
         }
     }
     Ok(())

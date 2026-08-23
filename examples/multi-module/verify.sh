@@ -16,11 +16,11 @@ assert_binary_prints "Hello, Sindri!"
 echo "==> editing the library only"
 sed -i 's/Hello/Hi/' "$source_file"
 
-echo "==> compiling after the edit (expecting a rebuild)"
+echo "==> building after the edit (expecting a rebuild)"
 expect_rebuild
 assert_binary_prints "Hi, Sindri!"
 
-echo "==> compiling once more (expecting silence again)"
-expect_silent_compile
+echo "==> building once more (expecting silence again)"
+expect_silent_build
 
 echo "OK: editing the dependency rebuilds the app, whose output reflects the change, then settles"

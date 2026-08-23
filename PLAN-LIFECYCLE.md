@@ -146,28 +146,44 @@ the way a multi-plugin world needs.
 
 ### 3c — Rewire `GoPlugin` callers
 
-- [ ] Delete `GoPlugin::tasks()` / `compile_parameters()`; the four
-  `lifecycle.rs` call sites resolve tasks through the loaded `PluginRegistry`
-  instead.
-- [ ] Apply `go-package` only to executable modules (library modules get
-  `go-format/go-compile/go-test` only) — the conditional-application
-  problem 3b's manifest redesign left for this phase; see 3b's note above.
-- [ ] Update the tool-target binary lookup in `lifecycle.rs` (currently
+- [x] Delete `GoPlugin::tasks()` / `compile_parameters()`; the `lifecycle.rs`
+  call sites resolve tasks through the loaded `PluginRegistry` instead, via
+  a new `GoPlugin::tasks_for(plugins, artifact_type)`.
+- [x] Apply `go-package` only to executable modules (library modules get
+  `go-format`/`go-compile`/`go-test` only) — `tasks_for` filters it out
+  with `ArtifactType::is_executable()`.
+- [x] Update the tool-target binary lookup in `lifecycle.rs` (was
   `TaskName::new("go-compile")`) to resolve against `go-package`'s output
   directory instead, since that's the task that now actually links and
   places the tracked binary.
-- [ ] `generate_go_work_task` stays Rust-side glue *for this phase only* —
+- [x] **Finding, resolved with the user:** binding the executable-linking
+  task to `package` (3b's design) means `sindri compile` alone no longer
+  produces a binary for an ordinary executable module — `build_task_graph`
+  only runs steps up to and including the invocation's own target, and
+  `compile` never reaches `package`. This is a real, intentional behavior
+  change, not a bug to route around: `compile` type-checks; `package`
+  (which already runs everything `compile` does, plus `test`, plus
+  `go-package`) is what actually links and places the binary — matching
+  the Maven/Gradle-style phase distinction the lifecycle's own step order
+  (`… → test → integration-test → package → publish`) already implies.
+  Confirmed by updating every `tests/cli.rs` case that reads a compiled
+  binary to invoke `package` instead of `compile`; cases that only check
+  that `go-compile` itself ran (not that a binary exists) were left
+  invoking `compile`, unchanged.
+- [x] `generate_go_work_task` stays Rust-side glue *for this phase only* —
   its script content is built via `format!()` embedding the discovered
   list of Go module directories, data no task's `inputs` can express yet.
   Phase 4 below eliminates this gap.
-- [ ] `module_tool::invocation_task` is a different case and stays
+- [x] `module_tool::invocation_task` is a different case and stays
   Rust-side permanently: it's not Go-specific at all — `module_tools` is a
   cross-cutting Sindri mechanism any module can use regardless of
   language, and its script is already a trivial static one-liner — so it
   was never a candidate for `.sindri/plugins/go/` in the first place.
-- [ ] Preserve today's "one known plugin, always applied to every module"
+- [x] Preserve today's "one known plugin, always applied to every module"
   behavior rather than inventing a language-to-plugin dispatch mechanism
-  ahead of a second real language.
+  ahead of a second real language: `tasks_for` flattens every loaded
+  plugin's tasks unconditionally (today, just `go`'s), the same way
+  `GoPlugin::tasks()` applied unconditionally before.
 
 ### 3d — Validation invariants
 

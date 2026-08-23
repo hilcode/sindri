@@ -26,9 +26,11 @@ fn empty_binding_hash() -> String {
     ParameterBinding::empty().binding_hash().to_hex()
 }
 
-/// The binding hash `go-compile` resolves to for a given `sindri-go.mode` value. Every Go module
-/// below binds `mode = "debug"` unless it's specifically exercising a second, coexisting binding, so
-/// `mode_binding_hash("debug")` is the binding-hash path segment shared by most fixtures here.
+/// The binding hash `go-compile`/`go-package` resolve to for a given `sindri-go.mode` value (both
+/// declare the same `mode` parameter, so a given value resolves to the same hash for either task).
+/// Every Go module below binds `mode = "debug"` unless it's specifically exercising a second,
+/// coexisting binding, so `mode_binding_hash("debug")` is the binding-hash path segment shared by
+/// most fixtures here.
 fn mode_binding_hash(mode: &str) -> String {
     let declared: ParameterDeclarations = ParameterDeclarations::new([Parameter::new(
         PluginName::new("sindri-go"),
@@ -200,18 +202,20 @@ fn greeting_source(word: &str) -> String {
     )
 }
 
-/// The lone binary the `app` executable's `go-compile` writes into its own tracked output directory
-/// (`.target/app/compile/go-compile/output/`), read back so a test can tell whether it was rebuilt.
+/// The lone binary the `app` executable's `go-package` writes into its own tracked output directory
+/// (`.target/app/go-package/<binding-hash>/`), read back so a test can tell whether it was rebuilt.
+/// Only produced once a build reaches the `package` step — `compile` alone type-checks but does not
+/// link a binary.
 fn app_binary(workspace: &Path) -> Vec<u8> {
     let output_directory: PathBuf = workspace
         .join(".target")
         .join("app")
-        .join("go-compile")
+        .join("go-package")
         .join(mode_binding_hash("debug"));
     let entry: fs::DirEntry = fs::read_dir(&output_directory)
         .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
         .next()
-        .expect("the executable's compile should leave exactly one binary")
+        .expect("the executable's package step should leave exactly one binary")
         .unwrap();
     fs::read(entry.path()).unwrap()
 }
@@ -454,9 +458,12 @@ fn compile_module_with_local_go_library_dependency_builds() {
 }
 
 #[test]
-fn compile_module_with_module_tools_generates_and_compiles_the_tool_output() {
+fn package_module_with_module_tools_generates_and_compiles_the_tool_output() {
     let directory: TempDir = codegen_dir();
-    let output: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    // `app` is itself an executable, and only the `package` step actually links its binary — the
+    // same step tool-target modules like `codegen` are already forced through regardless of the
+    // top-level invocation.
+    let output: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
     assert!(
         output.status.success(),
         "expected exit 0 building a module with module_tools; stderr: {}",
@@ -468,11 +475,11 @@ fn compile_module_with_module_tools_generates_and_compiles_the_tool_output() {
         generated.contains("Hello from codegen!"),
         "unexpected generated file content:\n{generated}"
     );
-    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    let output_directory: PathBuf = go_package_output_directory(directory.path());
     let binary_path: PathBuf = fs::read_dir(&output_directory)
         .unwrap_or_else(|error| panic!("output directory {output_directory:?} is unreadable: {error}"))
         .next()
-        .expect("app's compile should leave exactly one binary")
+        .expect("app's package step should leave exactly one binary")
         .unwrap()
         .path();
     let run: Output = Command::new(&binary_path).output().unwrap();
@@ -489,23 +496,24 @@ fn compile_module_with_module_tools_generates_and_compiles_the_tool_output() {
 }
 
 #[test]
-fn second_multi_module_compile_is_silent_and_editing_the_dependency_rebuilds_the_dependent() {
+fn second_multi_module_package_is_silent_and_editing_the_dependency_rebuilds_the_dependent() {
     let directory: TempDir = isolated_multi_module_dir();
     let app: PathBuf = directory.path().join("app");
-    let first: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    // `package`, not `compile`, since `app`'s binary is only linked at the `package` step.
+    let first: Output = sindri().arg("package").current_dir(&app).output().unwrap();
     assert!(
         first.status.success(),
-        "first compile failed; stderr: {}",
+        "first package failed; stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     let original_binary: Vec<u8> = app_binary(directory.path());
 
-    // Nothing changed: the second compile must be silent (both modules cache-hit).
-    let second: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
-    assert!(second.status.success(), "second compile failed");
+    // Nothing changed: the second package build must be silent (both modules cache-hit).
+    let second: Output = sindri().arg("package").current_dir(&app).output().unwrap();
+    assert!(second.status.success(), "second package build failed");
     assert!(
         second.stdout.is_empty(),
-        "a second compile on an unchanged multi-module tree should be silent; got: {}",
+        "a second package build on an unchanged multi-module tree should be silent; got: {}",
         String::from_utf8_lossy(&second.stdout)
     );
 
@@ -513,7 +521,7 @@ fn second_multi_module_compile_is_silent_and_editing_the_dependency_rebuilds_the
     // directory, so only the dependency edge can rebuild it — and it must, or its binary would keep
     // embedding the library's old behaviour.
     fs::write(directory.path().join("lib").join("greeting.go"), greeting_source("Hi")).unwrap();
-    let rebuild: Output = sindri().arg("compile").current_dir(&app).output().unwrap();
+    let rebuild: Output = sindri().arg("package").current_dir(&app).output().unwrap();
     assert!(
         rebuild.status.success(),
         "rebuild after editing the dependency failed; stderr: {}",
@@ -595,39 +603,40 @@ fn compile_quiet_with_failure_still_shows_error() {
     assert!(output.stdout.is_empty(), "expected no stdout with --quiet");
 }
 
-fn go_compile_output_directory(workspace: &Path) -> PathBuf {
+fn go_package_output_directory(workspace: &Path) -> PathBuf {
     // A plain `sindri.build` module has no qualifier, so its state lives directly under `.target`
     // (no module-path segment): `.target/<task-name>/<binding-hash>/`.
     workspace
         .join(".target")
-        .join("go-compile")
+        .join("go-package")
         .join(mode_binding_hash("debug"))
 }
 
 #[test]
-fn second_compile_on_unchanged_tree_is_silent() {
+fn second_package_on_unchanged_tree_is_silent() {
     let directory: TempDir = go_module_dir();
-    let first: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    // `package`, not `compile`, since a binary is only linked at the `package` step.
+    let first: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
     assert!(
         first.status.success(),
-        "first compile failed; stderr: {}",
+        "first package build failed; stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&first.stdout).contains("go-compile"),
-        "first compile should run go-compile"
+        String::from_utf8_lossy(&first.stdout).contains("go-package"),
+        "first package build should run go-package"
     );
-    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    let output_directory: PathBuf = go_package_output_directory(directory.path());
     assert!(
         fs::read_dir(&output_directory).unwrap().next().is_some(),
-        "first compile should leave a built binary in {output_directory:?}"
+        "first package build should leave a built binary in {output_directory:?}"
     );
 
-    let second: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
-    assert!(second.status.success(), "second compile failed");
+    let second: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
+    assert!(second.status.success(), "second package build failed");
     assert!(
         second.stdout.is_empty(),
-        "second compile on an unchanged tree should be silent; got: {}",
+        "second package build on an unchanged tree should be silent; got: {}",
         String::from_utf8_lossy(&second.stdout)
     );
 }
@@ -652,29 +661,29 @@ fn editing_a_source_file_triggers_a_rebuild() {
 #[test]
 fn deleting_the_output_binary_triggers_a_rebuild() {
     let directory: TempDir = go_module_dir();
-    sindri().arg("compile").current_dir(directory.path()).output().unwrap();
-    let output_directory: PathBuf = go_compile_output_directory(directory.path());
+    sindri().arg("package").current_dir(directory.path()).output().unwrap();
+    let output_directory: PathBuf = go_package_output_directory(directory.path());
     for entry in fs::read_dir(&output_directory).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
     }
-    let rebuild: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let rebuild: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
     assert!(rebuild.status.success(), "rebuild after deleting output failed");
     assert!(
-        String::from_utf8_lossy(&rebuild.stdout).contains("go-compile"),
-        "deleting the output binary should re-run go-compile (self-healing)"
+        String::from_utf8_lossy(&rebuild.stdout).contains("go-package"),
+        "deleting the output binary should re-run go-package (self-healing)"
     );
 }
 
 #[test]
 fn two_parameter_bindings_of_one_module_coexist_without_overwriting_each_other() {
     let directory: TempDir = go_module_dir();
-    let debug_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let debug_build: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
     assert!(
         debug_build.status.success(),
-        "debug-mode compile failed; stderr: {}",
+        "debug-mode package build failed; stderr: {}",
         String::from_utf8_lossy(&debug_build.stderr)
     );
-    let debug_output_directory: PathBuf = go_compile_output_directory(directory.path());
+    let debug_output_directory: PathBuf = go_package_output_directory(directory.path());
     assert!(
         fs::read_dir(&debug_output_directory).unwrap().next().is_some(),
         "the debug binding should leave a binary in {debug_output_directory:?}"
@@ -685,16 +694,16 @@ fn two_parameter_bindings_of_one_module_coexist_without_overwriting_each_other()
     let build_file: PathBuf = directory.path().join("sindri.build");
     let source: String = fs::read_to_string(&build_file).unwrap();
     fs::write(&build_file, source.replace(r#"mode = "debug""#, r#"mode = "release""#)).unwrap();
-    let release_build: Output = sindri().arg("compile").current_dir(directory.path()).output().unwrap();
+    let release_build: Output = sindri().arg("package").current_dir(directory.path()).output().unwrap();
     assert!(
         release_build.status.success(),
-        "release-mode compile failed; stderr: {}",
+        "release-mode package build failed; stderr: {}",
         String::from_utf8_lossy(&release_build.stderr)
     );
     let release_output_directory: PathBuf = directory
         .path()
         .join(".target")
-        .join("go-compile")
+        .join("go-package")
         .join(mode_binding_hash("release"));
     assert!(
         fs::read_dir(&release_output_directory).unwrap().next().is_some(),
